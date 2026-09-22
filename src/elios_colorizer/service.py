@@ -138,7 +138,7 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
                      *, sample_interval_s: float = 1.0, max_frames: int | None = None,
                      start_s: float | None = None, end_s: float | None = None,
                      experimental: bool = False) -> dict:
-    from .flight import discover_source, load_telemetry, iter_observations
+    from .flight import discover_source, load_telemetry, iter_observations, inspect_video_coverage
     from .camera import Calibration
     from .colorize import colorize_las, ColorizationOptions, ColorizationCancelled
 
@@ -186,9 +186,15 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
     ensure_running()
     if not len(telemetry.frame_times_s):
         raise ValueError('No recorded video frame timing was found.')
+    emit('Checking video', .025, 'Comparing encoded RGB frames with recorded FrameSync counters…', force=True)
+    video_coverage = inspect_video_coverage(source, telemetry, cancelled)
+    ensure_running()
     origin = float(telemetry.frame_times_s[0])
     first = origin + (start_s or 0)
-    last = float(telemetry.frame_times_s[-1]) if end_s is None else min(origin + end_s, float(telemetry.frame_times_s[-1]))
+    available_end = (float(telemetry.frame_times_s[-1])
+                     if video_coverage.last_available_sync_time_s is None
+                     else video_coverage.last_available_sync_time_s)
+    last = available_end if end_s is None else min(origin + end_s, available_end)
     if first >= last:
         raise ValueError('Time window does not overlap recorded video timing.')
     expected_frames = max(1, int((last - first) / sample_interval_s) + 1)
@@ -196,7 +202,8 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
         expected_frames = min(expected_frames, max_frames)
     emit('Colorizing', .08, f'Projecting sampled RGB frames onto the existing LAS ({expected_frames} planned views)…', force=True)
     frames = iter_observations(source, telemetry, sample_interval_s=sample_interval_s,
-                               max_frames=max_frames, start_s=start_s, end_s=end_s, cancelled=cancelled)
+                               max_frames=max_frames, start_s=start_s, end_s=end_s, cancelled=cancelled,
+                               video_coverage=video_coverage)
     logical_cpus = os.cpu_count() or 1
     # Projection work is memory-bandwidth heavy. Four workers gives useful CPU
     # concurrency without oversubscribing NumPy/OpenCV or inflating temporaries.

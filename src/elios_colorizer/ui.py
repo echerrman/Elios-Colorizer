@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import traceback
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -223,7 +224,12 @@ class Checklist(QWidget):
             state.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
             name = _label(str(row.get("label", "Input")))
             name.setStyleSheet("font-weight: 600;")
-            detail = _label(str(row.get("detail", "")), muted=True)
+            raw_detail = str(row.get("detail", ""))
+            wrapped_detail = re.sub(r"([\\/_.-])", lambda match: match.group(1) + "\u200b", raw_detail)
+            detail = _label(wrapped_detail, muted=True)
+            detail.setToolTip(raw_detail)
+            detail.setMinimumWidth(0)
+            detail.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             grid.addWidget(state, 0, 0, 2, 1)
             grid.addWidget(name, 0, 1)
@@ -327,6 +333,8 @@ class MainWindow(QMainWindow):
         checks_row = QHBoxLayout()
         checks_row.setSpacing(16)
         checks_card, checks_layout = _card("2  Check flight data")
+        checks_card.setMinimumWidth(380)
+        checks_card.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.checklist = Checklist()
         checks_layout.addWidget(self.checklist)
         self.summary = _label("Choose a flight folder to check its inputs.", muted=True)
@@ -334,6 +342,8 @@ class MainWindow(QMainWindow):
         checks_layout.addWidget(self.summary)
         checks_row.addWidget(checks_card, 3)
         dependency_card, dependency_layout = _card("Tools & libraries")
+        dependency_card.setMinimumWidth(290)
+        dependency_card.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.dependencies = Checklist()
         dependency_layout.addWidget(self.dependencies)
         self.refresh_button = QPushButton("Refresh checks")
@@ -410,6 +420,8 @@ class MainWindow(QMainWindow):
         edit.setPlaceholderText(placeholder)
         edit.setAccessibleName(title)
         edit.setClearButtonEnabled(True)
+        edit.setMinimumWidth(0)
+        edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         row.addWidget(edit, 1)
         button = QPushButton("Browse…")
         button.setAccessibleName(f"Browse {title.lower()}")

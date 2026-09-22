@@ -11,6 +11,7 @@ import csv
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import struct
@@ -404,6 +405,96 @@ class Telemetry:
         return PoseSample(position, self._slerp([time_s]).as_quat()[0], angle)
 
 
+@dataclass(frozen=True)
+class VideoSegment:
+    path: Path
+    frame_count: int
+    fps: float
+
+
+@dataclass(frozen=True)
+class VideoCoverage:
+    segments: tuple[VideoSegment, ...]
+    total_frames: int
+    synchronized_frames_available: int
+    frame_sync_records_beyond_video: int
+    last_available_sync_time_s: float | None
+
+
+def inspect_video_coverage(source: FlightSource, telemetry: Telemetry,
+                           cancelled=None) -> VideoCoverage:
+    """Validate video containers before expensive LAS indexing.
+
+    Inspector can write a few final FrameSync records after the encoded movie
+    ends. Those unavailable tail records are safe to skip because every earlier
+    counter keeps its exact decoded-frame mapping. A large overrun still fails
+    closed because it can indicate a missing or seriously truncated segment.
+    """
+    import cv2
+
+    if not source.videos:
+        raise FlightError("No RGB videos were found.")
+    segments = []
+    total_frames = 0
+    for video in source.videos:
+        _check_cancel(cancelled)
+        capture = cv2.VideoCapture(str(video))
+        try:
+            if not capture.isOpened():
+                raise FlightError(f"Cannot decode RGB video: {video.name}")
+            count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = float(capture.get(cv2.CAP_PROP_FPS))
+            if count <= 0 or not np.isfinite(fps) or fps <= 0:
+                raise FlightError(f"Video has no usable frame count/rate: {video.name}")
+            segments.append(VideoSegment(video, count, fps))
+            total_frames += count
+        finally:
+            capture.release()
+
+    if not len(telemetry.frame_indices):
+        return VideoCoverage(tuple(segments), total_frames, 0, 0, None)
+    in_range = (telemetry.frame_indices >= 0) & (telemetry.frame_indices < total_frames)
+    synchronized = int(in_range.sum())
+    if synchronized == 0:
+        raise FlightError("No FrameSync records correspond to available RGB footage.")
+    beyond = int((telemetry.frame_indices >= total_frames).sum())
+    overflow_span = max(0, int(telemetry.frame_indices[-1]) + 1 - total_frames)
+    # Ten seconds or 0.5% of the recording, whichever is larger, tolerates
+    # ordinary encoder-finalization tails while still detecting a missing clip.
+    maximum_tail = max(int(math.ceil(max(segment.fps for segment in segments) * 10)),
+                       int(math.ceil(total_frames * .005)))
+    if overflow_span > maximum_tail:
+        raise FlightError(
+            f"FrameSync extends {overflow_span:,} frames beyond available RGB footage; "
+            "this is too large to treat as a recording tail and a segment may be missing."
+        )
+
+    telemetry.timing_diagnostics['encoded_video_frames'] = total_frames
+    telemetry.timing_diagnostics['frame_sync_records'] = int(len(telemetry.frame_indices))
+    telemetry.timing_diagnostics['frame_sync_records_beyond_video'] = beyond
+    telemetry.timing_diagnostics['frame_sync_overflow_span_frames'] = overflow_span
+    telemetry.timing_diagnostics['untimestamped_video_frames_skipped'] = total_frames - synchronized
+    telemetry.timing_diagnostics['video_segments'] = [
+        {'name': segment.path.name, 'frame_count': segment.frame_count, 'fps': segment.fps}
+        for segment in segments
+    ]
+    if beyond:
+        warning = (
+            f"{beyond:,} trailing FrameSync records have no encoded RGB frame and are skipped; "
+            f"the preceding {synchronized:,} synchronized frames retain their exact mapping."
+        )
+        if warning not in telemetry.warnings:
+            telemetry.warnings.append(warning)
+    unmatched = total_frames - synchronized
+    if unmatched:
+        warning = (f'{unmatched:,} encoded frames have no FrameSync timestamp and are skipped. '
+                   'Counter-to-decoded-frame alignment still requires visual calibration checks.')
+        if warning not in telemetry.warnings:
+            telemetry.warnings.append(warning)
+    last_time = float(telemetry.frame_times_s[np.flatnonzero(in_range)[-1]])
+    return VideoCoverage(tuple(segments), total_frames, synchronized, beyond, last_time)
+
+
 def telemetry_cache_key(source: FlightSource) -> str:
     """Invalidate extraction on source replacement, edit, or parser change."""
     items = []
@@ -562,7 +653,8 @@ def load_telemetry(source: FlightSource, cache_dir, progress=None, cancelled=Non
 
 
 def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interval_s=1.0,
-                      max_frames=None, start_s=None, end_s=None, progress=None, cancelled=None) -> Iterator:
+                      max_frames=None, start_s=None, end_s=None, progress=None, cancelled=None,
+                      video_coverage: VideoCoverage | None = None) -> Iterator:
     """Yield upright RGB observations with exact global frame-counter matching.
 
     start_s/end_s are seconds relative to the first frame synchronization time.
@@ -576,8 +668,7 @@ def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interva
         raise ValueError("Frame sampling interval must be positive.")
     if max_frames is not None and max_frames <= 0:
         return
-    if not source.videos:
-        raise FlightError("No RGB videos were found.")
+    coverage = video_coverage or inspect_video_coverage(source, telemetry, cancelled)
     has_sync = len(telemetry.frame_indices) > 0
     origin = float(telemetry.frame_times_s[0]) if has_sync else telemetry.video_offset_s
     lower = origin + (start_s or 0)
@@ -585,33 +676,14 @@ def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interva
     last_sample = -np.inf
     emitted = global_start = 0
     fallback_segment_offset = 0.0
-    # Validate all segments before yielding even a limited preview.
-    total_frames = 0
-    for video in source.videos:
-        _check_cancel(cancelled)
-        probe = cv2.VideoCapture(str(video))
-        try:
-            if not probe.isOpened():
-                raise FlightError(f'Cannot decode RGB video: {video.name}')
-            total_frames += int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
-        finally:
-            probe.release()
+    total_frames = coverage.total_frames
     if has_sync:
-        if telemetry.frame_indices[-1] >= total_frames:
-            raise FlightError('FrameSync references frames beyond available RGB footage; a segment may be missing.')
-        unmatched = total_frames - len(telemetry.frame_indices)
-        telemetry.timing_diagnostics['encoded_video_frames'] = total_frames
-        telemetry.timing_diagnostics['untimestamped_video_frames_skipped'] = unmatched
         usable_start = max(telemetry.pose_times_s[0], telemetry.pitch_times_s[0])
         usable_end = min(telemetry.pose_times_s[-1], telemetry.pitch_times_s[-1])
         telemetry.timing_diagnostics['timestamped_frames_outside_pose_tilt_interval'] = int(
             np.sum((telemetry.frame_times_s < usable_start) | (telemetry.frame_times_s > usable_end)))
-        if unmatched:
-            warning = (f'{unmatched} encoded frames have no FrameSync timestamp and are skipped. '
-                       'Counter-to-decoded-frame alignment still requires visual calibration checks.')
-            if warning not in telemetry.warnings:
-                telemetry.warnings.append(warning)
-    for segment, video in enumerate(source.videos):
+    for segment, segment_info in enumerate(coverage.segments):
+        video = segment_info.path
         _check_cancel(cancelled)
         capture = cv2.VideoCapture(str(video))
         if not capture.isOpened():
@@ -622,10 +694,8 @@ def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interva
             rotation = int(round(capture.get(cv2.CAP_PROP_ORIENTATION_META))) % 360
             if rotation not in (0, 90, 180, 270):
                 raise FlightError(f"Unsupported video display rotation {rotation} degrees.")
-            count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = float(capture.get(cv2.CAP_PROP_FPS))
-            if count <= 0 or not np.isfinite(fps) or fps <= 0:
-                raise FlightError(f"Video has no usable frame count/rate: {video.name}")
+            count = segment_info.frame_count
+            fps = segment_info.fps
             if has_sync:
                 mask = ((telemetry.frame_indices >= global_start) & (telemetry.frame_indices < global_start + count)
                         & (telemetry.frame_times_s >= lower) & (telemetry.frame_times_s <= upper))
@@ -680,5 +750,3 @@ def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interva
             capture.release()
     if emitted == 0:
         raise FlightError("No RGB frame has valid overlapping pose, tilt and synchronization telemetry.")
-    if has_sync and telemetry.frame_indices[-1] >= global_start:
-        raise FlightError("FrameSync references frames beyond the available video segments; one or more RGB files may be missing.")

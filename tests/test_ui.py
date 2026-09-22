@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from elios_colorizer.ui import MainWindow
 
@@ -173,3 +173,23 @@ def test_missing_inputs_block_processing(ui, tmp_path):
     assert not window.run_button.isEnabled()
     window._start_colorization()
     assert not window.backend.run_started.is_set()
+
+
+def test_long_paths_stay_inside_panels(ui):
+    window = ui(FakeBackend())
+    window.resize(820, 680)
+    long_path = 'C:/' + '/'.join(['very_long_flight_folder_name'] * 14) + '/flight_obcbag.mcap'
+    window.source_edit.setText(long_path)
+    window.checklist.set_rows([
+        {'label': 'Position and orientation', 'status': 'ok', 'detail': long_path},
+        {'label': 'Camera tilt and video timing', 'status': 'ok', 'detail': long_path},
+    ])
+    window.dependencies.set_rows([
+        {'label': 'A deliberately long dependency label', 'status': 'ok', 'detail': '1.2.3'}
+    ])
+    window.show()
+    QApplication.processEvents()
+
+    scroll = window.centralWidget()
+    assert scroll.horizontalScrollBar().maximum() == 0
+    assert any('\u200b' in label.text() for label in window.checklist.findChildren(QLabel))

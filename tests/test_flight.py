@@ -3,7 +3,8 @@ import struct
 import binascii
 import numpy as np
 import pytest
-from elios_colorizer.flight import (FlightError, Telemetry, discover_source, parse_starnet, _read_trajectory)
+from elios_colorizer.flight import (FlightError, FlightSource, Telemetry, discover_source,
+                                    inspect_video_coverage, parse_starnet, _read_trajectory)
 
 
 def metadata(folder, identity='same-flight', native=False):
@@ -99,3 +100,57 @@ def test_starnet_rejects_inconsistent_video_offset(tmp_path):
     path.write_bytes(data)
     with pytest.raises(FlightError, match='VideoOffset disagrees'):
         parse_starnet(path)
+
+
+class FakeVideoCapture:
+    def __init__(self, path, frame_count=3, fps=30.0):
+        self.frame_count = frame_count
+        self.fps = fps
+
+    def isOpened(self):
+        return True
+
+    def get(self, prop):
+        import cv2
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return self.frame_count
+        if prop == cv2.CAP_PROP_FPS:
+            return self.fps
+        return 0
+
+    def release(self):
+        pass
+
+
+def test_video_coverage_skips_small_framesync_tail(tmp_path, monkeypatch):
+    import cv2
+    video = tmp_path / 'segment.mov'
+    video.touch()
+    telemetry = make_telemetry()
+    telemetry.frame_indices = np.arange(5, dtype=np.int64)
+    telemetry.frame_times_s = np.arange(5, dtype=float) / 30
+    source = FlightSource(tmp_path, videos=(video,))
+    monkeypatch.setattr(cv2, 'VideoCapture', FakeVideoCapture)
+
+    coverage = inspect_video_coverage(source, telemetry)
+
+    assert coverage.total_frames == 3
+    assert coverage.synchronized_frames_available == 3
+    assert coverage.frame_sync_records_beyond_video == 2
+    assert coverage.last_available_sync_time_s == pytest.approx(2 / 30)
+    assert telemetry.timing_diagnostics['frame_sync_records_beyond_video'] == 2
+    assert any('trailing FrameSync' in warning for warning in telemetry.warnings)
+
+
+def test_video_coverage_rejects_large_overrun(tmp_path, monkeypatch):
+    import cv2
+    video = tmp_path / 'segment.mov'
+    video.touch()
+    telemetry = make_telemetry()
+    telemetry.frame_indices = np.array([0, 1000], dtype=np.int64)
+    telemetry.frame_times_s = np.array([0., 1.])
+    source = FlightSource(tmp_path, videos=(video,))
+    monkeypatch.setattr(cv2, 'VideoCapture', FakeVideoCapture)
+
+    with pytest.raises(FlightError, match='too large'):
+        inspect_video_coverage(source, telemetry)

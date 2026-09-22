@@ -34,6 +34,8 @@ All six coarse scans favored zero additional shift on a 50 ms search grid, with 
 
 FrameSync has **14,346** records while the video has **14,348** encoded frames. The current convention maps counter 1 to decoded global frame 0. The two frames without timestamps are skipped. Three additional timestamped tail frames fall beyond the last valid pose and are also skipped. The common recorded interval is **319.790390–798.335606 s**. Missing tails are never stretched or extrapolated to force equal durations.
 
+Some recordings have the inverse finalization mismatch: a few trailing FrameSync records exist after the final encoded RGB frame. The application checks this before LAS indexing and skips only those unavailable tail records. It retains the exact counter mapping for every earlier frame and records both counts in the processing report. An overrun larger than ten seconds or 0.5% of the recording is still rejected as a possible missing or seriously truncated segment.
+
 ## Application safeguards added
 
 - Reject metadata video offset versus first FrameSync disagreement above 10 ms.

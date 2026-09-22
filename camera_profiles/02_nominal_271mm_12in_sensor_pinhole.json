@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "profile_name": "UNVALIDATED nominal 2.71 mm lens and 1/2.3-inch sensor estimate; diagnostic only",
+  "validated": false,
+  "image_width": 3840,
+  "image_height": 2160,
+  "intrinsics": {
+    "fx": 1690.0,
+    "fy": 1290.0,
+    "cx": 1920.0,
+    "cy": 1080.0
+  },
+  "distortion": {
+    "model": "pinhole",
+    "coefficients": []
+  },
+  "camera_to_body": {
+    "rotation_xyzw": [
+      0.5,
+      -0.5,
+      0.5,
+      -0.5
+    ],
+    "translation_m": [
+      0.27,
+      0.0,
+      0.0
+    ],
+    "tilt_axis_body": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "tilt_pivot_body_m": [
+      0.27,
+      0.0,
+      0.0
+    ],
+    "tilt_sign": -1.0,
+    "tilt_zero_degrees": 0.0
+  }
+}

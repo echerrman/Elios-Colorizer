@@ -1,0 +1,14 @@
+.venv/
+.local_deps/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+Flight_Data/
+outputs/
+.cache/
+analysis/native_flight/*.csv
+analysis/native_flight/*.jpg
+

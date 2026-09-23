@@ -6,10 +6,11 @@ A local Windows desktop application that projects synchronized RGB video onto an
 
 Double-click **Launch Elios Colorizer.cmd**, or open **dist/EliosColorizer/EliosColorizer.exe**. When copying to another Windows computer, copy the entire `dist/EliosColorizer` folder, including `_internal`; the EXE alone is not sufficient. The development launcher uses `.venv` when a portable build is unavailable.
 
-1. Select a native Inspector flight folder, its matching export folder, or their common parent. Native/export folders are paired only when their metadata contains the same flight UUID.
-2. Check the input and dependency panels. If the LAS is stored elsewhere, select it using the point-cloud browse button.
-3. Select a measured and verified **RGB camera calibration profile**, once per camera/recording mode. Later launches remember the selected profile. Confirm that it applies to the selected drone.
-4. Choose a new `.las` output filename, then select **Colorize point cloud**. Progress and cancellation remain available while processing. Existing files are not overwritten.
+1. Add one row per flight and select its native Inspector folder and matching exported LAS/LAZ. Leave the default single row to use the original single-flight workflow.
+2. Select one measured and verified **RGB camera calibration profile** shared by every selected flight. The combined checklist verifies all flights before processing.
+3. Choose **Separate colorized LAS files** to process one or many flights independently, or **Align and merge into one cloud** for two or more flights.
+4. Optionally enable a maximum camera-to-point colorization distance. Leaving it off preserves the original all-distance behavior.
+5. Choose an output `.las` for a single or merged result, or an output folder for multiple separate results, then run the workflow. Existing files are not overwritten.
 
 **Current Flight 1 limitation:** all flight inputs are available, but a validated 4K RGB lens/mount/tilt calibration is not present. Normal processing intentionally reports this as a missing input. The included YAMLs are for the navigation cameras. The desktop build is ready for interface and input-discovery testing; accurate final-flight colorization still needs RGB calibration. See [the calibration guide](docs/CALIBRATION.md).
 
@@ -39,7 +40,9 @@ Processing uses LAS chunks and disk-backed color buffers. Temporary working file
 
 Version 0.2 adds automatic CPU acceleration without changing projection or scoring. The app keeps 250,000-point chunks and four-view batches because larger values were slower on the real Flight 1 sample. When safe memory headroom is available, it decodes XYZ once into an in-memory cache and uses up to four CPU workers for independent visibility frames and disjoint point chunks. It automatically falls back to the original bounded-memory streaming path on smaller-memory systems. There is no user setting to tune and no CUDA dependency.
 
-Version 0.2.1 accepts the small FrameSync tail mismatch produced by some otherwise normal Inspector recordings. Video coverage is checked before LAS indexing; unavailable trailing synchronization records are skipped without shifting any earlier frame, while a large mismatch still stops as a possible missing segment. Long paths now wrap within checklist cards and input fields remain constrained to the window.
+Version 0.2.1 accepts the small FrameSync tail mismatch produced by some otherwise normal Inspector recordings. Video coverage is checked before LAS indexing; unavailable trailing synchronization records are skipped without shifting any earlier frame, while a large mismatch still stops as a possible missing segment. Long paths wrap within checklist cards and input fields remain constrained to the window.
+
+Version 0.3 adds multi-flight processing. Every flight is colorized independently and records the winning view's confidence and camera distance. Separate mode writes one geometry-preserving LAS per flight. Merged mode checks alignment against the first cloud and accepts only a small rigid correction that improves held-out nearest-neighbor metrics within strict movement bounds; otherwise it retains the original Inspector coordinates. Nearby observations keep the highest-confidence color rather than blurring disagreements, and uncolored points are removed after all flights have had a chance to supply RGB. Merged mode works best when the point clouds are already well aligned in Inspector and use the same coordinate system.
 
 The repeatable benchmark in `tools/benchmark_performance.py` used 16 fixed 4K Flight 1 observations and 1,064,482 uniformly sampled source points. Across three rotated trials, the cached four-worker configuration completed the projection portion in a median 7.147 seconds versus 15.874 seconds for the single-worker streamed baseline, a **2.22× speedup**. Eight streamed workers reached only 2.02×, so the application caps concurrency at four to avoid extra memory pressure for negligible benefit. Every RGB channel and `Colorized` flag was identical across all configurations. The longer end-to-end runtime also includes video seeking/decoding, telemetry extraction on a cold cache, LAS indexing, and final LAS writing, so overall speedup varies.
 

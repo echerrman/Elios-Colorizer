@@ -72,6 +72,19 @@ class FakeBackend:
             raise RuntimeError("Test did not cancel processing")
         return {"output": output, "report": str(Path(output).with_suffix(".json")), "colored_points": 75, "total_points": 100}
 
+    def inspect_sources(self, flights, calibration_override=None):
+        self.calls.append(tuple(item["folder"] for item in flights))
+        return {"ready": True, "checklist": [{"label": "All flights", "status": "ok", "detail": "Ready"}],
+                "dependencies": [], "summary": f"{len(flights)} flights"}
+
+    def run_workflow(self, flights, output, calibration_override=None, *, mode,
+                     maximum_color_distance_m, progress, cancelled):
+        self.last_run = (flights, output, calibration_override, mode, maximum_color_distance_m)
+        self.run_started.set()
+        progress("Workflow", .5, "Working")
+        return {"output": output, "report": str(Path(output) / "report.json"),
+                "colored_points": 150, "total_points": 200}
+
 
 @pytest.fixture
 def ui(app):
@@ -193,3 +206,29 @@ def test_long_paths_stay_inside_panels(ui):
     scroll = window.centralWidget()
     assert scroll.horizontalScrollBar().maximum() == 0
     assert any('\u200b' in label.text() for label in window.checklist.findChildren(QLabel))
+
+
+def test_multi_flight_modes_and_optional_distance(ui, tmp_path):
+    backend = FakeBackend()
+    window = ui(backend)
+    second = window._add_flight()
+    window.source_edit.setText("flight-one")
+    window.las_edit.setText("one.las")
+    second.folder_edit.setText("flight-two")
+    second.las_edit.setText("two.las")
+    window.calibration_edit.setText("shared.json")
+    output = tmp_path / "separate"
+    window.output_edit.setText(str(output))
+    window.distance_check.setChecked(True)
+    window.distance_spin.setValue(6.5)
+    window._start_pending_inspection()
+    wait_until(lambda: window._thread is None)
+    assert window.run_button.isEnabled()
+    window._start_colorization()
+    wait_until(lambda: window._thread is None)
+    flights, saved, calibration, mode, distance = backend.last_run
+    assert [item["folder"] for item in flights] == ["flight-one", "flight-two"]
+    assert (saved, calibration, mode, distance) == (str(output), "shared.json", "separate", 6.5)
+    window.mode_combo.setCurrentIndex(1)
+    assert "already well aligned" in window.mode_help.text()
+    assert not window.run_button.isEnabled()  # merged mode needs a .las output

@@ -18,6 +18,8 @@ def main() -> int:
     run.add_argument('--start', dest='start_s', type=float, help='Elapsed seconds from video start')
     run.add_argument('--end', dest='end_s', type=float)
     run.add_argument('--experimental', action='store_true', help='Diagnostic output with an unvalidated calibration; do not treat as reliable colorization')
+    run.add_argument('--max-color-distance', dest='maximum_color_distance_m', type=float,
+                     help='Optional maximum camera-to-point colorization distance in meters')
     args = vars(parser.parse_args())
     command = args.pop('command')
     try:

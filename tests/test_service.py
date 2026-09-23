@@ -1,8 +1,9 @@
 from elios_colorizer.selftest import create_fixture
-from elios_colorizer.service import inspect_source, run_colorization
+from elios_colorizer.service import inspect_source, run_colorization, run_workflow
 import laspy
 import numpy as np
 import pytest
+from pathlib import Path
 
 
 def test_complete_service_and_source_immutability(tmp_path, monkeypatch):
@@ -46,3 +47,23 @@ def test_header_timestamp_not_arrival_and_wrong_clock_offset_rejected(tmp_path):
     (source / 'flight.json').write_text(json.dumps(metadata))
     with pytest.raises(FlightError, match='metadata video offset disagrees'):
         load_telemetry(discover_source(source), tmp_path / 'cache')
+
+
+def test_complete_two_flight_merged_workflow(tmp_path, monkeypatch):
+    import json
+    first = create_fixture(tmp_path / 'first')
+    second = create_fixture(tmp_path / 'second')
+    metadata = json.loads((second / 'flight.json').read_text())
+    metadata['id'] = 'synthetic-second-flight'
+    (second / 'flight.json').write_text(json.dumps(metadata))
+    monkeypatch.setenv('ELIOS_COLORIZER_CACHE', str(tmp_path / 'cache'))
+    result = run_workflow([{'folder': str(first)}, {'folder': str(second)}],
+                          str(tmp_path / 'merged.las'), mode='merge')
+    merged = laspy.read(result['output'])
+    assert result['colored_points'] == result['total_points'] == 3
+    assert np.all(merged.Colorized == 1)
+    assert set(merged.point_format.extra_dimension_names) >= {
+        'Colorized', 'ColorConfidence', 'ColorDistance', 'SourceFlight'}
+    report = json.loads(Path(result['report']).read_text())
+    assert len(report['flight_results']) == 2
+    assert all('.elios-workflow-' not in str(item) for item in report['flight_results'])

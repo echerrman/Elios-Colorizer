@@ -64,6 +64,7 @@ class ColorizationOptions:
     reject_exposure_extremes: bool = True
     overwrite: bool = False
     experimental_calibration: bool = False
+    maximum_color_distance_m: float | None = None
     cache_xyz: bool | None = None
     worker_threads: int = 1
 
@@ -75,6 +76,8 @@ class ColorizationOptions:
                 or not 0 < self.minimum_depth_m < self.maximum_depth_m
                 or self.occlusion_absolute_tolerance_m < 0
                 or self.occlusion_relative_tolerance < 0
+                or (self.maximum_color_distance_m is not None
+                    and not self.minimum_depth_m < self.maximum_color_distance_m <= self.maximum_depth_m)
                 or not 0 <= self.minimum_luminance < self.maximum_luminance <= 255
                 or self.minimum_sharpness < 0):
             raise ValueError("Invalid projection or image-quality options")
@@ -272,7 +275,8 @@ def _update_visibility(xyz: np.ndarray, frame: _PreparedFrame, calibration: Cali
 
 
 def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFrame],
-                         colors: np.ndarray, quality: np.ndarray, calibration: Calibration,
+                         colors: np.ndarray, quality: np.ndarray, distances: np.ndarray,
+                         calibration: Calibration,
                          options: ColorizationOptions) -> tuple[int, int]:
     """Color one disjoint LAS slice while preserving chronological frame order."""
     for frame in batch:
@@ -288,7 +292,10 @@ def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
         usable = np.ones(len(rgb), dtype=bool)
         if options.reject_exposure_extremes:
             usable &= (luminance >= options.minimum_luminance) & (luminance <= options.maximum_luminance)
-        cosine = z / np.linalg.norm(camera, axis=1)
+        point_distance = np.linalg.norm(camera, axis=1)
+        if options.maximum_color_distance_m is not None:
+            usable &= point_distance <= options.maximum_color_distance_m
+        cosine = z / point_distance
         border_distance = np.minimum.reduce((uv[:, 0] / calibration.image_width,
             uv[:, 1] / calibration.image_height,
             1 - uv[:, 0] / calibration.image_width, 1 - uv[:, 1] / calibration.image_height))
@@ -301,6 +308,7 @@ def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
         chosen = indices[better]
         colors[chosen] = rgb[better].astype(np.uint16) * 257
         quality[chosen] = score[better]
+        distances[chosen] = point_distance[better].astype(np.float32)
     return offset, len(xyz)
 
 
@@ -336,6 +344,15 @@ def _output_header(source: laspy.LasHeader) -> laspy.LasHeader:
             raise ColorizationError("Existing Colorized dimension must be uint8")
     else:
         header.add_extra_dim(laspy.ExtraBytesParams("Colorized", "uint8", description="1=RGB observed; 0=unobserved"))
+    for name, description in (
+        ("ColorConfidence", "RGB observation confidence"),
+        ("ColorDistance", "Winning camera distance (m)"),
+    ):
+        if name in header.point_format.dimension_names:
+            if header.point_format.dimension_by_name(name).dtype != np.dtype("float32"):
+                raise ColorizationError(f"Existing {name} dimension must be float32")
+        else:
+            header.add_extra_dim(laspy.ExtraBytesParams(name, "float32", description=description))
     return header
 
 
@@ -380,7 +397,7 @@ def colorize_las(
     header = _output_header(original_header)
     destination.parent.mkdir(parents=True, exist_ok=True)
     use_xyz_cache = _use_xyz_cache(count, options)
-    required_bytes = count * (header.point_format.size + 10) + 64 * 1024**2
+    required_bytes = count * (header.point_format.size + 14) + 64 * 1024**2
     if shutil.disk_usage(destination.parent).free < required_bytes:
         raise ColorizationError(f"Insufficient output disk space; need about {required_bytes / 1024**3:.2f} GiB")
     received, used, rejected = 0, 0, 0
@@ -388,6 +405,7 @@ def colorize_las(
         work = Path(scratch)
         colors = np.memmap(work / "rgb.u16", mode="w+", dtype=np.uint16, shape=(count, 3))
         quality = np.memmap(work / "quality.f32", mode="w+", dtype=np.float32, shape=(count,))
+        distances = np.memmap(work / "distance.f32", mode="w+", dtype=np.float32, shape=(count,))
         # Freshly created mapped files are zero initialized by the operating system.
         try:
             # Chunk bounds are tiny (about 4 KB per 20M points) and let later passes
@@ -446,12 +464,12 @@ def colorize_las(
                                                 borderType=cv2.BORDER_CONSTANT, borderValue=float("inf"))
                 chunks = _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache)
                 if executor is None:
-                    completed_chunks = (_assign_chunk_colors(offset, xyz, batch, colors, quality,
+                    completed_chunks = (_assign_chunk_colors(offset, xyz, batch, colors, quality, distances,
                                                              calibration, options) for offset, xyz in chunks)
                 else:
                     completed_chunks = _bounded_parallel_map(
                         executor,
-                        lambda item: _assign_chunk_colors(item[0], item[1], batch, colors, quality,
+                        lambda item: _assign_chunk_colors(item[0], item[1], batch, colors, quality, distances,
                                                           calibration, options),
                         chunks, options.worker_threads)
                 for offset, length in completed_chunks:
@@ -477,6 +495,8 @@ def colorize_las(
                     points.blue = colors[offset:offset + length, 2]
                     observed = quality[offset:offset + length] > 0
                     points["Colorized"] = observed.astype(np.uint8)
+                    points["ColorConfidence"] = quality[offset:offset + length]
+                    points["ColorDistance"] = distances[offset:offset + length]
                     colored += int(observed.sum())
                     writer.write_points(points)
                     offset += length
@@ -506,3 +526,4 @@ def colorize_las(
             # Windows cannot remove an open memory-mapped file.
             colors._mmap.close()
             quality._mmap.close()
+            distances._mmap.close()

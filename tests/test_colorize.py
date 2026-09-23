@@ -108,6 +108,17 @@ def test_best_observation_wins(tmp_path, camera, options):
     assert output.green[0] == 200 * 257
 
 
+def test_optional_distance_limit_and_provenance(tmp_path, camera, options):
+    make_las(tmp_path / "source.las", [(0, 0, 2), (3, 0, 5)])
+    colorize_las(tmp_path / "source.las", tmp_path / "output.las", [solid_frame()], camera,
+                 options=replace(options, maximum_color_distance_m=3.0))
+    output = laspy.read(tmp_path / "output.las")
+    np.testing.assert_array_equal(output.Colorized, [1, 0])
+    assert output.ColorConfidence[0] > 0
+    assert output.ColorDistance[0] == pytest.approx(2.0)
+    assert output.ColorConfidence[1] == output.ColorDistance[1] == 0
+
+
 def test_cancel_is_atomic_and_does_not_touch_input(tmp_path, camera, options):
     source = tmp_path / "source.las"
     make_las(source, [(0, 0, 2), (1, 0, 2)])

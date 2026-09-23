@@ -1,0 +1,92 @@
+name: Bug report
+description: Report a reproducible application, processing, or packaging problem.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. Remove flight footage, customer or facility names, credentials, precise locations, and other sensitive information before posting.
+
+  - type: input
+    id: version
+    attributes:
+      label: Elios Colorizer version
+      description: Use the version shown in the processing report or release name.
+      placeholder: "0.2.1"
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: workflow
+    attributes:
+      label: Workflow
+      options:
+        - Single flight
+        - Multiple separate flights
+        - Multi-flight alignment and merge
+        - Application startup or packaging
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe what happened and where processing stopped.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Select...
+        2. Choose...
+        3. Run...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Paste the error and relevant processing details. Remove private paths and identifying flight information.
+      render: shell
+
+  - type: input
+    id: inspector
+    attributes:
+      label: Inspector and flight-data version
+      description: Include the Inspector version and drone model when known.
+      placeholder: "Inspector 5.x, Elios 3"
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed confidential flight data, locations, customer information, credentials, and private file paths.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

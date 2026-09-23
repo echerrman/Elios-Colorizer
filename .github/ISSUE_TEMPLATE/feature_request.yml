@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest a focused improvement to the application or workflow.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem first. Please do not include confidential flight or customer data.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What task is difficult or impossible today, and who encounters it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain how you expect the application to behave.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe current workarounds or other approaches you considered.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add sanitized examples, mockups, or compatibility details when useful.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and requests for this feature.
+          required: true
+        - label: I removed confidential flight, customer, facility, credential, and location information.
+          required: true

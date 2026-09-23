@@ -60,8 +60,9 @@ def test_complete_two_flight_merged_workflow(tmp_path, monkeypatch):
     result = run_workflow([{'folder': str(first)}, {'folder': str(second)}],
                           str(tmp_path / 'merged.las'), mode='merge')
     merged = laspy.read(result['output'])
-    assert result['colored_points'] == result['total_points'] == 3
-    assert np.all(merged.Colorized == 1)
+    assert result['colored_points'] == 3
+    assert result['total_points'] == 4
+    assert list(merged.Colorized).count(0) == 1
     assert set(merged.point_format.extra_dimension_names) >= {
         'Colorized', 'ColorConfidence', 'ColorDistance', 'SourceFlight'}
     report = json.loads(Path(result['report']).read_text())

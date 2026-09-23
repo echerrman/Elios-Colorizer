@@ -44,7 +44,7 @@ def test_alignment_accepts_only_verified_improvement_and_keeps_good_original(tmp
     assert "original inspector coordinates retained" in results[2].note.lower()
 
 
-def test_fusion_selects_best_confidence_and_removes_uncolored(tmp_path):
+def test_fusion_selects_best_confidence_and_retains_uncolored(tmp_path):
     first = tmp_path / "first.las"
     second = tmp_path / "second.las"
     make_colored(first, np.array([[0, 0, 0], [.1, 0, 0], [.5, 0, 0]]),
@@ -56,8 +56,15 @@ def test_fusion_selects_best_confidence_and_removes_uncolored(tmp_path):
                          alignments=(identity(first), identity(second)), voxel_size_m=.01)
     output = laspy.read(result.output_path)
     assert result.input_colored_points == 4
-    assert result.point_count == 3
+    assert result.input_point_count == 5
+    assert result.point_count == 4
+    assert result.colored_point_count == 3
     overlap = np.argmin(np.abs(np.asarray(output.x)))
     assert output.blue[overlap] == 60000 and output.red[overlap] == 0
     assert output.SourceFlight[overlap] == 2
-    assert np.all(output.Colorized == 1)
+    assert np.count_nonzero(output.Colorized) == 3
+    uncolored = np.flatnonzero(output.Colorized == 0)
+    assert len(uncolored) == 1
+    index = int(uncolored[0])
+    assert output.x[index] == .5
+    assert output.red[index] == output.green[index] == output.blue[index] == 0

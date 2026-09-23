@@ -455,10 +455,10 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
         'fusion': fusion_report,
         'alignment_policy': ('Original Inspector coordinates are authoritative. A bounded rigid correction is '
                              'used only when held-out nearest-neighbor metrics improve; otherwise identity is used.'),
-        'uncolored_points': 'Excluded after all flight observations were reconciled.',
+        'uncolored_points': 'Retained with RGB=(0,0,0) and Colorized=0 after flight reconciliation.',
     }
     with report_path.open('x', encoding='utf-8') as handle:
         json.dump(payload, handle, indent=2)
     return dict(output=str(destination), report=str(report_path),
-                colored_points=fused.point_count, total_points=fused.point_count,
+                colored_points=fused.colored_point_count, total_points=fused.point_count,
                 source_colored_points=sum(int(item['colored_points']) for item in flight_results))

@@ -1,6 +1,6 @@
 """Desktop interface for single- and multi-flight colorization."""
 from __future__ import annotations
-import json, re, sys, threading, time, traceback
+import re, sys, threading, time, traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -128,11 +128,11 @@ class MainWindow(QMainWindow):
         self.backend=backend; self.settings=QSettings("EliosColorizer","EliosColorizer"); self.flight_rows=[]
         self._thread=self._worker=None; self._job_kind=""; self._job_selection=None; self._job_revision=self._revision=0
         self._inspection_pending=False; self._inspected_selection=None; self._ready=False; self._cancellation=threading.Event(); self._close_when_idle=False
-        self._last_result=None; self._last_progress_message=""; self._run_started_at=None; self._dark_mode=self.settings.value("dark_mode",False,type=bool)
+        self._last_result=None; self._last_progress_message=""; self._run_started_at=None; self._dark_mode=False
         self._elapsed_timer=QTimer(self); self._elapsed_timer.setInterval(500); self._elapsed_timer.timeout.connect(self._update_elapsed)
         self.setWindowTitle("Elios Colorizer"); self.resize(1080,920); self.setMinimumSize(820,680); self._build(); self._apply_theme()
         self._debounce=QTimer(self); self._debounce.setSingleShot(True); self._debounce.setInterval(350); self._debounce.timeout.connect(self._start_pending_inspection)
-        self.calibration_edit.textChanged.connect(self._inputs_changed); self.output_edit.textChanged.connect(self._update_actions)
+        self.calibration_edit.textChanged.connect(self._calibration_changed); self.output_edit.textChanged.connect(self._update_actions)
         self.mode_combo.currentIndexChanged.connect(self._mode_changed); self.distance_check.toggled.connect(self._distance_changed)
         if restore_settings:self._restore_settings()
         self._sync_aliases(); self._show_empty(); self._mode_changed()
@@ -174,18 +174,20 @@ class MainWindow(QMainWindow):
     def _inspection_selection(self):
         x=self._selection(); return WorkflowSelection(x.flights,x.calibration_override)
     def _restore_settings(self):
-        try:saved=json.loads(str(self.settings.value("flights","")))
-        except (ValueError,TypeError):saved=[]
-        if not saved:saved=[{"folder":str(self.settings.value("source","")),"las_override":""}]
-        while len(self.flight_rows)<len(saved):self._add_flight(trigger=False)
-        for row,item in zip(self.flight_rows,saved):row.folder_edit.setText(str(item.get("folder","")));row.las_edit.setText(str(item.get("las_override") or ""))
-        self.output_edit.setText(str(self.settings.value("output",""))); self.calibration_edit.setText(str(self.settings.value("calibration",""))); self.mode_combo.setCurrentIndex(max(0,self.mode_combo.findData(str(self.settings.value("mode","separate"))))); self.distance_check.setChecked(self.settings.value("distance_enabled",False,type=bool)); self.distance_spin.setValue(float(self.settings.value("distance_m",8)))
+        calibration=str(self.settings.value("calibration","") or "")
+        for key in ("flights","source","output","mode","distance_enabled","distance_m","dark_mode"):
+            self.settings.remove(key)
+        self.calibration_edit.setText(calibration)
     def _save_settings(self):
-        self.settings.setValue("flights",json.dumps([x.to_dict() for x in self._selection().flights])); self.settings.setValue("source",self.source_edit.text()); self.settings.setValue("output",self.output_edit.text()); self.settings.setValue("calibration",self.calibration_edit.text()); self.settings.setValue("mode",self.mode_combo.currentData()); self.settings.setValue("distance_enabled",self.distance_check.isChecked()); self.settings.setValue("distance_m",self.distance_spin.value())
+        calibration=self.calibration_edit.text().strip()
+        if calibration:self.settings.setValue("calibration",calibration)
+        else:self.settings.remove("calibration")
+    def _calibration_changed(self,*_):
+        self._save_settings();self._inputs_changed()
     def _apply_theme(self):
         self.setStyleSheet(_DARK_STYLE if self._dark_mode else _LIGHT_STYLE)
         if hasattr(self,"theme_button"):self.theme_button.setIcon(QIcon(str(_asset_path("theme-moon.svg" if self._dark_mode else "theme-sun.svg"))));self.theme_button.setText("Light mode" if self._dark_mode else "Dark mode")
-    def _toggle_theme(self):self._dark_mode=self.theme_button.isChecked();self.settings.setValue("dark_mode",self._dark_mode);self._apply_theme()
+    def _toggle_theme(self):self._dark_mode=self.theme_button.isChecked();self._apply_theme()
     def _show_empty(self):self.checklist.set_rows([{"label":"Flight inputs","status":"warning","detail":"Select a folder for every flight."}])
     def _browse_calibration(self):
         path,_=QFileDialog.getOpenFileName(self,"Choose RGB camera profile",self.calibration_edit.text() or self.source_edit.text(),"Camera profile (*.json)")
@@ -193,7 +195,7 @@ class MainWindow(QMainWindow):
     def _browse_output(self):
         if self.mode_combo.currentData()=="separate" and len(self.flight_rows)>1:path=QFileDialog.getExistingDirectory(self,"Choose output folder",self.output_edit.text())
         else:
-            path,_=QFileDialog.getSaveFileName(self,"Save colorized point cloud",self.output_edit.text() or "colorized.las","LAS point cloud (*.las)",options=QFileDialog.Option.DontConfirmOverwrite)
+            path,_=QFileDialog.getSaveFileName(self,"Save colorized point cloud",self.output_edit.text(),"LAS point cloud (*.las)",options=QFileDialog.Option.DontConfirmOverwrite)
             if path and not Path(path).suffix:path+=".las"
         if path:self.output_edit.setText(path)
     def _mode_changed(self,*_):

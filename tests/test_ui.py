@@ -15,6 +15,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel
 
+import elios_colorizer.ui as ui_module
 from elios_colorizer.ui import MainWindow
 
 
@@ -125,6 +126,16 @@ def test_ready_requires_validated_inputs_and_las_output(ui, tmp_path):
     assert not window.run_button.isEnabled()
 
 
+def test_selecting_inputs_does_not_populate_output(ui):
+    window = ui(FakeBackend())
+    window.source_edit.setText("flight")
+    window.las_edit.setText("source.las")
+    window._start_pending_inspection()
+    wait_until(lambda: window._thread is None)
+    assert window.output_edit.text() == ""
+    assert not window.run_button.isEnabled()
+
+
 def test_old_inspection_cannot_enable_new_source(ui, tmp_path):
     backend = FakeBackend()
     backend.block_first = True
@@ -232,3 +243,45 @@ def test_multi_flight_modes_and_optional_distance(ui, tmp_path):
     window.mode_combo.setCurrentIndex(1)
     assert "already well aligned" in window.mode_help.text()
     assert not window.run_button.isEnabled()  # merged mode needs a .las output
+
+
+def test_only_camera_calibration_is_restored_between_sessions(app, monkeypatch):
+    class MemorySettings:
+        values = {
+            "flights": '[{"folder":"old-flight","las_override":"old.las"}]',
+            "source": "old-flight",
+            "output": "old-output.las",
+            "calibration": "saved-camera.json",
+            "mode": "merge",
+            "distance_enabled": True,
+            "distance_m": 12.0,
+            "dark_mode": True,
+        }
+
+        def __init__(self, *_): pass
+        def value(self, key, default=None, **_): return self.values.get(key, default)
+        def setValue(self, key, value): self.values[key] = value
+        def remove(self, key): self.values.pop(key, None)
+
+    monkeypatch.setattr(ui_module, "QSettings", MemorySettings)
+    window = MainWindow(FakeBackend(), restore_settings=True)
+    try:
+        assert len(window.flight_rows) == 1
+        assert window.source_edit.text() == ""
+        assert window.las_edit.text() == ""
+        assert window.output_edit.text() == ""
+        assert window.calibration_edit.text() == "saved-camera.json"
+        assert window.mode_combo.currentData() == "separate"
+        assert not window.distance_check.isChecked()
+        assert not window._dark_mode
+        window.source_edit.setText("new-flight")
+        window.las_edit.setText("new.las")
+        window.output_edit.setText("new-output.las")
+        window.calibration_edit.setText("new-camera.json")
+        window._save_settings()
+        assert MemorySettings.values == {"calibration": "new-camera.json"}
+    finally:
+        window._debounce.stop()
+        window.close()
+        window.deleteLater()
+        QApplication.processEvents()

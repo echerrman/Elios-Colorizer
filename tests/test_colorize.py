@@ -10,8 +10,9 @@ from scipy.spatial.transform import Rotation
 
 from elios_colorizer.camera import Calibration, CalibrationError
 from elios_colorizer.colorize import (
+    adaptively_select_observations,
     ColorizationCancelled, ColorizationError, ColorizationOptions,
-    FrameObservation, colorize_las,
+    FrameObservation, colorize_las, group_nearby_observations,
 )
 
 
@@ -50,6 +51,30 @@ def solid_frame(rgb=(100, 150, 200), **kwargs):
     image = np.empty((100, 100, 3), dtype=np.uint8)
     image[:] = rgb
     return FrameObservation(image, (0, 0, 0), (0, 0, 0, 1), 0, 1.0, **kwargs)
+
+
+def test_adaptive_selection_and_spatial_view_grouping():
+    base = solid_frame()
+    frames = [
+        replace(base, position_world_m=(0, 0, 0), timestamp_s=0),
+        replace(base, position_world_m=(.01, 0, 0), timestamp_s=1),
+        replace(base, position_world_m=(.04, 0, 0), timestamp_s=2),
+        replace(base, position_world_m=(.04, 0, 0), timestamp_s=4),
+    ]
+    selection_stats = {}
+    selected = list(adaptively_select_observations(frames, stats=selection_stats))
+    assert selection_stats == {'candidates': 4, 'retained': 3, 'skipped': 1}
+    assert [frame.timestamp_s for frame in selected] == [0, 2, 4]
+
+    positions = [0, 100, 1, 101]
+    unordered = [replace(base, position_world_m=(x, 0, 0), timestamp_s=i)
+                 for i, x in enumerate(positions)]
+    grouping_stats = {}
+    grouped = list(group_nearby_observations(unordered, 2, lookahead_batches=2,
+                                             stats=grouping_stats))
+    assert [frame.position_world_m[0] for frame in grouped] == [0, 1, 100, 101]
+    assert grouping_stats['groups'] == 2
+    assert grouping_stats['reordered_views'] == 2
 
 
 @pytest.mark.parametrize("point_format,version,expected", [(0, "1.2", 2), (1, "1.2", 3), (6, "1.4", 7)])
@@ -101,11 +126,12 @@ def test_bilinear_sampling_and_real_black_flag(tmp_path, camera, options):
 
 def test_best_observation_wins(tmp_path, camera, options):
     make_las(tmp_path / "source.las", [(0, 0, 3)])
-    farther = replace(solid_frame((200, 50, 50)), position_world_m=(0, 0, -10))
-    nearer = solid_frame((50, 200, 50))
+    farther = replace(solid_frame((200, 50, 50)), position_world_m=(0, 0, -10), source_flight=1)
+    nearer = replace(solid_frame((50, 200, 50)), source_flight=2)
     colorize_las(tmp_path / "source.las", tmp_path / "output.las", [farther, nearer], camera, options=options)
     output = laspy.read(tmp_path / "output.las")
     assert output.green[0] == 200 * 257
+    assert output.SourceFlight[0] == 2
 
 
 def test_optional_distance_limit_and_provenance(tmp_path, camera, options):

@@ -45,6 +45,7 @@ class FrameObservation:
     camera_pitch_degrees: float
     timestamp_s: float
     frame_id: str = ""
+    source_flight: int = 1
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,94 @@ class _PreparedFrame:
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _observation_similarity(first: FrameObservation, second: FrameObservation) -> tuple[float, float, float]:
+    translation = float(np.linalg.norm(np.asarray(first.position_world_m, dtype=np.float64)
+                                       - np.asarray(second.position_world_m, dtype=np.float64)))
+    q1 = np.asarray(first.orientation_xyzw, dtype=np.float64)
+    q2 = np.asarray(second.orientation_xyzw, dtype=np.float64)
+    cosine = float(np.clip(abs(np.dot(q1, q2) / (np.linalg.norm(q1) * np.linalg.norm(q2))), 0, 1))
+    rotation_degrees = float(np.degrees(2 * math.acos(cosine)))
+    pitch_degrees = abs(float(first.camera_pitch_degrees) - float(second.camera_pitch_degrees))
+    return translation, rotation_degrees, pitch_degrees
+
+
+def _observation_image_score(frame: FrameObservation) -> float:
+    """Cheap relative quality score used only to choose between pose-redundant frames."""
+    image = frame.rgb
+    width = min(320, image.shape[1])
+    thumbnail = cv2.resize(image, (width, max(2, round(width * image.shape[0] / image.shape[1]))),
+                           interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(thumbnail, cv2.COLOR_RGB2GRAY)
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+    usable = float(((gray >= 3) & (gray <= 252)).mean())
+    return math.log1p(max(0, sharpness)) * usable
+
+
+def adaptively_select_observations(frames: Iterable[FrameObservation], *, stats: dict[str, int] | None = None,
+                                   translation_m: float = .03, rotation_degrees: float = 2.0,
+                                   pitch_degrees: float = 1.5,
+                                   maximum_gap_s: float = 2.0) -> Iterator[FrameObservation]:
+    """Keep the best image from each nearly stationary camera-pose interval."""
+    counters = stats if stats is not None else {}
+    counters.update(candidates=0, retained=0, skipped=0)
+    anchor = best = None
+    best_score = -math.inf
+    for frame in frames:
+        counters['candidates'] += 1
+        if anchor is None:
+            anchor = best = frame
+            best_score = _observation_image_score(frame)
+            continue
+        translation, rotation, pitch = _observation_similarity(anchor, frame)
+        changed = (translation >= translation_m or rotation >= rotation_degrees
+                   or pitch >= pitch_degrees or frame.timestamp_s - anchor.timestamp_s >= maximum_gap_s)
+        if changed:
+            counters['retained'] += 1
+            yield best
+            anchor = best = frame
+            best_score = _observation_image_score(frame)
+        else:
+            score = _observation_image_score(frame)
+            if score > best_score:
+                best, best_score = frame, score
+    if best is not None:
+        counters['retained'] += 1
+        yield best
+    counters['skipped'] = counters['candidates'] - counters['retained']
+
+
+def group_nearby_observations(frames: Iterable[FrameObservation], batch_size: int, *,
+                              lookahead_batches: int = 2,
+                              stats: dict[str, int] | None = None) -> Iterator[FrameObservation]:
+    """Use bounded lookahead so each projection batch contains spatially similar views."""
+    if batch_size < 1 or lookahead_batches < 1:
+        raise ValueError('Batch size and lookahead must be positive.')
+    counters = stats if stats is not None else {}
+    counters.update(groups=0, reordered_views=0, maximum_buffered_views=0)
+    source = iter(frames)
+    limit = batch_size * lookahead_batches
+    buffer = list(islice(source, limit))
+    while buffer:
+        counters['maximum_buffered_views'] = max(counters['maximum_buffered_views'], len(buffer))
+        seed = buffer[0]
+        if len(buffer) <= batch_size:
+            chosen_indices = list(range(len(buffer)))
+        else:
+            scores = []
+            for index, candidate in enumerate(buffer[1:], 1):
+                translation, rotation, pitch = _observation_similarity(seed, candidate)
+                scores.append((translation / .50 + rotation / 20 + pitch / 20, index))
+            chosen_indices = [0, *[index for _, index in sorted(scores)[:batch_size - 1]]]
+        group = [buffer[index] for index in chosen_indices]
+        if chosen_indices != list(range(len(chosen_indices))):
+            counters['reordered_views'] += len(group)
+        for index in sorted(chosen_indices, reverse=True):
+            del buffer[index]
+        counters['groups'] += 1
+        yield from group
+        buffer.extend(islice(source, limit - len(buffer)))
 
 
 def _check_cancel(cancelled: Callable[[], bool] | None) -> None:
@@ -276,6 +365,7 @@ def _update_visibility(xyz: np.ndarray, frame: _PreparedFrame, calibration: Cali
 
 def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFrame],
                          colors: np.ndarray, quality: np.ndarray, distances: np.ndarray,
+                         sources: np.ndarray,
                          calibration: Calibration,
                          options: ColorizationOptions) -> tuple[int, int]:
     """Color one disjoint LAS slice while preserving chronological frame order."""
@@ -309,6 +399,7 @@ def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
         colors[chosen] = rgb[better].astype(np.uint16) * 257
         quality[chosen] = score[better]
         distances[chosen] = point_distance[better].astype(np.float32)
+        sources[chosen] = frame.observation.source_flight
     return offset, len(xyz)
 
 
@@ -353,6 +444,12 @@ def _output_header(source: laspy.LasHeader) -> laspy.LasHeader:
                 raise ColorizationError(f"Existing {name} dimension must be float32")
         else:
             header.add_extra_dim(laspy.ExtraBytesParams(name, "float32", description=description))
+    if "SourceFlight" in header.point_format.dimension_names:
+        if header.point_format.dimension_by_name("SourceFlight").dtype != np.dtype("uint16"):
+            raise ColorizationError("Existing SourceFlight dimension must be uint16")
+    else:
+        header.add_extra_dim(laspy.ExtraBytesParams("SourceFlight", "uint16",
+                                                    description="Winning source flight (1-based)"))
     return header
 
 
@@ -406,6 +503,7 @@ def colorize_las(
         colors = np.memmap(work / "rgb.u16", mode="w+", dtype=np.uint16, shape=(count, 3))
         quality = np.memmap(work / "quality.f32", mode="w+", dtype=np.float32, shape=(count,))
         distances = np.memmap(work / "distance.f32", mode="w+", dtype=np.float32, shape=(count,))
+        sources = np.memmap(work / "source.u16", mode="w+", dtype=np.uint16, shape=(count,))
         # Freshly created mapped files are zero initialized by the operating system.
         try:
             # Chunk bounds are tiny (about 4 KB per 20M points) and let later passes
@@ -465,11 +563,11 @@ def colorize_las(
                 chunks = _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache)
                 if executor is None:
                     completed_chunks = (_assign_chunk_colors(offset, xyz, batch, colors, quality, distances,
-                                                             calibration, options) for offset, xyz in chunks)
+                                                             sources, calibration, options) for offset, xyz in chunks)
                 else:
                     completed_chunks = _bounded_parallel_map(
                         executor,
-                        lambda item: _assign_chunk_colors(item[0], item[1], batch, colors, quality, distances,
+                        lambda item: _assign_chunk_colors(item[0], item[1], batch, colors, quality, distances, sources,
                                                           calibration, options),
                         chunks, options.worker_threads)
                 for offset, length in completed_chunks:
@@ -497,6 +595,7 @@ def colorize_las(
                     points["Colorized"] = observed.astype(np.uint8)
                     points["ColorConfidence"] = quality[offset:offset + length]
                     points["ColorDistance"] = distances[offset:offset + length]
+                    points["SourceFlight"] = sources[offset:offset + length]
                     colored += int(observed.sum())
                     writer.write_points(points)
                     offset += length
@@ -527,3 +626,4 @@ def colorize_las(
             colors._mmap.close()
             quality._mmap.close()
             distances._mmap.close()
+            sources._mmap.close()

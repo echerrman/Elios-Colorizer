@@ -21,7 +21,7 @@ from typing import Callable, Iterator
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 POSE_TOPIC = "/kalman_scan2map_node/odometry"
 SERVO_TOPIC = "/sensors/servo_angle"
 ESCAPES = {0xAB: 0xAA, 0xAC: 0x55, 0xAD: 0xF0, 0xAF: 0xA5}
@@ -63,8 +63,8 @@ class FlightSource:
         missing = []
         if not self.videos:
             missing.append("RGB video (.MOV or .MP4)")
-        if not self.mcap_path and not self.trajectory_path:
-            missing.append("MCAP or exported trajectory CSV")
+        if not self.trajectory_path:
+            missing.append("Inspector exported trajectory CSV matching the selected point cloud")
         if not self.starnet_path:
             missing.append("StarNet camera tilt and video synchronization log")
         if not self.las_path:
@@ -183,7 +183,17 @@ def discover_source(folder, las_override=None, calibration_override=None) -> Fli
     if starnet is None:
         starnet = _one([p for p in scoped if p.suffix.lower() == ".stn"
                         and "thermal" not in p.name.lower()], "StarNet logs")
-    trajectory = _one([p for p in combined if p.name.lower().endswith("trajectory.csv")], "trajectory CSV files")
+    las_selection = las_override
+    if las_override:
+        selected = Path(las_override).expanduser().resolve()
+        if selected.is_dir():
+            # The desktop UI asks for the Inspector export folder so geometry
+            # and its map-frame trajectory cannot be selected independently.
+            combined = list(set(combined + [p for p in selected.iterdir()
+                                             if p.is_file() and not p.is_symlink()]))
+            las_selection = None
+        elif not selected.is_file():
+            raise FlightError(f"Selected Inspector export or point cloud does not exist: {selected}")
 
     def override_or_find(override, candidates, label):
         if override:
@@ -193,12 +203,36 @@ def discover_source(folder, las_override=None, calibration_override=None) -> Fli
             return path
         return _one(candidates, label)
 
-    las = override_or_find(las_override, [p for p in combined if p.suffix.lower() in (".las", ".laz")], "point clouds")
+    las = override_or_find(las_selection, [p for p in combined if p.suffix.lower() in (".las", ".laz")], "point clouds")
+    trajectory_candidates = [p.resolve() for p in combined
+                             if p.name.lower().endswith("trajectory.csv")]
+    if las is not None:
+        trajectory_candidates.extend(p.resolve() for p in las.parent.glob("*.csv")
+                                     if p.name.lower().endswith("trajectory.csv"))
+        las_prefix = re.sub(r"(?i)(?:[-_ ]pointcloud)$", "", las.stem)
+        matching = []
+        for candidate in set(trajectory_candidates):
+            trajectory_prefix = re.sub(r"(?i)(?:[-_ ]trajectory)$", "", candidate.stem)
+            if trajectory_prefix.casefold() == las_prefix.casefold():
+                matching.append(candidate)
+        if matching:
+            trajectory = _one(matching, "trajectory CSV files matching the selected point cloud")
+        elif len(set(trajectory_candidates)) == 1:
+            # Older/synthetic exports may use generic names such as test.las +
+            # trajectory.csv; a sole candidate remains unambiguous.
+            trajectory = next(iter(set(trajectory_candidates)))
+        elif trajectory_candidates:
+            raise FlightError("Multiple trajectory CSV files found, and none matches the selected point-cloud filename.")
+        else:
+            trajectory = None
+    else:
+        trajectory = _one(trajectory_candidates, "trajectory CSV files")
     profile = override_or_find(calibration_override, [p for p in combined if p.name.lower() in
                                ("rgb_camera_profile.json", "colorizer_calibration.json")], "RGB camera profiles")
     if not starnet and mcap:
         warnings.append("MCAP servo fallback has receipt timestamps and an inferred opposite sign; StarNet is preferred.")
-    if trajectory and not mcap:
+    if trajectory:
+        warnings.append("Exported trajectory poses are used because they share the selected LAS coordinate system; native MCAP remains available only as a fallback.")
         warnings.append("Export trajectory quality=1 is treated as usable; the export does not define its confidence semantics.")
     return FlightSource(scope, meta_path, metadata, tuple(videos), mcap, starnet, trajectory, las, profile, warnings)
 
@@ -594,10 +628,10 @@ def load_telemetry(source: FlightSource, cache_dir, progress=None, cancelled=Non
             pass  # Interrupted/corrupt cache is safely regenerated from originals.
     warnings = list(source.warnings)
     clock_checks = {}
-    if source.mcap_path:
-        poses, servo, pose_frame, body_frame, clock_checks = _read_mcap(source, progress, cancelled)
-    elif source.trajectory_path:
+    if source.trajectory_path:
         poses, servo, pose_frame, body_frame = _read_trajectory(source.trajectory_path), np.empty((0, 2)), "export", "body"
+    elif source.mcap_path:
+        poses, servo, pose_frame, body_frame, clock_checks = _read_mcap(source, progress, cancelled)
     else:
         raise FlightError("No MCAP or exported trajectory CSV was found.")
     _check_cancel(cancelled)

@@ -6,10 +6,16 @@ import sys
 
 root = Path(__file__).resolve().parents[1]
 destination = root / 'dist' / 'EliosColorizer'
-for name in ('README.md', 'THIRD_PARTY_NOTICES.md', 'requirements-lock.txt'):
+for name in ('README.md', 'LICENSE', 'CHANGELOG.md', 'THIRD_PARTY_NOTICES.md', 'requirements-lock.txt'):
     shutil.copy2(root / name, destination / name)
-shutil.copytree(root / 'docs', destination / 'docs', dirs_exist_ok=True)
-shutil.copytree(root / 'camera_profiles', destination / 'camera_profiles', dirs_exist_ok=True)
+for name in ('CALIBRATION.md', 'INSTALLATION.md', 'OUTPUT_FORMAT.md',
+             'TIME_SYNCHRONIZATION.md', 'USER_GUIDE.md'):
+    (destination / 'docs').mkdir(parents=True, exist_ok=True)
+    shutil.copy2(root / 'docs' / name, destination / 'docs' / name)
+for name in ('README.md', 'example_profile.json'):
+    target = destination / 'camera_profiles' / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(root / 'camera_profiles' / name, target)
 for distribution in distributions():
     name = distribution.metadata['Name']
     for relative in distribution.files or ():

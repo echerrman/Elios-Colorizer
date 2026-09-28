@@ -3,8 +3,9 @@ import struct
 import binascii
 import numpy as np
 import pytest
+from types import SimpleNamespace
 from elios_colorizer.flight import (FlightError, FlightSource, Telemetry, discover_source,
-                                    inspect_video_coverage, parse_starnet, _read_trajectory)
+                                    inspect_video_coverage, load_telemetry, parse_starnet, _read_trajectory)
 
 
 def metadata(folder, identity='same-flight', native=False):
@@ -32,6 +33,57 @@ def test_discovery_pairs_only_matching_flights(tmp_path):
         assert len(source.warnings) >= 1
     with pytest.raises(FlightError, match='Multiple flight'):
         discover_source(tmp_path)
+
+
+def test_las_override_pairs_matching_export_trajectory(tmp_path):
+    native = tmp_path / 'native'
+    native.mkdir()
+    (native / 'flight.mcap').touch()
+    (native / 'camera.stn').touch()
+    (native / 'one.MOV').touch()
+    export = tmp_path / 'export'
+    export.mkdir()
+    las = export / 'sample-flight-pointcloud.las'
+    las.touch()
+    matching = export / 'sample-flight-trajectory.csv'
+    matching.touch()
+    (export / 'another-flight-trajectory.csv').touch()
+
+    source = discover_source(native, las_override=las)
+
+    assert source.las_path == las
+    assert source.trajectory_path == matching
+
+    from_folder = discover_source(native, las_override=export)
+    assert from_folder.las_path == las
+    assert from_folder.trajectory_path == matching
+
+
+def test_export_trajectory_is_preferred_to_native_mcap(tmp_path, monkeypatch):
+    root = tmp_path / 'flight'
+    root.mkdir()
+    trajectory = root / 'flight-trajectory.csv'
+    trajectory.write_text(
+        'timestamp[s] pos_x[m] pos_y[m] pos_z[m] rot_x rot_y rot_z rot_w quality\n'
+        '1 10 20 30 0 0 0 1 1\n2 11 20 30 0 0 0 1 1\n')
+    mcap = root / 'flight.mcap'; mcap.touch()
+    starnet = root / 'flight.stn'; starnet.touch()
+    source = FlightSource(root, mcap_path=mcap, starnet_path=starnet,
+                          trajectory_path=trajectory,
+                          metadata={'time_sync': {'video_offset': 1_000_000}})
+    camera = SimpleNamespace(
+        pitch_times_s=np.array([1., 2.]), pitch_degrees=np.array([-70., -70.]),
+        frame_indices=np.array([0, 1]), frame_times_s=np.array([1., 2.]),
+        command_times_s=np.empty(0), command_degrees=np.empty(0), warnings=[],
+        timing_diagnostics={})
+    monkeypatch.setattr('elios_colorizer.flight.parse_starnet', lambda *_: camera)
+    monkeypatch.setattr('elios_colorizer.flight._read_mcap',
+                        lambda *_: pytest.fail('MCAP poses must not replace the LAS-frame trajectory'))
+
+    telemetry = load_telemetry(source, tmp_path / 'cache')
+
+    np.testing.assert_array_equal(telemetry.positions_m, [[10, 20, 30], [11, 20, 30]])
+    assert telemetry.pose_frame == 'export'
 
 
 def make_telemetry(times=(0., .1, .2), confidence=(1, 1, 1)):

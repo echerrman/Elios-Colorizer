@@ -6,6 +6,11 @@ import sys
 
 root = Path(__file__).resolve().parents[1]
 destination = root / 'dist' / 'EliosColorizer'
+included_distributions = {
+    'laspy', 'lazrs', 'lz4', 'mcap', 'mcap-ros2-support', 'numpy',
+    'opencv-python-headless', 'pyinstaller', 'pyside6-essentials', 'pyyaml',
+    'scipy', 'shiboken6', 'zstandard',
+}
 for name in ('README.md', 'LICENSE', 'CHANGELOG.md', 'THIRD_PARTY_NOTICES.md', 'requirements-lock.txt'):
     shutil.copy2(root / name, destination / name)
 for name in ('CALIBRATION.md', 'INSTALLATION.md', 'OUTPUT_FORMAT.md',
@@ -18,10 +23,18 @@ for name in ('README.md', 'example_profile.json'):
     shutil.copy2(root / 'camera_profiles' / name, target)
 for distribution in distributions():
     name = distribution.metadata['Name']
+    if name.lower() not in included_distributions:
+        continue
     for relative in distribution.files or ():
         parts = [part.lower() for part in relative.parts]
         basename = relative.name.lower()
-        if ('licenses' in parts or basename.startswith(('license', 'copying', 'notice'))):
+        is_named_notice = basename.startswith(('license', 'copying', 'notice'))
+        is_text_in_license_dir = (
+            'licenses' in parts
+            and '__pycache__' not in parts
+            and relative.suffix.lower() in ('', '.txt', '.md', '.rst')
+        )
+        if is_named_notice or is_text_in_license_dir:
             source = distribution.locate_file(relative)
             if not source.is_file():
                 continue

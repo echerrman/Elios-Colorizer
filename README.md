@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml"><img alt="Tests" src="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://github.com/echerrman/Elios-Colorizer/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/echerrman/Elios-Colorizer?display_name=tag&sort=semver"></a>
+  <a href="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml?query=branch%3Amain"><img alt="Tests" src="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.0.0"><img alt="Release v1.0.0" src="https://img.shields.io/badge/release-v1.0.0-2f6f89"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2f6f89"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2f6f89">
   <img alt="Local processing" src="https://img.shields.io/badge/processing-local-187548">

@@ -9,4 +9,4 @@ if (-not (Test-Path -LiteralPath '.venv/Scripts/python.exe')) {
 if ($LASTEXITCODE -ne 0) { throw 'Locked dependency installation failed.' }
 & '.\.venv\Scripts\python.exe' -m pip install --no-deps --no-build-isolation -e .
 if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
-Write-Host 'Ready. Open Launch Elios Colorizer.cmd.'
+Write-Host 'Ready. Run scripts\launch-dev.cmd.'

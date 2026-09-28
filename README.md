@@ -34,9 +34,8 @@ native flight telemetry, and recorded 4K video. It preserves unobserved geometry
 marks every point with an explicit colorization status, and performs all work on
 the local computer. Flight data is not uploaded to a cloud service.
 
-> **Development status:** the current stable release provides the original
-> single-flight workflow. Multi-flight batch processing and conservative merging
-> are undergoing final validation for version 1.0.0.
+> **Version 1.0:** single-flight colorization, multi-flight batch processing,
+> and confidence-aware merged colorization are available in the stable release.
 
 ## Install
 
@@ -68,12 +67,13 @@ reprojection checks. Read the [camera calibration guide](docs/CALIBRATION.md).
 | --- | --- |
 | Single flight | One geometry-preserving colorized LAS |
 | Multiple flights, separate | One independent colorized LAS per flight |
-| Multiple flights, merged | Conservative alignment check followed by one reconciled LAS |
+| Multiple flights, merged | Confidence-aware colorization of one aligned merged LAS |
 
-For merged output, the first cloud defines the coordinate frame. A small rigid
-correction is accepted only when held-out overlap improves within strict movement
-limits. Otherwise, the original Inspector coordinates are retained. Merging works
-best when Inspector has already aligned every cloud in the same coordinate system.
+Merged output supports a user-aligned cloud with per-flight transforms or an
+automatic alignment workflow. Automatic alignment accepts corrections only when
+overlap improves within strict movement and quality limits; a failed alignment
+stops the run and directs the user to align manually. Merging works best when
+Inspector has already placed every cloud in a common coordinate system.
 
 An optional distance limit prevents distant background points from receiving
 low-confidence RGB. Uncolored points are retained in every workflow so the user

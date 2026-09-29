@@ -1,7 +1,10 @@
 # RGB camera calibration
 
-Accurate colorization requires a measured profile for the Elios RGB camera and
-recording mode. Navigation-camera YAML files do not describe the 4K recording
+For the standard Elios 3 built-in RGB camera payload in 3840 × 2160 recording
+mode, use `camera_profiles/elios_3_builtin_rgb_default_profile.json`. It is the
+tested default baseline and is recommended unless the camera payload, recording
+mode, mount geometry, or independently measured calibration differs from the
+standard setup. Navigation-camera YAML files do not describe the 4K recording
 camera and should not be scaled or substituted.
 
 The application requires a separate JSON profile and blocks normal processing
@@ -39,10 +42,11 @@ been checked.
 
 ## Profile schema
 
-Copy `camera_profiles/example_profile.json` and replace every placeholder with
-measured values. Coordinates are metres, angles are degrees, and quaternions use
-`xyzw` ordering. The optical frame is right, down, forward. Body poses transform
-from body coordinates into the existing LAS coordinate frame.
+For a special camera setup, copy `camera_profiles/camera_profile_template.json`
+and replace every placeholder with measured values. Coordinates are metres,
+angles are degrees, and quaternions use `xyzw` ordering. The optical frame is
+right, down, forward. Body poses transform from body coordinates into the
+existing LAS coordinate frame.
 
 Supported distortion models are `pinhole`, `opencv`, and `fisheye`. For a
 camera-head angle `reported_pitch`, the profile applies:

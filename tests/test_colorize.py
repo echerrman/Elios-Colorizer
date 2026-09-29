@@ -190,6 +190,19 @@ def test_calibration_validation_and_round_trip(camera, tmp_path):
         replace(camera, rotation_xyzw=(0, 0, 0, 10))
 
 
+def test_distributed_default_and_template_camera_profiles():
+    profiles = Path(__file__).resolve().parents[1] / "camera_profiles"
+    default = Calibration.load(profiles / "elios_3_builtin_rgb_default_profile.json")
+    assert default.validated
+    assert default.profile_name == "Elios 3 Built-in RGB Camera - Tested Default Baseline"
+    assert (default.image_width, default.image_height) == (3840, 2160)
+    with pytest.raises(CalibrationError, match="validated"):
+        Calibration.load(profiles / "camera_profile_template.json")
+    template = Calibration.load(profiles / "camera_profile_template.json",
+                                require_validated=False)
+    assert not template.validated
+
+
 @pytest.mark.parametrize("model,coefficients", [("opencv", (0, 0, 0, 0, 0)), ("fisheye", (0, 0, 0, 0))])
 def test_distortion_projection_center(camera, model, coefficients):
     calibrated = replace(camera, distortion_model=model, distortion_coefficients=coefficients)

@@ -13,6 +13,7 @@ $executable = Join-Path $projectRoot 'dist\EliosColorizer\EliosColorizer.exe'
 $archive = Join-Path $projectRoot "dist\EliosColorizer-v$Version-windows-x64.zip"
 $checksum = Join-Path $projectRoot "dist\EliosColorizer-v$Version-windows-x64.zip.sha256"
 $selfTest = Join-Path $projectRoot ".release-selftest-$Version"
+$testTemp = Join-Path $projectRoot '.release-pytest'
 
 if (-not (Test-Path -LiteralPath $python)) {
     throw 'Run scripts\setup.ps1 before preparing a release.'
@@ -33,8 +34,15 @@ if ($LASTEXITCODE -ne 0 -or $changes) {
     throw 'Commit all public release changes before packaging.'
 }
 
-& $python -m pytest -q
-if ($LASTEXITCODE -ne 0) { throw 'Tests failed; release was not packaged.' }
+if (Test-Path -LiteralPath $testTemp) {
+    Remove-Item -LiteralPath $testTemp -Recurse -Force
+}
+& $python -m pytest -q -p no:cacheprovider --basetemp $testTemp
+$testExit = $LASTEXITCODE
+if (Test-Path -LiteralPath $testTemp) {
+    Remove-Item -LiteralPath $testTemp -Recurse -Force
+}
+if ($testExit -ne 0) { throw 'Tests failed; release was not packaged.' }
 
 & (Join-Path $PSScriptRoot 'build.ps1')
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $executable)) {

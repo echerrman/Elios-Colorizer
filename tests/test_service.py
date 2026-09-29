@@ -1,6 +1,7 @@
 from elios_colorizer.selftest import create_fixture
 from elios_colorizer.service import (find_cloudcompare_executable, inspect_source, inspect_sources,
-                                     merged_processing_tuning, run_colorization, run_workflow)
+                                     merged_processing_tuning, processing_tuning,
+                                     run_colorization, run_workflow)
 import laspy
 import numpy as np
 import pytest
@@ -15,6 +16,7 @@ def test_merged_processing_tuning_uses_safe_larger_batches():
     assert constrained == {'worker_threads': 4, 'frame_batch_size': 4}
     modest = merged_processing_tuning(20_000_000, 10 * gib, 12)
     assert modest == {'worker_threads': 6, 'frame_batch_size': 12}
+    assert processing_tuning(20_000_000, 10 * gib, 12) == modest
 
 
 @pytest.mark.parametrize('balancing', [False, True])
@@ -32,6 +34,14 @@ def test_complete_service_and_source_immutability(tmp_path, monkeypatch, balanci
     for name in original.point_format.dimension_names:
         np.testing.assert_array_equal(original[name], colored[name])
     assert list(colored.Colorized) == [1, 1, 1, 0]
+    import json
+    report = json.loads(Path(result['report']).read_text())
+    configuration = report['processing_configuration']
+    assert configuration['frame_batch_size'] == processing_tuning(4)['frame_batch_size']
+    assert configuration['adaptive_view_selection']['candidate_views'] >= 1
+    assert configuration['adaptive_view_selection']['retained_views'] >= 1
+    assert configuration['view_grouping']['groups'] >= 1
+    assert configuration['spatial_index']['point_order_preserved']
     assert before == {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in source.iterdir()}
     with pytest.raises(ValueError, match='exists'):
         run_colorization(str(source), result['output'])

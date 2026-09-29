@@ -1,7 +1,7 @@
 """Desktop interface for single- and multi-flight colorization."""
 from __future__ import annotations
 import re, shutil, sys, threading, time, traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Qt, QUrl, Signal, Slot
@@ -71,6 +71,7 @@ class WorkflowSelection:
     flights:tuple[FlightSelection,...]; calibration_override:str|None=None
     mode:str="separate"; maximum_color_distance_m:float|None=None
     alignment_method:str="manual"; merged_source:str|None=None; cloudcompare_executable:str|None=None
+    illumination_balancing:bool=False
 @dataclass(frozen=True)
 class SourceSelection: # Public compatibility with 0.2.x.
     folder:str; las_override:str|None=None; calibration_override:str|None=None
@@ -89,11 +90,12 @@ class ServiceWorker(QObject):
             elif len(flights)==1 and self.selection.mode=="separate":
                 kw=dict(folder=flights[0]["folder"],las_override=flights[0]["las_override"],output=self.output,calibration_override=self.selection.calibration_override,progress=self.progress.emit,cancelled=self.cancellation.is_set)
                 if self.selection.maximum_color_distance_m is not None: kw["maximum_color_distance_m"]=self.selection.maximum_color_distance_m
+                if self.selection.illumination_balancing: kw["illumination_balancing"]=True
                 result=self.backend.run_colorization(**kw)
             else:
                 result=self.backend.run_workflow(flights,self.output,calibration_override=self.selection.calibration_override,mode=self.selection.mode,
                     alignment_method=self.selection.alignment_method,merged_source=self.selection.merged_source,cloudcompare_executable=self.selection.cloudcompare_executable,
-                    maximum_color_distance_m=self.selection.maximum_color_distance_m,progress=self.progress.emit,cancelled=self.cancellation.is_set)
+                    illumination_balancing=self.selection.illumination_balancing,maximum_color_distance_m=self.selection.maximum_color_distance_m,progress=self.progress.emit,cancelled=self.cancellation.is_set)
             self.result.emit(result)
         except Exception as exc:self.error.emit(str(exc) or type(exc).__name__,traceback.format_exc())
         finally:self.finished.emit()
@@ -223,8 +225,7 @@ class MainWindow(QMainWindow):
         self.automatic_panel=QWidget(); automatic_box=QVBoxLayout(self.automatic_panel); automatic_box.setContentsMargins(0,0,0,0); self.cloudcompare_edit,self.cloudcompare_button=self._file_row(automatic_box,"CloudCompare","Detected automatically, or browse to CloudCompare.exe…",self._browse_cloudcompare); align_box.addWidget(self.automatic_panel)
         box.addWidget(self.alignment_panel)
         row=QHBoxLayout(); self.distance_check=QCheckBox("Limit colorization distance"); self.distance_check.setObjectName("distanceToggle"); self.distance_spin=QDoubleSpinBox(); self.distance_spin.setRange(.2,40); self.distance_spin.setValue(8); self.distance_spin.setSuffix(" m"); row.addWidget(self.distance_check); row.addWidget(self.distance_spin); row.addStretch(); box.addLayout(row)
-        color_balance_tip="Color balancing will normalize visible color differences between flights and lighting conditions in a future update."
-        row=QHBoxLayout(); self.color_balance_check=QCheckBox("Apply color balancing"); self.color_balance_check.setObjectName("comingSoonToggle"); self.color_balance_check.setEnabled(False); self.color_balance_check.setToolTip(color_balance_tip); row.addWidget(self.color_balance_check); self.color_balance_badge=_label("COMING SOON"); self.color_balance_badge.setObjectName("comingSoonBadge"); self.color_balance_badge.setToolTip(color_balance_tip); row.addWidget(self.color_balance_badge); row.addStretch(); box.addLayout(row)
+        self.color_balance_check=QCheckBox("Correct uneven illumination"); self.color_balance_check.setToolTip("Use overlapping views to conservatively correct center-to-edge lighting. Leaves RGB unchanged when evidence is insufficient."); box.addWidget(self.color_balance_check)
         self.output_edit,self.output_button=self._file_row(box,"Output","Choose output…",self._browse_output)
         row=QHBoxLayout(); self.state_label=_label("Select a flight to begin."); row.addWidget(self.state_label,1); self.cancel_button=QPushButton("Cancel"); self.cancel_button.clicked.connect(self._cancel); self.cancel_button.hide(); row.addWidget(self.cancel_button); self.run_button=QPushButton("Colorize point cloud",objectName="primary"); self.run_button.clicked.connect(self._start_colorization); row.addWidget(self.run_button); box.addLayout(row)
         progress_row=QHBoxLayout(); self.progress_bar=QProgressBar(); self.progress_bar.setRange(0,1000); self.progress_bar.setTextVisible(False); progress_row.addWidget(self.progress_bar,1); self.progress_badge=_label("0%"); self.progress_badge.setObjectName("percentBadge"); self.progress_badge.setAlignment(Qt.AlignmentFlag.AlignCenter); self.progress_badge.setMinimumWidth(58); progress_row.addWidget(self.progress_badge); box.addLayout(progress_row)
@@ -258,9 +259,9 @@ class MainWindow(QMainWindow):
             duplicate=row in duplicates;row.name_edit.setProperty("duplicateName",duplicate);row.name_edit.style().unpolish(row.name_edit);row.name_edit.style().polish(row.name_edit)
             row.name_edit.setToolTip("Flight names must be unique." if duplicate else "Click to rename this flight (48 characters maximum).")
         return duplicates
-    def _selection(self):return WorkflowSelection(tuple(x.selection() for x in self.flight_rows),self.calibration_edit.text().strip() or None,str(self.mode_combo.currentData()),self.distance_spin.value() if self.distance_check.isChecked() else None,str(self.alignment_combo.currentData()),self.merged_edit.text().strip() or None,self.cloudcompare_edit.text().strip() or None)
+    def _selection(self):return WorkflowSelection(tuple(x.selection() for x in self.flight_rows),self.calibration_edit.text().strip() or None,str(self.mode_combo.currentData()),self.distance_spin.value() if self.distance_check.isChecked() else None,str(self.alignment_combo.currentData()),self.merged_edit.text().strip() or None,self.cloudcompare_edit.text().strip() or None,self.color_balance_check.isChecked())
     def _inspection_selection(self):
-        return self._selection()
+        return replace(self._selection(), illumination_balancing=False)
     def _restore_settings(self):
         calibration=str(self.settings.value("calibration","") or "")
         saved_theme=self.settings.value("dark_mode",False)
@@ -423,7 +424,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self,"run_button"):return
         running=self._job_kind=="run";idle=self._thread is None;names_valid=not self._duplicate_name_rows()
         for row in self.flight_rows:row.set_enabled(not running)
-        for x in (self.add_flight_button,self.calibration_edit,self.calibration_button,self.mode_combo,self.alignment_combo,self.alignment_guide_button,self.merged_edit,self.merged_button,self.cloudcompare_edit,self.cloudcompare_button,self.distance_check,self.output_edit,self.output_button,self.refresh_button):x.setEnabled(not running)
+        for x in (self.add_flight_button,self.calibration_edit,self.calibration_button,self.mode_combo,self.alignment_combo,self.alignment_guide_button,self.merged_edit,self.merged_button,self.cloudcompare_edit,self.cloudcompare_button,self.distance_check,self.color_balance_check,self.output_edit,self.output_button,self.refresh_button):x.setEnabled(not running)
         self.distance_spin.setEnabled(not running and self.distance_check.isChecked());self.cancel_button.setVisible(running);self.cancel_button.setEnabled(running and not self._cancellation.is_set());merge_valid=self.mode_combo.currentData()!="merge" or len(self.flight_rows)>1;can=idle and names_valid and self._ready and self._inspected_selection==self._inspection_selection() and self._output_valid() and merge_valid and not self._inspection_pending;self.run_button.setEnabled(can)
     def _start_colorization(self):
         if not self.run_button.isEnabled():return

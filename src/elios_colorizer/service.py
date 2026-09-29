@@ -343,7 +343,8 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
                      *, sample_interval_s: float = 1.0, max_frames: int | None = None,
                      start_s: float | None = None, end_s: float | None = None,
                      experimental: bool = False,
-                     maximum_color_distance_m: float | None = None) -> dict:
+                     maximum_color_distance_m: float | None = None,
+                     illumination_balancing: bool = False) -> dict:
     from .flight import discover_source, load_telemetry, iter_observations, inspect_video_coverage
     from .camera import Calibration
     from .colorize import colorize_las, ColorizationOptions, ColorizationCancelled
@@ -419,11 +420,14 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
     # concurrency without oversubscribing NumPy/OpenCV or inflating temporaries.
     workers = max(1, min(4, logical_cpus // 4))
     options = ColorizationOptions(experimental_calibration=experimental, worker_threads=workers,
-                                  maximum_color_distance_m=maximum_color_distance_m)
+                                  maximum_color_distance_m=maximum_color_distance_m,
+                                  illumination_balancing=illumination_balancing)
 
     def engine_progress(info: dict):
         stage = info['stage']
-        if stage == 'indexing':
+        if stage == 'illumination':
+            emit('Illumination Balancing', high_water, info['reason'], force=True)
+        elif stage == 'indexing':
             fraction = info['points_processed'] / max(info['point_count'], 1)
             method = (f"caching coordinates in memory for {info['worker_threads']} CPU workers"
                       if info['xyz_cache_used'] else 'using the bounded-memory streaming path')
@@ -502,7 +506,7 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                          calibration_override: str | None, *, alignment_method: str,
                          merged_source: str | None, cloudcompare_executable: str | None,
                          maximum_color_distance_m: float | None, progress, cancelled,
-                         started: float, flight_checks: list[dict]) -> dict[str, Any]:
+                         started: float, flight_checks: list[dict], illumination_balancing: bool = False) -> dict[str, Any]:
     """Color one final geometry with globally competing observations from all flights."""
     from itertools import chain
     from .camera import Calibration
@@ -609,8 +613,9 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
             merged_point_count = int(geometry_reader.header.point_count)
         tuning = merged_processing_tuning(merged_point_count)
         options = ColorizationOptions(worker_threads=tuning['worker_threads'],
-                                      frame_batch_size=tuning['frame_batch_size'],
-                                      maximum_color_distance_m=maximum_color_distance_m)
+                                      frame_batch_size=tuning['frame_batch_size'], merged_output=True,
+                                      maximum_color_distance_m=maximum_color_distance_m,
+                                  illumination_balancing=illumination_balancing)
         grouping_stats: dict[str, int] = {}
         grouped_stream = group_nearby_observations(chain.from_iterable(streams),
                                                    options.frame_batch_size,
@@ -618,13 +623,22 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                                                    stats=grouping_stats)
         color_share = .95 - preparation_share
 
+        engine_high_water = preparation_share
+
+        def engine_emit(stage, fraction, message):
+            nonlocal engine_high_water
+            engine_high_water = max(engine_high_water, fraction)
+            progress(stage, engine_high_water, message)
+
         def engine_progress(info: dict) -> None:
             stage = info['stage']
             if not progress:
                 return
-            if stage == 'indexing':
+            if stage == 'illumination':
+                engine_emit('Illumination Balancing', preparation_share, info['reason'])
+            elif stage == 'indexing':
                 local = info['points_processed'] / max(info['point_count'], 1)
-                progress('Preparing final geometry', preparation_share + color_share * .02 * local,
+                engine_emit('Preparing final geometry', preparation_share + color_share * .02 * local,
                          f"Reading {info['points_processed']:,} / {info['point_count']:,} merged points · "
                          f"{options.frame_batch_size}-view batches · {options.worker_threads} CPU workers")
             elif stage in ('visibility', 'colorizing'):
@@ -637,14 +651,14 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                 estimated_selected = max(info['frames_received'], round(planned * retention))
                 view_fraction = min(1., (completed + options.frame_batch_size * within)
                                     / max(estimated_selected, 1))
-                progress('Checking visibility' if stage == 'visibility' else 'Assigning RGB',
+                engine_emit('Checking visibility' if stage == 'visibility' else 'Assigning RGB',
                          preparation_share + color_share * (.02 + .93 * view_fraction),
                          f"{info['frames_used']} / approximately {estimated_selected} selected views · "
                          f"{candidates:,} / {planned:,} candidate views reviewed · "
                          f"{info['points_processed']:,} / {info['point_count']:,} points in this pass")
             elif stage == 'writing':
                 local = info['points_processed'] / max(info['point_count'], 1)
-                progress('Saving merged LAS', .95 + .049 * local,
+                engine_emit('Saving merged LAS', .95 + .049 * local,
                          f"Writing {info['points_processed']:,} / {info['point_count']:,} points")
 
         result = colorize_las(geometry, destination, grouped_stream, calibration,
@@ -690,6 +704,7 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
                  alignment_method: str = 'manual', merged_source: str | None = None,
                  cloudcompare_executable: str | None = None,
                  maximum_color_distance_m: float | None = None,
+                 illumination_balancing: bool = False,
                  progress: Callable[[str, float, str], None] | None = None,
                  cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
     """Colorize one or more flights, optionally align and fuse colored results."""
@@ -725,7 +740,8 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
         item = selections[0]
         return run_colorization(str(item.get('folder') or ''), str(destination),
             item.get('las_override'), calibration_override, progress, cancelled,
-            maximum_color_distance_m=maximum_color_distance_m)
+            maximum_color_distance_m=maximum_color_distance_m,
+                                  illumination_balancing=illumination_balancing)
 
     started = time.monotonic()
     if mode == 'separate':
@@ -758,7 +774,8 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
                     progress(f'{_name}: {stage}', _base + _scale * fraction, message)
             result = run_colorization(str(item.get('folder') or ''), str(flight_output),
                 item.get('las_override'), calibration_override, flight_progress, cancelled,
-                maximum_color_distance_m=maximum_color_distance_m)
+                maximum_color_distance_m=maximum_color_distance_m,
+                                  illumination_balancing=illumination_balancing)
             reports.append(result)
         total = sum(int(result['total_points']) for result in reports)
         colored = sum(int(result['colored_points']) for result in reports)
@@ -776,4 +793,5 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
         alignment_method=alignment_method, merged_source=merged_source,
         cloudcompare_executable=cloudcompare_executable,
         maximum_color_distance_m=maximum_color_distance_m, progress=progress,
-        cancelled=cancelled, started=started, flight_checks=flight_checks)
+        cancelled=cancelled, started=started, flight_checks=flight_checks,
+        illumination_balancing=illumination_balancing)

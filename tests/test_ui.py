@@ -60,7 +60,8 @@ class FakeBackend:
             "summary": folder,
         }
 
-    def run_colorization(self, folder, output, las_override=None, calibration_override=None, *, progress, cancelled):
+    def run_colorization(self, folder, output, las_override=None, calibration_override=None, *, progress, cancelled, illumination_balancing=False):
+        self.illumination_balancing = illumination_balancing
         self.last_run = (folder, output, las_override, calibration_override)
         self.run_started.set()
         progress("Projecting", 0.5, "Projecting visible points")
@@ -144,10 +145,12 @@ def test_action_buttons_and_color_balance_placeholder(ui):
     assert second.remove_button.objectName() == "removeFlightButton"
     assert "✕" in second.remove_button.text() and "Remove" in second.remove_button.text()
     assert "↻" in window.refresh_button.text()
-    assert not window.color_balance_check.isEnabled()
-    assert window.color_balance_check.text() == "Apply color balancing"
-    assert window.color_balance_badge.text() == "COMING SOON"
-    assert "future update" in window.color_balance_check.toolTip()
+    assert window.color_balance_check.isEnabled()
+    assert window.color_balance_check.text() == "Correct uneven illumination"
+    assert not window.color_balance_check.isChecked()
+    window.color_balance_check.setChecked(True)
+    assert window._selection().illumination_balancing
+    assert not window._inspection_selection().illumination_balancing
 
 
 def test_old_inspection_cannot_enable_new_source(ui, tmp_path):
@@ -175,10 +178,12 @@ def test_processing_receives_inputs_and_reports_coverage(ui, tmp_path):
     window.calibration_edit.setText("camera.json")
     output = tmp_path / "result.las"
     prepare(window, output)
+    window.color_balance_check.setChecked(True)
     window._start_colorization()
     assert not window.source_edit.isEnabled()
     assert not window.run_button.isEnabled()
     wait_until(lambda: window._thread is None)
+    assert backend.illumination_balancing
     assert backend.last_run == ("flight", str(output), "source.las", "camera.json")
     assert window.progress_bar.value() == 1000
     assert window.progress_badge.text() == "100%"

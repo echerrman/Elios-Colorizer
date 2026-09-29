@@ -27,6 +27,7 @@ import laspy
 import numpy as np
 
 from .camera import Calibration
+from .illumination import LINEAR, apply_gain, fit_model, radius_squared, raw_usable
 
 
 class ColorizationError(RuntimeError):
@@ -68,6 +69,8 @@ class ColorizationOptions:
     maximum_color_distance_m: float | None = None
     cache_xyz: bool | None = None
     worker_threads: int = 1
+    illumination_balancing: bool = False
+    merged_output: bool = False
 
     def __post_init__(self) -> None:
         if self.chunk_size < 1 or self.frame_batch_size < 1 or self.depth_buffer_width < 8 or self.worker_threads < 1:
@@ -96,6 +99,7 @@ class ColorizationResult:
     frames_rejected: int
     experimental_calibration: bool = False
     xyz_cache_used: bool = False
+    illumination_balancing: dict | None = None
 
     @property
     def coverage_fraction(self) -> float:
@@ -117,6 +121,8 @@ class _PreparedFrame:
     scale_x: float
     scale_y: float
     sharpness_weight: float
+    illumination_model: Any = None
+    illumination_frame: int = 0
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -363,12 +369,34 @@ def _update_visibility(xyz: np.ndarray, frame: _PreparedFrame, calibration: Cali
     np.minimum.at(frame.depth, (y, x), z)
 
 
+def _estimate_illumination(sample_xyz, batch, calibration, options):
+    radii = np.full((len(batch), len(sample_xyz)), np.nan)
+    light = np.full_like(radii, np.nan)
+    for index, frame in enumerate(batch):
+        selected, uv, z, camera = _project(sample_xyz, frame, calibration, options, border=True)
+        x, y = _pixel_indices(uv, frame)
+        near = frame.depth[y, x]
+        valid = z <= near + options.occlusion_absolute_tolerance_m + near * options.occlusion_relative_tolerance
+        rgb = _sample_rgb(frame.observation.rgb, uv)
+        valid &= raw_usable(rgb, options.minimum_luminance, options.maximum_luminance)
+        if options.maximum_color_distance_m is not None:
+            valid &= np.linalg.norm(camera, axis=1) <= options.maximum_color_distance_m
+        radii[index, selected[valid]] = radius_squared(uv[valid], calibration)
+        light[index, selected[valid]] = LINEAR[rgb[valid]] @ np.array([.2126, .7152, .0722])
+    model, report = fit_model(radii, light)
+    for index, frame in enumerate(batch):
+        frame.illumination_model = model
+        frame.illumination_frame = index
+    return report
+
+
 def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFrame],
                          colors: np.ndarray, quality: np.ndarray, distances: np.ndarray,
                          sources: np.ndarray,
                          calibration: Calibration,
-                         options: ColorizationOptions) -> tuple[int, int]:
+                         options: ColorizationOptions) -> tuple[int, int, int, int]:
     """Color one disjoint LAS slice while preserving chronological frame order."""
+    corrected_count = rejected_count = 0
     for frame in batch:
         selected, uv, z, camera = _project(xyz, frame, calibration, options, border=True)
         x, y = _pixel_indices(uv, frame)
@@ -382,6 +410,10 @@ def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
         usable = np.ones(len(rgb), dtype=bool)
         if options.reject_exposure_extremes:
             usable &= (luminance >= options.minimum_luminance) & (luminance <= options.maximum_luminance)
+        if options.illumination_balancing:
+            exposure_ok = raw_usable(rgb, options.minimum_luminance, options.maximum_luminance, luminance)
+            rejected_count += int(np.count_nonzero(~exposure_ok))
+            usable &= exposure_ok
         point_distance = np.linalg.norm(camera, axis=1)
         if options.maximum_color_distance_m is not None:
             usable &= point_distance <= options.maximum_color_distance_m
@@ -395,12 +427,26 @@ def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
                  / (1 + (z / 5)**2)).astype(np.float32)
         indices = selected + offset
         better = usable & (score > quality[indices])
+        candidates = np.flatnonzero(better)
+        chosen_rgb = rgb[candidates]
+        if frame.illumination_model is not None:
+            # Penalties never exceed one, so an existing loser cannot become a
+            # winner. Compute gains and encode RGB only for potential winners.
+            gains, penalty = frame.illumination_model.adjustment(
+                chosen_rgb, radius_squared(uv[candidates], calibration), frame.illumination_frame)
+            score[candidates] *= penalty
+            wins = score[candidates] > quality[indices[candidates]]
+            better[candidates] = wins
+            chosen_rgb = chosen_rgb[wins]
+            corrected = apply_gain(chosen_rgb, gains[wins])
+            corrected_count += int(np.count_nonzero(np.any(corrected != chosen_rgb, axis=1)))
+            chosen_rgb = corrected
         chosen = indices[better]
-        colors[chosen] = rgb[better].astype(np.uint16) * 257
+        colors[chosen] = chosen_rgb.astype(np.uint16) * 257
         quality[chosen] = score[better]
         distances[chosen] = point_distance[better].astype(np.float32)
         sources[chosen] = frame.observation.source_flight
-    return offset, len(xyz)
+    return offset, len(xyz), corrected_count, rejected_count
 
 
 def _bounded_parallel_map(executor: ThreadPoolExecutor, function: Callable,
@@ -416,7 +462,7 @@ def _bounded_parallel_map(executor: ThreadPoolExecutor, function: Callable,
             yield future.result()
 
 
-def _output_header(source: laspy.LasHeader) -> laspy.LasHeader:
+def _output_header(source: laspy.LasHeader, merged_output: bool = False) -> laspy.LasHeader:
     if source.point_format.id in (4, 5, 9, 10):
         raise ColorizationError("Waveform LAS requires waveform payload handling and is not supported")
     target_format = {0: 2, 1: 3, 2: 2, 3: 3, 6: 7, 7: 7, 8: 8}[source.point_format.id]
@@ -439,6 +485,8 @@ def _output_header(source: laspy.LasHeader) -> laspy.LasHeader:
         ("ColorConfidence", "RGB observation confidence"),
         ("ColorDistance", "Winning camera distance (m)"),
     ):
+        if merged_output:
+            continue
         if name in header.point_format.dimension_names:
             if header.point_format.dimension_by_name(name).dtype != np.dtype("float32"):
                 raise ColorizationError(f"Existing {name} dimension must be float32")
@@ -450,6 +498,9 @@ def _output_header(source: laspy.LasHeader) -> laspy.LasHeader:
     else:
         header.add_extra_dim(laspy.ExtraBytesParams("SourceFlight", "uint16",
                                                     description="Winning source flight (1-based)"))
+    if merged_output:
+        header.remove_extra_dims([name for name in ("ColorConfidence", "ColorDistance")
+                                  if name in header.point_format.extra_dimension_names])
     return header
 
 
@@ -491,13 +542,22 @@ def colorize_las(
     count = original_header.point_count
     if count == 0:
         raise ColorizationError("Source LAS contains no points")
-    header = _output_header(original_header)
+    header = _output_header(original_header, options.merged_output)
     destination.parent.mkdir(parents=True, exist_ok=True)
     use_xyz_cache = _use_xyz_cache(count, options)
     required_bytes = count * (header.point_format.size + 14) + 64 * 1024**2
     if shutil.disk_usage(destination.parent).free < required_bytes:
         raise ColorizationError(f"Insufficient output disk space; need about {required_bytes / 1024**3:.2f} GiB")
     received, used, rejected = 0, 0, 0
+    illumination = dict(requested=options.illumination_balancing, applied=False,
+        accepted_batches=0, skipped_batches=0, overlap_sample_count=0,
+        radial_gain_range=[1., 1.], exposure_gain_range=[1., 1.],
+        corrected_observations=0, rejected_exposure_observations=0,
+        minimum_model_confidence=None, fallback_reasons={},
+        scope="batch-local radial response and matched per-frame exposure offsets")
+    sample_ids = (np.linspace(0, count - 1, min(count, 8192), dtype=np.int64)
+                  if options.illumination_balancing else np.empty(0, dtype=np.int64))
+    sample_xyz = np.empty((len(sample_ids), 3))
     with tempfile.TemporaryDirectory(prefix=".elios-colorize-", dir=destination.parent) as scratch:
         work = Path(scratch)
         colors = np.memmap(work / "rgb.u16", mode="w+", dtype=np.uint16, shape=(count, 3))
@@ -514,6 +574,8 @@ def colorize_las(
                 _check_cancel(cancelled)
                 if not np.isfinite(xyz).all():
                     raise ColorizationError("Source LAS contains nonfinite coordinates")
+                lo, hi = np.searchsorted(sample_ids, [offset, offset + len(xyz)])
+                sample_xyz[lo:hi] = xyz[sample_ids[lo:hi] - offset]
                 chunk_bounds[offset] = np.array([xyz.min(axis=0), xyz.max(axis=0)])
                 if xyz_cache is not None:
                     xyz_cache[offset:offset + len(xyz)] = xyz
@@ -560,6 +622,21 @@ def colorize_las(
                     for frame in batch:
                         frame.depth = cv2.erode(frame.depth, np.ones((size, size), np.uint8),
                                                 borderType=cv2.BORDER_CONSTANT, borderValue=float("inf"))
+                if options.illumination_balancing:
+                    fit = _estimate_illumination(sample_xyz, batch, calibration, options)
+                    illumination['overlap_sample_count'] += fit['overlap_sample_count']
+                    key = 'accepted_batches' if fit['accepted'] else 'skipped_batches'
+                    illumination[key] += 1
+                    if fit['accepted']:
+                        for name in ('radial_gain_range', 'exposure_gain_range'):
+                            illumination[name][0] = min(illumination[name][0], fit[name][0])
+                            illumination[name][1] = max(illumination[name][1], fit[name][1])
+                        prior = illumination['minimum_model_confidence']
+                        illumination['minimum_model_confidence'] = min(prior, fit['confidence']) if prior is not None else fit['confidence']
+                    else:
+                        reasons = illumination['fallback_reasons']
+                        reasons[fit['reason']] = reasons.get(fit['reason'], 0) + 1
+                    _emit(progress, "illumination", batch=batch_index, **fit)
                 chunks = _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache)
                 if executor is None:
                     completed_chunks = (_assign_chunk_colors(offset, xyz, batch, colors, quality, distances,
@@ -570,7 +647,9 @@ def colorize_las(
                         lambda item: _assign_chunk_colors(item[0], item[1], batch, colors, quality, distances, sources,
                                                           calibration, options),
                         chunks, options.worker_threads)
-                for offset, length in completed_chunks:
+                for offset, length, corrected_count, rejected_count in completed_chunks:
+                    illumination['corrected_observations'] += corrected_count
+                    illumination['rejected_exposure_observations'] += rejected_count
                     _check_cancel(cancelled)
                     _emit(progress, "colorizing", batch=batch_index, points_processed=offset + length,
                           point_count=count, frames_received=received, frames_used=used)
@@ -593,8 +672,9 @@ def colorize_las(
                     points.blue = colors[offset:offset + length, 2]
                     observed = quality[offset:offset + length] > 0
                     points["Colorized"] = observed.astype(np.uint8)
-                    points["ColorConfidence"] = quality[offset:offset + length]
-                    points["ColorDistance"] = distances[offset:offset + length]
+                    if not options.merged_output:
+                        points["ColorConfidence"] = quality[offset:offset + length]
+                        points["ColorDistance"] = distances[offset:offset + length]
                     points["SourceFlight"] = sources[offset:offset + length]
                     colored += int(observed.sum())
                     writer.write_points(points)
@@ -616,9 +696,10 @@ def colorize_las(
                 temporary_output.unlink()
             else:
                 os.rename(temporary_output, destination)
+            illumination['applied'] = illumination['corrected_observations'] > 0
             result = ColorizationResult(destination, count, colored, received, used, rejected,
                                          experimental_calibration=not calibration.validated,
-                                         xyz_cache_used=use_xyz_cache)
+                                         xyz_cache_used=use_xyz_cache, illumination_balancing=illumination)
             _emit(progress, "complete", **result.to_dict())
             return result
         finally:

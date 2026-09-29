@@ -5,6 +5,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### v1.1.0 local development
+
+- Added optional **Correct uneven illumination**, using visibility-checked overlap
+  evidence, bounded batch-local radial fits, modest exposure offsets, and
+  point-disjoint validation. Unsafe fits leave RGB unchanged.
+- Added illumination diagnostics to processing details and JSON reports.
+- Final merged LAS retains Colorized and SourceFlight; confidence and
+  distance remain internal. Separate outputs retain their existing attributes.
+- Added synthetic correction, fallback, workflow, and performance checks.
+
 ## [1.0.0] - 2026-09-28
 
 ### Added

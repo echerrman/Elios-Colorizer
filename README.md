@@ -104,8 +104,8 @@ coordinates and compatible attributes. The application adds:
 | Attribute | Meaning |
 | --- | --- |
 | `Colorized` | `1` if a usable RGB observation was selected; otherwise `0` |
-| `ColorConfidence` | Relative score of the selected observation |
-| `ColorDistance` | Camera-to-point distance in metres |
+| `ColorConfidence` (separate outputs only) | Relative score of the selected observation |
+| `ColorDistance` (separate outputs only) | Camera-to-point distance in metres |
 | `SourceFlight` | One-based source-flight index in merged output |
 
 Each output includes a JSON processing report with calibration identity, timing
@@ -167,3 +167,11 @@ Elios Colorizer is available under the [MIT License](LICENSE).
 Elios, Elios 3, Inspector, and Flyability are trademarks of their respective
 owners. This independent open-source project is not affiliated with, sponsored
 by, or endorsed by Flyability.
+
+### v1.1.0 local development
+
+The optional **Correct uneven illumination** control uses matched geometry to
+reduce radial lighting differences conservatively. See
+[Illumination Balancing](docs/ILLUMINATION_BALANCING.md) for validation, fallback,
+and synthetic performance measurements. This development build is pending
+real-flight acceptance testing; the public release remains v1.0.0.

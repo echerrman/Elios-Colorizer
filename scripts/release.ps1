@@ -24,7 +24,7 @@ if ($LASTEXITCODE -ne 0 -or $sourceVersion.Trim() -ne $Version) {
 }
 
 $manifest = Get-Content -LiteralPath 'pyproject.toml' -Raw
-if ($manifest -notmatch "(?m)^version = `"$([regex]::Escape($Version))`"$") {
+if ($manifest -notmatch "(?m)^version = `"$([regex]::Escape($Version))`"\r?$") {
     throw "pyproject.toml does not declare version $Version."
 }
 

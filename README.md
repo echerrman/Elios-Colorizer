@@ -170,7 +170,7 @@ by, or endorsed by Flyability.
 
 ### v1.1.0 local development
 
-The optional **Correct uneven illumination** control uses matched geometry to
+The optional **Illumination Balancing** control uses matched geometry to
 reduce radial lighting differences conservatively. See
 [Illumination Balancing](docs/ILLUMINATION_BALANCING.md) for validation, fallback,
 and synthetic performance measurements. This development build is pending

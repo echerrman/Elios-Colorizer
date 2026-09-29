@@ -1,6 +1,6 @@
 # Illumination Balancing (v1.1.0 local development)
 
-**Correct uneven illumination** is opt-in and is not persisted between sessions.
+**Illumination Balancing** is opt-in and is not persisted between sessions.
 It uses repeated observations of the same source points, not histogram matching.
 Insufficient or inconsistent evidence leaves RGB unchanged.
 

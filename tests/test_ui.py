@@ -146,7 +146,8 @@ def test_action_buttons_and_color_balance_placeholder(ui):
     assert "✕" in second.remove_button.text() and "Remove" in second.remove_button.text()
     assert "↻" in window.refresh_button.text()
     assert window.color_balance_check.isEnabled()
-    assert window.color_balance_check.text() == "Correct uneven illumination"
+    assert window.color_balance_check.text() == "Illumination Balancing"
+    assert window.color_balance_check.objectName() == window.distance_check.objectName() == "distanceToggle"
     assert not window.color_balance_check.isChecked()
     window.color_balance_check.setChecked(True)
     assert window._selection().illumination_balancing

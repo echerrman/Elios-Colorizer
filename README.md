@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml?query=branch%3Amain"><img alt="Tests" src="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.0.0"><img alt="Release v1.0.0" src="https://img.shields.io/badge/release-v1.0.0-2f6f89"></a>
+  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.1.0"><img alt="Release v1.1.0" src="https://img.shields.io/badge/release-v1.1.0-2f6f89"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2f6f89"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2f6f89">
   <img alt="Local processing" src="https://img.shields.io/badge/processing-local-187548">
@@ -104,8 +104,8 @@ coordinates and compatible attributes. The application adds:
 | Attribute | Meaning |
 | --- | --- |
 | `Colorized` | `1` if a usable RGB observation was selected; otherwise `0` |
-| `ColorConfidence` | Relative score of the selected observation |
-| `ColorDistance` | Camera-to-point distance in metres |
+| `ColorConfidence` (separate outputs only) | Relative score of the selected observation |
+| `ColorDistance` (separate outputs only) | Camera-to-point distance in metres |
 | `SourceFlight` | One-based source-flight index in merged output |
 
 Each output includes a JSON processing report with calibration identity, timing
@@ -167,3 +167,11 @@ Elios Colorizer is available under the [MIT License](LICENSE).
 Elios, Elios 3, Inspector, and Flyability are trademarks of their respective
 owners. This independent open-source project is not affiliated with, sponsored
 by, or endorsed by Flyability.
+
+### v1.1.0
+
+The optional **Illumination Balancing** control uses matched geometry to
+reduce radial lighting differences conservatively. See
+[Illumination Balancing](docs/ILLUMINATION_BALANCING.md) for validation, fallback,
+and synthetic performance measurements. Version 1.1.0 also applies adaptive
+resource tuning and indexing to all processing workflows.

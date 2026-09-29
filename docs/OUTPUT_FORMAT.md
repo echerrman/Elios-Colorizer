@@ -12,8 +12,8 @@ format, standard attributes, and compatible VLR metadata. It adds or replaces
 | Dimension | Type | Meaning |
 | --- | --- | --- |
 | `Colorized` | Unsigned byte | `1` when a usable RGB observation was selected; otherwise `0` |
-| `ColorConfidence` | Float | Relative quality score of the selected observation |
-| `ColorDistance` | Float | Camera-to-point distance in metres for the selected observation |
+| `ColorConfidence` (separate outputs only) | Float | Relative quality score of the selected observation |
+| `ColorDistance` (separate outputs only) | Float | Camera-to-point distance in metres for the selected observation |
 
 Unobserved points remain present with RGB `(0, 0, 0)`, `Colorized=0`, and zero
 confidence and distance.

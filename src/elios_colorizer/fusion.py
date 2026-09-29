@@ -240,8 +240,6 @@ def _output_header(minimum: np.ndarray) -> laspy.LasHeader:
     header.scales = np.array([.001, .001, .001])
     header.offsets = np.floor(minimum * 1000) / 1000
     header.add_extra_dim(laspy.ExtraBytesParams("Colorized", "uint8", description="1=RGB observed"))
-    header.add_extra_dim(laspy.ExtraBytesParams("ColorConfidence", "float32", description="Selected RGB confidence"))
-    header.add_extra_dim(laspy.ExtraBytesParams("ColorDistance", "float32", description="Winning camera distance (m)"))
     header.add_extra_dim(laspy.ExtraBytesParams("SourceFlight", "uint16", description="One-based source flight index"))
     return header
 
@@ -263,8 +261,6 @@ def _write_groups(writer: laspy.LasWriter, records: np.ndarray,
     points.x, points.y, points.z = best["x"], best["y"], best["z"]
     points.red, points.green, points.blue = rgb[:, 0], rgb[:, 1], rgb[:, 2]
     points["Colorized"] = best["colorized"]
-    points["ColorConfidence"] = best["confidence"]
-    points["ColorDistance"] = best["distance"]
     points["SourceFlight"] = best["source"]
     writer.write_points(points)
     return len(best), int(np.count_nonzero(best["colorized"]))

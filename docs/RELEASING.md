@@ -1,7 +1,7 @@
 # Release process
 
-Version 1.0.0 should be published only after real-flight acceptance testing of
-single-flight, multiple-separate, and merged workflows.
+Publish a release only after acceptance testing of single-flight,
+multiple-separate, and merged workflows.
 
 ## Prepare
 
@@ -18,7 +18,7 @@ Run the release script from a PowerShell prompt:
 
 ```powershell
 ./scripts/setup.ps1
-./scripts/release.ps1 -Version 1.0.0
+./scripts/release.ps1 -Version 1.1.0
 ```
 
 The script verifies version consistency and a clean Git tree, runs the complete
@@ -29,7 +29,7 @@ Test the generated ZIP on a second Windows computer before publishing it.
 
 ## Publish
 
-1. Create the signed or annotated tag `v1.0.0` at the verified commit.
+1. Create the signed or annotated version tag at the verified commit.
 2. Create a GitHub release from that tag and use the matching changelog section
    as the release notes.
 3. Upload the Windows ZIP and `.sha256` file from `dist/`.

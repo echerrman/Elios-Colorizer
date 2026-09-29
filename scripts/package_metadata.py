@@ -17,7 +17,8 @@ for name in ('CALIBRATION.md', 'INSTALLATION.md', 'OUTPUT_FORMAT.md',
              'TIME_SYNCHRONIZATION.md', 'USER_GUIDE.md'):
     (destination / 'docs').mkdir(parents=True, exist_ok=True)
     shutil.copy2(root / 'docs' / name, destination / 'docs' / name)
-for name in ('README.md', 'example_profile.json'):
+for name in ('README.md', 'elios_3_builtin_rgb_default_profile.json',
+             'camera_profile_template.json'):
     target = destination / 'camera_profiles' / name
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(root / 'camera_profiles' / name, target)

@@ -41,9 +41,24 @@ def _name_flight_references(value: str, names: list[str]) -> str:
     return re.sub(r'\bFlight (\d+)\b', replace, value)
 
 
-def merged_processing_tuning(point_count: int, available_memory_bytes: int | None = None,
-                             logical_cpus: int | None = None) -> dict[str, int]:
-    """Choose conservative merged-cloud parallelism without exposing settings in the UI."""
+def _compact_count(value: int) -> str:
+    if value >= 1_000_000:
+        return f'{value / 1_000_000:.1f}M'
+    if value >= 10_000:
+        return f'{value / 1_000:.1f}K'
+    return f'{value:,}'
+
+
+def _projection_progress_detail(frames_used: int, estimated_views: int, candidates: int,
+                                planned: int, points: int, point_count: int) -> str:
+    return (f'{frames_used:,}/~{estimated_views:,} views · '
+            f'{candidates:,}/{planned:,} reviewed · '
+            f'{_compact_count(points)}/{_compact_count(point_count)} points')
+
+
+def processing_tuning(point_count: int, available_memory_bytes: int | None = None,
+                      logical_cpus: int | None = None) -> dict[str, int]:
+    """Choose conservative projection parallelism without exposing UI settings."""
     logical = max(1, logical_cpus if logical_cpus is not None else (os.cpu_count() or 1))
     # Larger batches reuse each expensive pass over merged XYZ for more camera views.
     # Bound 4K frame storage when physical-memory information is unavailable or tight.
@@ -61,6 +76,10 @@ def merged_processing_tuning(point_count: int, available_memory_bytes: int | Non
                                                    (8 if available_gib >= 5 else 4))))
     desired_batch = 24 if point_count >= 50_000_000 else (12 if point_count >= 10_000_000 else 8)
     return {'worker_threads': workers, 'frame_batch_size': min(memory_cap, desired_batch)}
+
+
+# Public compatibility for integrations which imported the original merged-only name.
+merged_processing_tuning = processing_tuning
 
 
 def find_cloudcompare_executable(selected: str | None = None) -> Path | None:
@@ -343,10 +362,13 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
                      *, sample_interval_s: float = 1.0, max_frames: int | None = None,
                      start_s: float | None = None, end_s: float | None = None,
                      experimental: bool = False,
-                     maximum_color_distance_m: float | None = None) -> dict:
+                     maximum_color_distance_m: float | None = None,
+                     illumination_balancing: bool = False) -> dict:
     from .flight import discover_source, load_telemetry, iter_observations, inspect_video_coverage
     from .camera import Calibration
-    from .colorize import colorize_las, ColorizationOptions, ColorizationCancelled
+    from .colorize import (adaptively_select_observations, colorize_las,
+                           ColorizationOptions, ColorizationCancelled,
+                           group_nearby_observations)
 
     import math
     if not math.isfinite(sample_interval_s) or sample_interval_s <= 0:
@@ -411,19 +433,30 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
     if max_frames is not None:
         expected_frames = min(expected_frames, max_frames)
     emit('Colorizing', .03, f'Projecting sampled RGB frames onto the existing LAS ({expected_frames} planned views)…', force=True)
-    frames = iter_observations(source, telemetry, sample_interval_s=sample_interval_s,
-                               max_frames=max_frames, start_s=start_s, end_s=end_s, cancelled=cancelled,
-                               video_coverage=video_coverage)
+    raw_frames = iter_observations(source, telemetry, sample_interval_s=sample_interval_s,
+                                   max_frames=max_frames, start_s=start_s, end_s=end_s,
+                                   cancelled=cancelled, video_coverage=video_coverage)
     logical_cpus = os.cpu_count() or 1
-    # Projection work is memory-bandwidth heavy. Four workers gives useful CPU
-    # concurrency without oversubscribing NumPy/OpenCV or inflating temporaries.
-    workers = max(1, min(4, logical_cpus // 4))
-    options = ColorizationOptions(experimental_calibration=experimental, worker_threads=workers,
-                                  maximum_color_distance_m=maximum_color_distance_m)
+    import laspy
+    with laspy.open(source.las_path) as source_reader:
+        source_point_count = int(source_reader.header.point_count)
+    tuning = processing_tuning(source_point_count, logical_cpus=logical_cpus)
+    options = ColorizationOptions(experimental_calibration=experimental,
+                                  worker_threads=tuning['worker_threads'],
+                                  frame_batch_size=tuning['frame_batch_size'],
+                                  maximum_color_distance_m=maximum_color_distance_m,
+                                  illumination_balancing=illumination_balancing)
+    adaptive_stats: dict[str, int] = {}
+    selected_frames = adaptively_select_observations(raw_frames, stats=adaptive_stats)
+    grouping_stats: dict[str, int] = {}
+    frames = group_nearby_observations(selected_frames, options.frame_batch_size,
+                                       lookahead_batches=2, stats=grouping_stats)
 
     def engine_progress(info: dict):
         stage = info['stage']
-        if stage == 'indexing':
+        if stage == 'illumination':
+            emit('Illumination Balancing', high_water, info['reason'], force=True)
+        elif stage == 'indexing':
             fraction = info['points_processed'] / max(info['point_count'], 1)
             method = (f"caching coordinates in memory for {info['worker_threads']} CPU workers"
                       if info['xyz_cache_used'] else 'using the bounded-memory streaming path')
@@ -437,9 +470,16 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
             local = info['points_processed'] / max(info['point_count'], 1)
             within_batch = (.5 if stage == 'colorizing' else 0) + .5 * local
             completed = max(0, info['frames_received'] - options.frame_batch_size)
-            fraction = min(1., (completed + options.frame_batch_size * within_batch) / expected_frames)
+            candidates = adaptive_stats.get('candidates', 0)
+            retained = adaptive_stats.get('retained', 0)
+            retention = retained / candidates if candidates else 1.
+            estimated_selected = max(info['frames_received'], round(expected_frames * retention))
+            fraction = min(1., (completed + options.frame_batch_size * within_batch)
+                           / max(estimated_selected, 1))
             emit('Checking visibility' if stage == 'visibility' else 'Assigning RGB', .03 + .92 * fraction,
-                 f"{info['frames_used']} views · {info['points_processed']:,} / {info['point_count']:,} points in this pass")
+                 _projection_progress_detail(info['frames_used'], estimated_selected,
+                                             candidates, expected_frames,
+                                             info['points_processed'], info['point_count']))
 
     result = colorize_las(source.las_path, destination, frames, calibration,
                           options=options, progress=engine_progress, cancelled=cancelled)
@@ -463,7 +503,24 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
             'worker_threads': options.worker_threads,
             'logical_cpus_detected': logical_cpus,
             'maximum_color_distance_m': maximum_color_distance_m,
-            'acceleration': 'CPU vectorization, bounded worker threads, and an automatic in-memory XYZ cache when memory permits',
+            'acceleration': ('Adaptive view selection and grouping, resource-aware frame batches, CPU vectorization, '
+                             'bounded worker threads, source-order chunk/frustum indexing, and an automatic '
+                             'in-memory XYZ cache when memory permits'),
+            'adaptive_view_selection': {
+                'candidate_views': adaptive_stats.get('candidates', 0),
+                'retained_views': adaptive_stats.get('retained', 0),
+                'skipped_views': adaptive_stats.get('skipped', 0),
+                'translation_threshold_m': .03,
+                'rotation_threshold_degrees': 2.0,
+                'camera_pitch_threshold_degrees': 1.5,
+                'maximum_gap_seconds': 2.0,
+            },
+            'view_grouping': grouping_stats,
+            'spatial_index': {
+                'method': 'lossless source-order chunk bounds with conservative camera-frustum rejection',
+                'chunk_count': math.ceil(source_point_count / options.chunk_size),
+                'point_order_preserved': True,
+            },
         },
         'time_synchronization': telemetry.timing_diagnostics,
         'sample_interval_seconds': sample_interval_s,
@@ -502,7 +559,7 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                          calibration_override: str | None, *, alignment_method: str,
                          merged_source: str | None, cloudcompare_executable: str | None,
                          maximum_color_distance_m: float | None, progress, cancelled,
-                         started: float, flight_checks: list[dict]) -> dict[str, Any]:
+                         started: float, flight_checks: list[dict], illumination_balancing: bool = False) -> dict[str, Any]:
     """Color one final geometry with globally competing observations from all flights."""
     from itertools import chain
     from .camera import Calibration
@@ -607,10 +664,11 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
         import laspy
         with laspy.open(geometry) as geometry_reader:
             merged_point_count = int(geometry_reader.header.point_count)
-        tuning = merged_processing_tuning(merged_point_count)
+        tuning = processing_tuning(merged_point_count)
         options = ColorizationOptions(worker_threads=tuning['worker_threads'],
-                                      frame_batch_size=tuning['frame_batch_size'],
-                                      maximum_color_distance_m=maximum_color_distance_m)
+                                      frame_batch_size=tuning['frame_batch_size'], merged_output=True,
+                                      maximum_color_distance_m=maximum_color_distance_m,
+                                  illumination_balancing=illumination_balancing)
         grouping_stats: dict[str, int] = {}
         grouped_stream = group_nearby_observations(chain.from_iterable(streams),
                                                    options.frame_batch_size,
@@ -618,13 +676,22 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                                                    stats=grouping_stats)
         color_share = .95 - preparation_share
 
+        engine_high_water = preparation_share
+
+        def engine_emit(stage, fraction, message):
+            nonlocal engine_high_water
+            engine_high_water = max(engine_high_water, fraction)
+            progress(stage, engine_high_water, message)
+
         def engine_progress(info: dict) -> None:
             stage = info['stage']
             if not progress:
                 return
-            if stage == 'indexing':
+            if stage == 'illumination':
+                engine_emit('Illumination Balancing', preparation_share, info['reason'])
+            elif stage == 'indexing':
                 local = info['points_processed'] / max(info['point_count'], 1)
-                progress('Preparing final geometry', preparation_share + color_share * .02 * local,
+                engine_emit('Preparing final geometry', preparation_share + color_share * .02 * local,
                          f"Reading {info['points_processed']:,} / {info['point_count']:,} merged points · "
                          f"{options.frame_batch_size}-view batches · {options.worker_threads} CPU workers")
             elif stage in ('visibility', 'colorizing'):
@@ -637,14 +704,14 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                 estimated_selected = max(info['frames_received'], round(planned * retention))
                 view_fraction = min(1., (completed + options.frame_batch_size * within)
                                     / max(estimated_selected, 1))
-                progress('Checking visibility' if stage == 'visibility' else 'Assigning RGB',
+                engine_emit('Checking visibility' if stage == 'visibility' else 'Assigning RGB',
                          preparation_share + color_share * (.02 + .93 * view_fraction),
-                         f"{info['frames_used']} / approximately {estimated_selected} selected views · "
-                         f"{candidates:,} / {planned:,} candidate views reviewed · "
-                         f"{info['points_processed']:,} / {info['point_count']:,} points in this pass")
+                         _projection_progress_detail(info['frames_used'], estimated_selected,
+                                                     candidates, planned,
+                                                     info['points_processed'], info['point_count']))
             elif stage == 'writing':
                 local = info['points_processed'] / max(info['point_count'], 1)
-                progress('Saving merged LAS', .95 + .049 * local,
+                engine_emit('Saving merged LAS', .95 + .049 * local,
                          f"Writing {info['points_processed']:,} / {info['point_count']:,} points")
 
         result = colorize_las(geometry, destination, grouped_stream, calibration,
@@ -690,6 +757,7 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
                  alignment_method: str = 'manual', merged_source: str | None = None,
                  cloudcompare_executable: str | None = None,
                  maximum_color_distance_m: float | None = None,
+                 illumination_balancing: bool = False,
                  progress: Callable[[str, float, str], None] | None = None,
                  cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
     """Colorize one or more flights, optionally align and fuse colored results."""
@@ -725,7 +793,8 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
         item = selections[0]
         return run_colorization(str(item.get('folder') or ''), str(destination),
             item.get('las_override'), calibration_override, progress, cancelled,
-            maximum_color_distance_m=maximum_color_distance_m)
+            maximum_color_distance_m=maximum_color_distance_m,
+                                  illumination_balancing=illumination_balancing)
 
     started = time.monotonic()
     if mode == 'separate':
@@ -758,7 +827,8 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
                     progress(f'{_name}: {stage}', _base + _scale * fraction, message)
             result = run_colorization(str(item.get('folder') or ''), str(flight_output),
                 item.get('las_override'), calibration_override, flight_progress, cancelled,
-                maximum_color_distance_m=maximum_color_distance_m)
+                maximum_color_distance_m=maximum_color_distance_m,
+                                  illumination_balancing=illumination_balancing)
             reports.append(result)
         total = sum(int(result['total_points']) for result in reports)
         colored = sum(int(result['colored_points']) for result in reports)
@@ -776,4 +846,5 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
         alignment_method=alignment_method, merged_source=merged_source,
         cloudcompare_executable=cloudcompare_executable,
         maximum_color_distance_m=maximum_color_distance_m, progress=progress,
-        cancelled=cancelled, started=started, flight_checks=flight_checks)
+        cancelled=cancelled, started=started, flight_checks=flight_checks,
+        illumination_balancing=illumination_balancing)

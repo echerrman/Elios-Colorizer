@@ -55,6 +55,7 @@ def test_fusion_selects_best_confidence_and_retains_uncolored(tmp_path):
     result = fuse_clouds([first, second], tmp_path / "merged.las",
                          alignments=(identity(first), identity(second)), voxel_size_m=.01)
     output = laspy.read(result.output_path)
+    assert set(output.point_format.extra_dimension_names) == {'Colorized', 'SourceFlight'}
     assert result.input_colored_points == 4
     assert result.input_point_count == 5
     assert result.point_count == 4

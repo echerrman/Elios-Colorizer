@@ -7,10 +7,8 @@ before reporting a problem that is already resolved in a newer release.
 
 | Version | Supported |
 | --- | --- |
-| 0.2.x | Yes |
-| Earlier versions | No |
-
-This table will be updated when version 1.0.0 is released.
+| 1.x | Yes |
+| 0.x | No |
 
 ## Reporting a vulnerability
 

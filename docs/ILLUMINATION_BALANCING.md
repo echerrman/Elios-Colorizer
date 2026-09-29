@@ -1,4 +1,4 @@
-# Illumination Balancing (v1.1.0 local development)
+# Illumination Balancing
 
 **Illumination Balancing** is opt-in and is not persisted between sessions.
 It uses repeated observations of the same source points, not histogram matching.

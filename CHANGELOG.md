@@ -5,14 +5,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### v1.1.0 local development
+## [1.1.0] - 2026-09-29
+
+### Added
 
 - Added optional **Correct uneven illumination**, using visibility-checked overlap
   evidence, bounded batch-local radial fits, modest exposure offsets, and
   point-disjoint validation. Unsafe fits leave RGB unchanged.
 - Added illumination diagnostics to processing details and JSON reports.
+- Added the tested default Elios 3 built-in camera profile and a bare camera
+  profile template for custom calibrations.
+
+### Changed
+
 - Final merged LAS retains Colorized and SourceFlight; confidence and
   distance remain internal. Separate outputs retain their existing attributes.
+- Applied adaptive resource tuning, spatial indexing, and grouped projection
+  passes to single-flight and separate-output workflows.
+- Condensed live projection progress details for easier scanning.
 - Added synthetic correction, fallback, workflow, and performance checks.
 
 ## [1.0.0] - 2026-09-28
@@ -61,7 +71,8 @@ project follows [Semantic Versioning](https://semver.org/).
   RGB-video ingestion.
 - Explicit `Colorized` output attribute and deterministic packaged self-test.
 
-[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/echerrman/Elios-Colorizer/compare/v0.2.1...v1.0.0
 [0.2.1]: https://github.com/echerrman/Elios-Colorizer/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/echerrman/Elios-Colorizer/releases/tag/v0.2.0

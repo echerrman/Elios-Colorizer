@@ -41,6 +41,21 @@ def _name_flight_references(value: str, names: list[str]) -> str:
     return re.sub(r'\bFlight (\d+)\b', replace, value)
 
 
+def _compact_count(value: int) -> str:
+    if value >= 1_000_000:
+        return f'{value / 1_000_000:.1f}M'
+    if value >= 10_000:
+        return f'{value / 1_000:.1f}K'
+    return f'{value:,}'
+
+
+def _projection_progress_detail(frames_used: int, estimated_views: int, candidates: int,
+                                planned: int, points: int, point_count: int) -> str:
+    return (f'{frames_used:,}/~{estimated_views:,} views · '
+            f'{candidates:,}/{planned:,} reviewed · '
+            f'{_compact_count(points)}/{_compact_count(point_count)} points')
+
+
 def processing_tuning(point_count: int, available_memory_bytes: int | None = None,
                       logical_cpus: int | None = None) -> dict[str, int]:
     """Choose conservative projection parallelism without exposing UI settings."""
@@ -462,9 +477,9 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
             fraction = min(1., (completed + options.frame_batch_size * within_batch)
                            / max(estimated_selected, 1))
             emit('Checking visibility' if stage == 'visibility' else 'Assigning RGB', .03 + .92 * fraction,
-                 f"{info['frames_used']} / approximately {estimated_selected} selected views · "
-                 f"{candidates:,} / {expected_frames:,} candidate views reviewed · "
-                 f"{info['points_processed']:,} / {info['point_count']:,} points in this pass")
+                 _projection_progress_detail(info['frames_used'], estimated_selected,
+                                             candidates, expected_frames,
+                                             info['points_processed'], info['point_count']))
 
     result = colorize_las(source.las_path, destination, frames, calibration,
                           options=options, progress=engine_progress, cancelled=cancelled)
@@ -691,9 +706,9 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                                     / max(estimated_selected, 1))
                 engine_emit('Checking visibility' if stage == 'visibility' else 'Assigning RGB',
                          preparation_share + color_share * (.02 + .93 * view_fraction),
-                         f"{info['frames_used']} / approximately {estimated_selected} selected views · "
-                         f"{candidates:,} / {planned:,} candidate views reviewed · "
-                         f"{info['points_processed']:,} / {info['point_count']:,} points in this pass")
+                         _projection_progress_detail(info['frames_used'], estimated_selected,
+                                                     candidates, planned,
+                                                     info['points_processed'], info['point_count']))
             elif stage == 'writing':
                 local = info['points_processed'] / max(info['point_count'], 1)
                 engine_emit('Saving merged LAS', .95 + .049 * local,

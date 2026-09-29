@@ -1,5 +1,6 @@
 from elios_colorizer.selftest import create_fixture
-from elios_colorizer.service import (find_cloudcompare_executable, inspect_source, inspect_sources,
+from elios_colorizer.service import (_projection_progress_detail, find_cloudcompare_executable,
+                                     inspect_source, inspect_sources,
                                      merged_processing_tuning, processing_tuning,
                                      run_colorization, run_workflow)
 import laspy
@@ -17,6 +18,11 @@ def test_merged_processing_tuning_uses_safe_larger_batches():
     modest = merged_processing_tuning(20_000_000, 10 * gib, 12)
     assert modest == {'worker_threads': 6, 'frame_batch_size': 12}
     assert processing_tuning(20_000_000, 10 * gib, 12) == modest
+
+
+def test_projection_progress_detail_is_compact():
+    assert _projection_progress_detail(48, 1011, 66, 1112, 16_000_000, 47_330_435) == (
+        '48/~1,011 views · 66/1,112 reviewed · 16.0M/47.3M points')
 
 
 @pytest.mark.parametrize('balancing', [False, True])

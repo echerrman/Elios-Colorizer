@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml?query=branch%3Amain"><img alt="Tests" src="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.1.0"><img alt="Release v1.1.0" src="https://img.shields.io/badge/release-v1.1.0-2f6f89"></a>
+  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.2.0"><img alt="Release v1.2.0" src="https://img.shields.io/badge/release-v1.2.0-2f6f89"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2f6f89"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2f6f89">
   <img alt="Local processing" src="https://img.shields.io/badge/processing-local-187548">
@@ -34,8 +34,9 @@ native flight telemetry, and recorded 4K video. It preserves unobserved geometry
 marks every point with an explicit colorization status, and performs all work on
 the local computer. Flight data is not uploaded to a cloud service.
 
-> **Version 1.0:** single-flight colorization, multi-flight batch processing,
-> and confidence-aware merged colorization are available in the stable release.
+> **Version 1.2:** single-flight colorization, multi-flight batch processing,
+> confidence-aware merged colorization, illumination balancing, and NVIDIA CUDA
+> acceleration are available in the stable release.
 
 ## Install
 
@@ -90,9 +91,11 @@ points into sampled video frames, rejects poor observations, and keeps the
 highest-confidence usable color for each point.
 
 Visibility uses a point-cloud depth buffer. Observation quality considers image
-position, distance, sharpness, and exposure. Processing is CPU-accelerated and
-automatically chooses between an in-memory coordinate cache and a bounded-memory
-streaming path.
+position, distance, sharpness, and exposure. On a compatible NVIDIA GPU, CUDA
+performs projection, depth-buffer visibility, RGB sampling, illumination
+correction, and observation scoring in bounded batches. The application falls
+back automatically to the CPU implementation and independently chooses between
+an in-memory coordinate cache and a bounded-memory streaming path.
 
 [Read the synchronization design →](docs/TIME_SYNCHRONIZATION.md)
 
@@ -130,6 +133,9 @@ Security concerns should be reported privately according to
 ## Compatibility and limitations
 
 - Windows 10 or 11, 64-bit.
+- NVIDIA CUDA acceleration supports NVIDIA GPUs with compute capability 7.5 or
+  newer and a current driver; the CPU fallback remains available on other
+  systems.
 - Observed Inspector native layout with StarNet Camera schema version 4.
 - LAS output; LAS and LAZ input.
 - Point-cloud visibility is approximate around thin or sparse structures.
@@ -142,7 +148,9 @@ See the [changelog](CHANGELOG.md) for release history.
 ## Development
 
 The complete source, tests, and reproducible Windows build scripts are public.
-Use 64-bit Python 3.12:
+Use 64-bit Python 3.12. CUDA-enabled development builds also require the
+NVIDIA CUDA Toolkit and the Visual Studio 2022 **Desktop development with
+C++** workload; builds without them retain the CPU fallback:
 
 ```powershell
 ./scripts/setup.ps1
@@ -154,6 +162,7 @@ The packaged application provides a deterministic synthetic integration check:
 
 ```powershell
 ./dist/EliosColorizer/EliosColorizer.exe --self-test ./selftest-output
+./dist/EliosColorizer/EliosColorizer.exe --cuda-check ./cuda-checkpoint
 ```
 
 Contributions are welcome through the process in
@@ -167,6 +176,12 @@ Elios Colorizer is available under the [MIT License](LICENSE).
 Elios, Elios 3, Inspector, and Flyability are trademarks of their respective
 owners. This independent open-source project is not affiliated with, sponsored
 by, or endorsed by Flyability.
+
+### v1.2.0
+
+Version 1.2.0 adds bounded NVIDIA CUDA acceleration for the most expensive
+projection, visibility, sampling, correction, and scoring work. Runtime checks
+select CUDA when supported and safely retain the complete CPU processing path.
 
 ### v1.1.0
 

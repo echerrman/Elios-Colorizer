@@ -16,8 +16,13 @@ Elios Colorizer uses unmodified third-party libraries. Their own licenses apply 
 | LZ4, zstandard | https://github.com/python-lz4/python-lz4 ; https://github.com/indygreg/python-zstandard | BSD / component notices |
 | PyYAML | https://pyyaml.org/ | MIT |
 | PyInstaller bootloader | https://pyinstaller.org/ | GPL with bootloader exception |
+| NVIDIA CUDA Runtime | https://developer.nvidia.com/cuda-toolkit | NVIDIA CUDA Toolkit EULA |
 
 Consult the bundled license texts for exact terms and copyright holders. The application does not modify Qt/PySide6; these remain dynamically loaded and replaceable. The application source is supplied in this project, and the unmodified upstream source is available from the linked projects at the versions recorded in `requirements-lock.txt`. No restriction on reverse engineering for debugging modifications to LGPL components is imposed by this project.
 
-Elios and Inspector are Flyability product names. This project is an independent local development tool and is not a Flyability product or endorsement.
+The Windows package contains NVIDIA CUDA Runtime components statically linked
+into the optional CUDA backend. They are distributed under the
+[NVIDIA CUDA Toolkit End User License Agreement](https://docs.nvidia.com/cuda/eula/index.html).
+The NVIDIA display driver is not included.
 
+Elios and Inspector are Flyability product names. This project is an independent local development tool and is not a Flyability product or endorsement.

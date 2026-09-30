@@ -57,7 +57,8 @@ def _projection_progress_detail(frames_used: int, estimated_views: int, candidat
 
 
 def processing_tuning(point_count: int, available_memory_bytes: int | None = None,
-                      logical_cpus: int | None = None) -> dict[str, int]:
+                      logical_cpus: int | None = None,
+                      cuda_acceleration: bool = False) -> dict[str, int]:
     """Choose conservative projection parallelism without exposing UI settings."""
     logical = max(1, logical_cpus if logical_cpus is not None else (os.cpu_count() or 1))
     # Larger batches reuse each expensive pass over merged XYZ for more camera views.
@@ -74,7 +75,9 @@ def processing_tuning(point_count: int, available_memory_bytes: int | None = Non
     memory_cap = (24 if available_gib >= 20 else
                   (16 if available_gib >= 12 else (12 if available_gib >= 8 else
                                                    (8 if available_gib >= 5 else 4))))
-    desired_batch = 24 if point_count >= 50_000_000 else (12 if point_count >= 10_000_000 else 8)
+    desired_batch = (24 if cuda_acceleration and point_count >= 10_000_000 else
+                     (24 if point_count >= 50_000_000 else
+                      (12 if point_count >= 10_000_000 else 8)))
     return {'worker_threads': workers, 'frame_batch_size': min(memory_cap, desired_batch)}
 
 
@@ -440,7 +443,10 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
     import laspy
     with laspy.open(source.las_path) as source_reader:
         source_point_count = int(source_reader.header.point_count)
-    tuning = processing_tuning(source_point_count, logical_cpus=logical_cpus)
+    from .cuda_backend import cuda_checkpoint
+    cuda_ready = cuda_checkpoint().available
+    tuning = processing_tuning(source_point_count, logical_cpus=logical_cpus,
+                               cuda_acceleration=cuda_ready)
     options = ColorizationOptions(experimental_calibration=experimental,
                                   worker_threads=tuning['worker_threads'],
                                   frame_batch_size=tuning['frame_batch_size'],
@@ -451,15 +457,21 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
     grouping_stats: dict[str, int] = {}
     frames = group_nearby_observations(selected_frames, options.frame_batch_size,
                                        lookahead_batches=2, stats=grouping_stats)
+    cuda_active = False
 
     def engine_progress(info: dict):
+        nonlocal cuda_active
         stage = info['stage']
-        if stage == 'illumination':
+        if stage == 'acceleration':
+            cuda_active = bool(info['cuda_acceleration_active'])
+            emit('NVIDIA CUDA', high_water, info['summary'], force=True)
+        elif stage == 'illumination':
             emit('Illumination Balancing', high_water, info['reason'], force=True)
         elif stage == 'indexing':
             fraction = info['points_processed'] / max(info['point_count'], 1)
-            method = (f"caching coordinates in memory for {info['worker_threads']} CPU workers"
-                      if info['xyz_cache_used'] else 'using the bounded-memory streaming path')
+            method = ('staging bounded chunks for CUDA projection' if cuda_active else
+                      (f"caching coordinates in memory for {info['worker_threads']} CPU workers"
+                       if info['xyz_cache_used'] else 'using the bounded-memory CPU streaming path'))
             emit('Preparing point cloud', .01 + .02 * fraction,
                  f"Reading {info['points_processed']:,} of {info['point_count']:,} points; {method}")
         elif stage == 'writing':
@@ -503,9 +515,10 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
             'worker_threads': options.worker_threads,
             'logical_cpus_detected': logical_cpus,
             'maximum_color_distance_m': maximum_color_distance_m,
-            'acceleration': ('Adaptive view selection and grouping, resource-aware frame batches, CPU vectorization, '
-                             'bounded worker threads, source-order chunk/frustum indexing, and an automatic '
-                             'in-memory XYZ cache when memory permits'),
+            'acceleration': result.acceleration,
+            'optimization': ('Adaptive view selection and grouping, resource-aware frame batches, bounded CUDA '
+                             'projection with automatic CPU fallback, source-order chunk/frustum indexing, and an '
+                             'automatic in-memory XYZ cache when memory permits'),
             'adaptive_view_selection': {
                 'candidate_views': adaptive_stats.get('candidates', 0),
                 'retained_views': adaptive_stats.get('retained', 0),
@@ -535,11 +548,12 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
     except OSError as exc:
         emit('LAS saved', 1, f'LAS is complete, but report could not be saved: {exc}', force=True)
         return dict(output=str(destination), report=None, colored_points=result.colored_point_count,
-                    total_points=result.point_count, warning=str(exc))
+                    total_points=result.point_count, acceleration=result.acceleration,
+                    warning=str(exc))
     emit('Complete', 1, f'{result.colored_point_count:,} of {result.point_count:,} points colored '
          f'({result.coverage_fraction:.1%}).', force=True)
     return dict(output=str(destination), report=str(report_path), colored_points=result.colored_point_count,
-                total_points=result.point_count)
+                total_points=result.point_count, acceleration=result.acceleration)
 
 
 def _safe_name(value: str, fallback: str) -> str:
@@ -664,7 +678,9 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
         import laspy
         with laspy.open(geometry) as geometry_reader:
             merged_point_count = int(geometry_reader.header.point_count)
-        tuning = processing_tuning(merged_point_count)
+        from .cuda_backend import cuda_checkpoint
+        tuning = processing_tuning(merged_point_count,
+                                   cuda_acceleration=cuda_checkpoint().available)
         options = ColorizationOptions(worker_threads=tuning['worker_threads'],
                                       frame_batch_size=tuning['frame_batch_size'], merged_output=True,
                                       maximum_color_distance_m=maximum_color_distance_m,
@@ -677,6 +693,7 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
         color_share = .95 - preparation_share
 
         engine_high_water = preparation_share
+        cuda_active = False
 
         def engine_emit(stage, fraction, message):
             nonlocal engine_high_water
@@ -684,16 +701,21 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
             progress(stage, engine_high_water, message)
 
         def engine_progress(info: dict) -> None:
+            nonlocal cuda_active
             stage = info['stage']
             if not progress:
                 return
-            if stage == 'illumination':
+            if stage == 'acceleration':
+                cuda_active = bool(info['cuda_acceleration_active'])
+                engine_emit('NVIDIA CUDA', preparation_share, info['summary'])
+            elif stage == 'illumination':
                 engine_emit('Illumination Balancing', preparation_share, info['reason'])
             elif stage == 'indexing':
                 local = info['points_processed'] / max(info['point_count'], 1)
                 engine_emit('Preparing final geometry', preparation_share + color_share * .02 * local,
                          f"Reading {info['points_processed']:,} / {info['point_count']:,} merged points · "
-                         f"{options.frame_batch_size}-view batches · {options.worker_threads} CPU workers")
+                         f"{options.frame_batch_size}-view batches · "
+                         f"{'CUDA projection' if cuda_active else f'{options.worker_threads} CPU workers'}")
             elif stage in ('visibility', 'colorizing'):
                 local = info['points_processed'] / max(info['point_count'], 1)
                 within = (.5 if stage == 'colorizing' else 0) + .5 * local
@@ -727,8 +749,10 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
             'point_count': merged_point_count,
             'frame_batch_size': options.frame_batch_size,
             'worker_threads': options.worker_threads,
-            'optimization': ('Merged-cloud batches reuse each XYZ pass across more views; projection and color '
-                             'assignment run concurrently across bounded CPU workers.'),
+            'acceleration': result.acceleration,
+            'optimization': ('Merged-cloud batches reuse each XYZ pass across more views; projection, occlusion, '
+                             'RGB sampling, and observation scoring run in bounded CUDA batches with automatic '
+                             'CPU fallback.'),
             'adaptive_view_selection': {
                 'candidate_views': sum(row.get('candidates', 0) for row in adaptive_rows),
                 'retained_views': sum(row.get('retained', 0) for row in adaptive_rows),
@@ -749,7 +773,8 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
     if progress:
         progress('Complete', 1., f'{result.colored_point_count:,} of {result.point_count:,} points colored.')
     return dict(output=str(destination), report=str(report_path),
-                colored_points=result.colored_point_count, total_points=result.point_count)
+                colored_points=result.colored_point_count, total_points=result.point_count,
+                acceleration=result.acceleration)
 
 
 def run_workflow(flights: Iterable[dict[str, str | None]], output: str,

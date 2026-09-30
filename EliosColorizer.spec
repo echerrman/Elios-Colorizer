@@ -1,10 +1,14 @@
 from PyInstaller.utils.hooks import collect_submodules, copy_metadata
+from pathlib import Path
 
 hidden = collect_submodules('mcap') + collect_submodules('mcap_ros2')
 data = [(f'assets/{name}', 'assets') for name in
     ('elios_colorizer.svg', 'theme-sun.svg', 'theme-moon.svg')]
 for package in ('numpy', 'scipy', 'opencv-python-headless', 'laspy', 'PySide6-Essentials', 'mcap', 'mcap-ros2-support', 'lazrs'):
     data += copy_metadata(package)
+cuda_probe = Path('build/cuda/elios_cuda_probe.dll')
+if cuda_probe.is_file():
+    data.append((str(cuda_probe), 'elios_colorizer/native'))
 a = Analysis(['scripts/desktop_entry.py'], pathex=['src'], binaries=[], datas=data,
              hiddenimports=hidden, hookspath=[], hooksconfig={}, runtime_hooks=[],
              excludes=['PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'tkinter'], noarchive=False)

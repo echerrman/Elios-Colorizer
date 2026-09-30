@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+cuda-checkpoint*/
 Flight_Data/
 outputs/
 .cache/

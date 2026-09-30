@@ -100,6 +100,7 @@ class ColorizationResult:
     experimental_calibration: bool = False
     xyz_cache_used: bool = False
     illumination_balancing: dict | None = None
+    acceleration: dict | None = None
 
     @property
     def coverage_fraction(self) -> float:
@@ -527,6 +528,9 @@ def colorize_las(
     re-iterable source to run again. Cancellation is checked at each LAS chunk.
     """
     options = options or ColorizationOptions()
+    from .cuda_backend import (CudaBackendError, cuda_checkpoint,
+                               cuda_projection_backend)
+    acceleration = cuda_checkpoint().to_dict()
     source, destination = Path(input_path).resolve(), Path(output_path).resolve()
     if source == destination:
         raise ColorizationError("Input and output must be different files")
@@ -534,6 +538,20 @@ def colorize_las(
         raise ColorizationError("Output must use .las; this preserves geometry without compression dependencies")
     if not isinstance(calibration, Calibration) or (not calibration.validated and not options.experimental_calibration):
         raise ColorizationError("A validated RGB camera calibration is required")
+    cuda_backend, cuda_reason = cuda_projection_backend(calibration)
+    acceleration.update(
+        processing_backend='cuda_projection' if cuda_backend else 'cpu_reference',
+        cuda_acceleration_active=cuda_backend is not None,
+        fallback_reason=cuda_reason,
+        visibility_chunks=0,
+        color_chunks=0,
+        points_projected_for_visibility=0,
+        points_processed_for_color=0,
+    )
+    acceleration['summary'] = (
+        f"CUDA projection enabled on {acceleration.get('device_name')}"
+        if cuda_backend else f"CPU fallback: {cuda_reason}")
+    _emit(progress, "acceleration", **acceleration)
     if destination.exists() and not options.overwrite:
         raise ColorizationError("Output already exists; choose another file name")
     _check_cancel(cancelled)
@@ -565,6 +583,7 @@ def colorize_las(
         distances = np.memmap(work / "distance.f32", mode="w+", dtype=np.float32, shape=(count,))
         sources = np.memmap(work / "source.u16", mode="w+", dtype=np.uint16, shape=(count,))
         # Freshly created mapped files are zero initialized by the operating system.
+        active_cuda_batch = None
         try:
             # Chunk bounds are tiny (about 4 KB per 20M points) and let later passes
             # seek past distant/behind-camera chunks without decoding their XYZ.
@@ -608,20 +627,48 @@ def colorize_las(
                 used += len(batch)
                 active_offsets = {offset for offset, bounds in chunk_bounds.items()
                                   if any(_chunk_may_be_visible(bounds, frame, calibration, options) for frame in batch)}
-                for offset, xyz in _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache):
-                    _check_cancel(cancelled)
-                    if executor is None or len(batch) == 1:
+                cuda_batch = None
+                if cuda_backend is not None:
+                    try:
+                        cuda_batch = cuda_backend.begin_batch(batch, calibration, options)
+                        active_cuda_batch = cuda_batch
+                        for offset, xyz in _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache):
+                            _check_cancel(cancelled)
+                            cuda_batch.visibility(xyz)
+                            acceleration['visibility_chunks'] += 1
+                            acceleration['points_projected_for_visibility'] += len(xyz) * len(batch)
+                            _emit(progress, "visibility", batch=batch_index,
+                                  points_processed=offset + len(xyz), point_count=count,
+                                  frames_received=received, frames_used=used)
+                        cuda_batch.finish_visibility(options.occlusion_radius_pixels)
+                    except CudaBackendError as exc:
+                        if cuda_batch is not None:
+                            cuda_batch.close()
+                        cuda_batch = active_cuda_batch = None
+                        cuda_backend = None
+                        cuda_reason = str(exc)
+                        acceleration.update(processing_backend='cpu_reference',
+                                            cuda_acceleration_active=False,
+                                            fallback_reason=cuda_reason,
+                                            summary=f'CPU fallback: {cuda_reason}')
+                        _emit(progress, "acceleration", **acceleration)
                         for frame in batch:
-                            _update_visibility(xyz, frame, calibration, options)
-                    else:
-                        list(executor.map(lambda frame: _update_visibility(xyz, frame, calibration, options), batch))
-                    _emit(progress, "visibility", batch=batch_index, points_processed=offset + len(xyz),
-                          point_count=count, frames_received=received, frames_used=used)
-                if options.occlusion_radius_pixels:
-                    size = 2 * options.occlusion_radius_pixels + 1
-                    for frame in batch:
-                        frame.depth = cv2.erode(frame.depth, np.ones((size, size), np.uint8),
-                                                borderType=cv2.BORDER_CONSTANT, borderValue=float("inf"))
+                            frame.depth.fill(np.inf)
+                if cuda_batch is None:
+                    for offset, xyz in _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache):
+                        _check_cancel(cancelled)
+                        if executor is None or len(batch) == 1:
+                            for frame in batch:
+                                _update_visibility(xyz, frame, calibration, options)
+                        else:
+                            list(executor.map(lambda frame: _update_visibility(xyz, frame, calibration, options), batch))
+                        _emit(progress, "visibility", batch=batch_index, points_processed=offset + len(xyz),
+                              point_count=count, frames_received=received, frames_used=used)
+                    if options.occlusion_radius_pixels:
+                        size = 2 * options.occlusion_radius_pixels + 1
+                        for frame in batch:
+                            frame.depth = cv2.erode(frame.depth, np.ones((size, size), np.uint8),
+                                                    borderType=cv2.BORDER_CONSTANT, borderValue=float("inf"))
                 if options.illumination_balancing:
                     fit = _estimate_illumination(sample_xyz, batch, calibration, options)
                     illumination['overlap_sample_count'] += fit['overlap_sample_count']
@@ -637,22 +684,70 @@ def colorize_las(
                         reasons = illumination['fallback_reasons']
                         reasons[fit['reason']] = reasons.get(fit['reason'], 0) + 1
                     _emit(progress, "illumination", batch=batch_index, **fit)
+                    if cuda_batch is not None:
+                        try:
+                            cuda_batch.set_illumination()
+                        except CudaBackendError as exc:
+                            cuda_batch.close()
+                            cuda_batch = active_cuda_batch = None
+                            cuda_backend = None
+                            cuda_reason = str(exc)
+                            acceleration.update(processing_backend='cpu_reference',
+                                                cuda_acceleration_active=False,
+                                                fallback_reason=cuda_reason,
+                                                summary=f'CPU fallback: {cuda_reason}')
+                            _emit(progress, "acceleration", **acceleration)
                 chunks = _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache)
-                if executor is None:
-                    completed_chunks = (_assign_chunk_colors(offset, xyz, batch, colors, quality, distances,
-                                                             sources, calibration, options) for offset, xyz in chunks)
+                if cuda_batch is not None:
+                    for offset, xyz in chunks:
+                        if cuda_batch is not None:
+                            try:
+                                corrected_count, rejected_count = cuda_batch.assign(
+                                    xyz, colors[offset:offset + len(xyz)],
+                                    quality[offset:offset + len(xyz)],
+                                    distances[offset:offset + len(xyz)],
+                                    sources[offset:offset + len(xyz)])
+                                acceleration['color_chunks'] += 1
+                                acceleration['points_processed_for_color'] += len(xyz) * len(batch)
+                            except CudaBackendError as exc:
+                                cuda_batch.close()
+                                cuda_batch = active_cuda_batch = None
+                                cuda_backend = None
+                                cuda_reason = str(exc)
+                                acceleration.update(processing_backend='cpu_reference',
+                                                    cuda_acceleration_active=False,
+                                                    fallback_reason=cuda_reason,
+                                                    summary=f'CPU fallback: {cuda_reason}')
+                                _emit(progress, "acceleration", **acceleration)
+                        if cuda_batch is None:
+                            _, _, corrected_count, rejected_count = _assign_chunk_colors(
+                                offset, xyz, batch, colors, quality, distances,
+                                sources, calibration, options)
+                        illumination['corrected_observations'] += corrected_count
+                        illumination['rejected_exposure_observations'] += rejected_count
+                        _check_cancel(cancelled)
+                        _emit(progress, "colorizing", batch=batch_index,
+                              points_processed=offset + len(xyz), point_count=count,
+                              frames_received=received, frames_used=used)
                 else:
-                    completed_chunks = _bounded_parallel_map(
-                        executor,
-                        lambda item: _assign_chunk_colors(item[0], item[1], batch, colors, quality, distances, sources,
-                                                          calibration, options),
-                        chunks, options.worker_threads)
-                for offset, length, corrected_count, rejected_count in completed_chunks:
-                    illumination['corrected_observations'] += corrected_count
-                    illumination['rejected_exposure_observations'] += rejected_count
-                    _check_cancel(cancelled)
-                    _emit(progress, "colorizing", batch=batch_index, points_processed=offset + length,
-                          point_count=count, frames_received=received, frames_used=used)
+                    if executor is None:
+                        completed_chunks = (_assign_chunk_colors(offset, xyz, batch, colors, quality, distances,
+                                                                 sources, calibration, options) for offset, xyz in chunks)
+                    else:
+                        completed_chunks = _bounded_parallel_map(
+                            executor,
+                            lambda item: _assign_chunk_colors(item[0], item[1], batch, colors, quality, distances,
+                                                              sources, calibration, options),
+                            chunks, options.worker_threads)
+                    for offset, length, corrected_count, rejected_count in completed_chunks:
+                        illumination['corrected_observations'] += corrected_count
+                        illumination['rejected_exposure_observations'] += rejected_count
+                        _check_cancel(cancelled)
+                        _emit(progress, "colorizing", batch=batch_index, points_processed=offset + length,
+                              point_count=count, frames_received=received, frames_used=used)
+                if cuda_batch is not None:
+                    cuda_batch.close()
+                    cuda_batch = active_cuda_batch = None
                 # Drop the full-resolution RGB arrays before decoding the next batch.
                 del batch, observations, prepared, observation
             if used == 0:
@@ -699,11 +794,14 @@ def colorize_las(
             illumination['applied'] = illumination['corrected_observations'] > 0
             result = ColorizationResult(destination, count, colored, received, used, rejected,
                                          experimental_calibration=not calibration.validated,
-                                         xyz_cache_used=use_xyz_cache, illumination_balancing=illumination)
+                                         xyz_cache_used=use_xyz_cache, illumination_balancing=illumination,
+                                         acceleration=acceleration)
             _emit(progress, "complete", **result.to_dict())
             return result
         finally:
             # Windows cannot remove an open memory-mapped file.
+            if active_cuda_batch is not None:
+                active_cuda_batch.close()
             colors._mmap.close()
             quality._mmap.close()
             distances._mmap.close()

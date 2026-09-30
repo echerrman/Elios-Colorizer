@@ -12,6 +12,17 @@ if __name__ == '__main__':
             folder.mkdir(parents=True, exist_ok=True)
             (folder / 'selftest-error.txt').write_text(traceback.format_exc())
             raise SystemExit(1)
+    elif len(sys.argv) == 3 and sys.argv[1] == '--cuda-check':
+        from pathlib import Path
+        import traceback
+        try:
+            from elios_colorizer.cuda_backend import write_cuda_checkpoint
+            write_cuda_checkpoint(sys.argv[2])
+        except Exception:
+            folder = Path(sys.argv[2])
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / 'cuda-checkpoint-error.txt').write_text(traceback.format_exc())
+            raise SystemExit(1)
     else:
         from elios_colorizer.ui import main
         raise SystemExit(main())

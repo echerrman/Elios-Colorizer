@@ -5,6 +5,18 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-30
+
+### Added
+
+- Added bounded NVIDIA CUDA acceleration for camera projection, lens distortion,
+  depth-buffer visibility, bilinear RGB sampling, illumination correction,
+  confidence scoring, and winning-observation selection.
+- Added automatic runtime validation and CPU fallback when CUDA is unavailable,
+  unsupported by the selected calibration, or fails safely during processing.
+- Added CUDA device, backend, fallback, and accelerated-point diagnostics to
+  live processing details and JSON reports.
+
 ## [1.1.0] - 2026-09-29
 
 ### Added
@@ -71,7 +83,8 @@ project follows [Semantic Versioning](https://semver.org/).
   RGB-video ingestion.
 - Explicit `Colorized` output attribute and deterministic packaged self-test.
 
-[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/echerrman/Elios-Colorizer/compare/v0.2.1...v1.0.0
 [0.2.1]: https://github.com/echerrman/Elios-Colorizer/compare/v0.2.0...v0.2.1

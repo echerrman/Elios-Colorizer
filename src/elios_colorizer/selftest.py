@@ -108,6 +108,7 @@ def run(directory):
     import laspy
     import numpy as np
     from .service import inspect_source, run_colorization
+    from .cuda_backend import cuda_checkpoint
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     source = create_fixture(directory / 'synthetic-flight')
@@ -117,6 +118,7 @@ def run(directory):
     if not inspected['ready']:
         raise RuntimeError(f'Bundled dependency/source check failed: {inspected}')
     result = run_colorization(str(source), str(directory / 'synthetic_colorized.las'))
+    result['cuda'] = cuda_checkpoint().to_dict()
     original, colored = laspy.read(source / 'test.las'), laspy.read(result['output'])
     for name in original.point_format.dimension_names:
         np.testing.assert_array_equal(original[name], colored[name])

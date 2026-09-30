@@ -18,6 +18,8 @@ def test_merged_processing_tuning_uses_safe_larger_batches():
     modest = merged_processing_tuning(20_000_000, 10 * gib, 12)
     assert modest == {'worker_threads': 6, 'frame_batch_size': 12}
     assert processing_tuning(20_000_000, 10 * gib, 12) == modest
+    cuda = processing_tuning(47_330_435, 24 * gib, 32, cuda_acceleration=True)
+    assert cuda == {'worker_threads': 12, 'frame_batch_size': 24}
 
 
 def test_projection_progress_detail_is_compact():

@@ -40,6 +40,21 @@ Enable **Limit colorization distance** to prevent distant background geometry
 from receiving low-confidence RGB. Those points remain in the output with
 `Colorized=0`, allowing another closer flight to color them during merging.
 
+## Advanced processing settings
+
+Open **Advanced processing settings** to adjust settings for the current session:
+
+- **Frame sampling frequency** considers 0.25–30 RGB frames per second; the
+  default is 1 frame per second. The Elios 3 records at 30 fps, so the maximum
+  setting considers every available RGB frame. Higher rates significantly
+  increase runtime.
+- **Image edge exclusion** ignores a 0–15% border around every frame; the
+  default is 2%.
+- **Blur rejection** can be Off, Normal, or Strong; the default is Normal.
+
+Each setting has its own reset button, and **Reset all defaults** restores the
+standard processing behavior. The selected values are recorded in the report.
+
 ## Readiness checklist
 
 The run button becomes available only after all selected flights contain usable
@@ -55,4 +70,6 @@ want a display or derivative cloud without uncolored geometry.
 
 Keep the JSON processing report beside the LAS. It records source files,
 calibration identity, timing checks, processing configuration, warnings, and
-coverage statistics needed to reproduce or diagnose the result.
+coverage statistics needed to reproduce or diagnose the result. A compact
+`summary` section appears first with the output, coverage, runtime, frame counts,
+and user-selected processing settings.

@@ -7,7 +7,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont, QIcon
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
-    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QAbstractSpinBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QMenu, QScrollArea,
     QSizePolicy, QSystemTrayIcon, QVBoxLayout, QWidget)
 
@@ -63,6 +63,45 @@ class NoWheelComboBox(QComboBox):
         event.ignore()
 
 @dataclass(frozen=True)
+class AdvancedProcessingSettings:
+    sample_frequency_hz:float=1.0
+    image_edge_exclusion_percent:float=2.0
+    minimum_sharpness:float=2.0
+
+class AdvancedProcessingDialog(QDialog):
+    BLUR_LEVELS=(("Off",0.0),("Normal",2.0),("Strong",8.0))
+    def __init__(self,settings:AdvancedProcessingSettings,parent=None):
+        super().__init__(parent);self.setWindowTitle("Advanced Processing Settings");self.setModal(True);self.setMinimumWidth(570)
+        root=QVBoxLayout(self);root.addWidget(_label("These settings apply to this processing session. Higher sampling can substantially increase processing time.",True))
+        grid=QGridLayout();grid.setColumnStretch(1,1);root.addLayout(grid)
+        self.sample_frequency=QDoubleSpinBox();self.sample_frequency.setObjectName("sampleFrequencySpin");self.sample_frequency.setRange(.25,30.0);self.sample_frequency.setDecimals(2);self.sample_frequency.setSingleStep(.25);self.sample_frequency.setSuffix(" frames/sec");self.sample_frequency.setValue(settings.sample_frequency_hz)
+        self.edge_exclusion=QDoubleSpinBox();self.edge_exclusion.setObjectName("edgeExclusionSpin");self.edge_exclusion.setRange(0,15);self.edge_exclusion.setDecimals(1);self.edge_exclusion.setSingleStep(1);self.edge_exclusion.setSuffix(" % per edge");self.edge_exclusion.setValue(settings.image_edge_exclusion_percent)
+        self.blur_rejection=NoWheelComboBox();self.blur_rejection.setObjectName("blurRejectionCombo")
+        for label,value in self.BLUR_LEVELS:self.blur_rejection.addItem(label,value)
+        self.blur_rejection.setCurrentIndex(next((i for i,(_,value) in enumerate(self.BLUR_LEVELS) if value==settings.minimum_sharpness),1))
+        self._add_row(grid,0,"Frame sampling frequency",self._arrow_control(self.sample_frequency,"sampleFrequency"),"How often RGB frames are considered. Range: 0.25–30; default: 1 frame/sec.",lambda:self.sample_frequency.setValue(1.0))
+        self._add_row(grid,2,"Image edge exclusion",self._arrow_control(self.edge_exclusion,"edgeExclusion"),"Ignore projected pixels inside this border on all four edges. Range: 0–15%; default: 2%.",lambda:self.edge_exclusion.setValue(2.0))
+        self._add_row(grid,4,"Blur rejection",self.blur_rejection,"Strong rejects more soft frames; Off accepts every frame. Default: Normal.",lambda:self.blur_rejection.setCurrentIndex(1))
+        controls=QHBoxLayout();reset_all=QPushButton("Reset all defaults");reset_all.setObjectName("resetAllAdvancedButton");reset_all.clicked.connect(self.reset_defaults);controls.addWidget(reset_all);controls.addStretch()
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);buttons.accepted.connect(self.accept);buttons.rejected.connect(self.reject);controls.addWidget(buttons);root.addLayout(controls)
+    @staticmethod
+    def _add_row(grid,row,title,control,description,reset):
+        label=_label(title);label.setStyleSheet("font-weight:600");grid.addWidget(label,row,0);grid.addWidget(control,row,1);button=QPushButton("Reset");button.clicked.connect(reset);grid.addWidget(button,row,2);grid.addWidget(_label(description,True),row+1,0,1,3)
+    @staticmethod
+    def _arrow_control(spin,prefix):
+        container=QWidget();layout=QHBoxLayout(container);layout.setContentsMargins(0,0,0,0);layout.setSpacing(6)
+        spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        decrease=QPushButton("◀");decrease.setObjectName(f"{prefix}DecreaseButton");decrease.setToolTip("Decrease value");decrease.setAccessibleName("Decrease value")
+        increase=QPushButton("▶");increase.setObjectName(f"{prefix}IncreaseButton");increase.setToolTip("Increase value");increase.setAccessibleName("Increase value")
+        for button in (decrease,increase):button.setMinimumWidth(44);button.setAutoRepeat(True);button.setAutoRepeatDelay(400);button.setAutoRepeatInterval(75)
+        decrease.clicked.connect(spin.stepDown);increase.clicked.connect(spin.stepUp)
+        layout.addWidget(decrease);layout.addWidget(spin,1);layout.addWidget(increase);return container
+    def reset_defaults(self):
+        self.sample_frequency.setValue(1.0);self.edge_exclusion.setValue(2.0);self.blur_rejection.setCurrentIndex(1)
+    def values(self):
+        return AdvancedProcessingSettings(self.sample_frequency.value(),self.edge_exclusion.value(),float(self.blur_rejection.currentData()))
+
+@dataclass(frozen=True)
 class FlightSelection:
     folder:str; las_override:str|None=None; name:str=""; transform_path:str|None=None; transform_values:str|None=None
     def to_dict(self): return {"folder":self.folder,"las_override":self.las_override,"name":self.name,"transform_path":self.transform_path,"transform_values":self.transform_values}
@@ -72,6 +111,7 @@ class WorkflowSelection:
     mode:str="separate"; maximum_color_distance_m:float|None=None
     alignment_method:str="manual"; merged_source:str|None=None; cloudcompare_executable:str|None=None
     illumination_balancing:bool=False
+    advanced:AdvancedProcessingSettings=AdvancedProcessingSettings()
 @dataclass(frozen=True)
 class SourceSelection: # Public compatibility with 0.2.x.
     folder:str; las_override:str|None=None; calibration_override:str|None=None
@@ -91,11 +131,18 @@ class ServiceWorker(QObject):
                 kw=dict(folder=flights[0]["folder"],las_override=flights[0]["las_override"],output=self.output,calibration_override=self.selection.calibration_override,progress=self.progress.emit,cancelled=self.cancellation.is_set)
                 if self.selection.maximum_color_distance_m is not None: kw["maximum_color_distance_m"]=self.selection.maximum_color_distance_m
                 if self.selection.illumination_balancing: kw["illumination_balancing"]=True
+                kw.update(sample_interval_s=1/self.selection.advanced.sample_frequency_hz,
+                          image_border_fraction=self.selection.advanced.image_edge_exclusion_percent/100,
+                          minimum_sharpness=self.selection.advanced.minimum_sharpness)
                 result=self.backend.run_colorization(**kw)
             else:
                 result=self.backend.run_workflow(flights,self.output,calibration_override=self.selection.calibration_override,mode=self.selection.mode,
                     alignment_method=self.selection.alignment_method,merged_source=self.selection.merged_source,cloudcompare_executable=self.selection.cloudcompare_executable,
-                    illumination_balancing=self.selection.illumination_balancing,maximum_color_distance_m=self.selection.maximum_color_distance_m,progress=self.progress.emit,cancelled=self.cancellation.is_set)
+                    illumination_balancing=self.selection.illumination_balancing,maximum_color_distance_m=self.selection.maximum_color_distance_m,
+                    sample_interval_s=1/self.selection.advanced.sample_frequency_hz,
+                    image_border_fraction=self.selection.advanced.image_edge_exclusion_percent/100,
+                    minimum_sharpness=self.selection.advanced.minimum_sharpness,
+                    progress=self.progress.emit,cancelled=self.cancellation.is_set)
             self.result.emit(result)
         except Exception as exc:self.error.emit(str(exc) or type(exc).__name__,traceback.format_exc())
         finally:self.finished.emit()
@@ -195,6 +242,7 @@ class MainWindow(QMainWindow):
         self._thread=self._worker=None; self._job_kind=""; self._job_selection=None; self._job_revision=self._revision=0
         self._inspection_pending=False; self._inspected_selection=None; self._ready=False; self._cancellation=threading.Event(); self._close_when_idle=False
         self._last_result=None; self._last_inspection_result=None; self._last_progress_message=""; self._run_started_at=None; self._progress_fraction=0.0; self._eta_seconds=None; self._eta_as_of=None; self._eta_samples=[]; self._eta_rate=None; self._dark_mode=False
+        self.advanced_settings=AdvancedProcessingSettings()
         self._elapsed_timer=QTimer(self); self._elapsed_timer.setInterval(1000); self._elapsed_timer.timeout.connect(self._update_elapsed)
         self.setWindowTitle("Elios Colorizer"); self.resize(1080,920); self.setMinimumSize(820,680); self._build()
         self._debounce=QTimer(self); self._debounce.setSingleShot(True); self._debounce.setInterval(350); self._debounce.timeout.connect(self._start_pending_inspection)
@@ -215,7 +263,7 @@ class MainWindow(QMainWindow):
         self.calibration_edit,self.calibration_button=self._file_row(box,"Camera profile","Choose shared RGB calibration…",self._browse_calibration); root.addWidget(card); self._add_flight(trigger=False)
         card,box=_card("2  Check all flight data"); self.checklist=Checklist(); box.addWidget(self.checklist); self.summary=_label("Choose flight folders.",True); box.addWidget(self.summary)
         row=QHBoxLayout(); self.refresh_button=QPushButton("↻  Refresh checks"); self.refresh_button.clicked.connect(self._inputs_changed); row.addWidget(self.refresh_button); row.addStretch(); self.tools_summary=_label("Local libraries are checked automatically.",True); row.addWidget(self.tools_summary); box.addLayout(row); self.dependencies=Checklist(); self.dependencies.hide(); box.addWidget(self.dependencies); root.addWidget(card)
-        card,box=_card("3  Choose processing and output"); card.setObjectName("processingCard"); row=QHBoxLayout(); self.mode_label=_label("Result"); row.addWidget(self.mode_label); self.mode_combo=NoWheelComboBox(); self.mode_combo.addItem("Separate colorized LAS files","separate"); self.mode_combo.addItem("Align and merge into one cloud","merge"); row.addWidget(self.mode_combo,1); box.addLayout(row)
+        card,box=_card("3  Choose processing and output"); card.setObjectName("processingCard");section_title=box.itemAt(0).widget();box.removeWidget(section_title);section_header=QHBoxLayout();section_header.addWidget(section_title);section_header.addStretch();self.advanced_button=QPushButton("Advanced processing settings…");self.advanced_button.setObjectName("accentButton");self.advanced_button.clicked.connect(self._show_advanced_settings);section_header.addWidget(self.advanced_button);box.insertLayout(0,section_header);self._update_advanced_summary(); row=QHBoxLayout(); self.mode_label=_label("Result"); row.addWidget(self.mode_label); self.mode_combo=NoWheelComboBox(); self.mode_combo.addItem("Separate colorized LAS files","separate"); self.mode_combo.addItem("Align and merge into one cloud","merge"); row.addWidget(self.mode_combo,1); box.addLayout(row)
         self.mode_help=_label("",True); box.addWidget(self.mode_help)
         self.alignment_panel=QFrame(objectName="alignmentPanel"); align_box=QVBoxLayout(self.alignment_panel); align_box.setContentsMargins(12,10,12,10); align_box.setSpacing(8)
         row=QHBoxLayout(); row.addWidget(_label("Alignment")); self.alignment_combo=NoWheelComboBox(); self.alignment_combo.addItem("Use a CloudCompare-aligned merged cloud (Recommended)","manual"); self.alignment_combo.addItem("Align automatically with CloudCompare","automatic"); row.addWidget(self.alignment_combo,1); align_box.addLayout(row)
@@ -259,9 +307,24 @@ class MainWindow(QMainWindow):
             duplicate=row in duplicates;row.name_edit.setProperty("duplicateName",duplicate);row.name_edit.style().unpolish(row.name_edit);row.name_edit.style().polish(row.name_edit)
             row.name_edit.setToolTip("Flight names must be unique." if duplicate else "Click to rename this flight (48 characters maximum).")
         return duplicates
-    def _selection(self):return WorkflowSelection(tuple(x.selection() for x in self.flight_rows),self.calibration_edit.text().strip() or None,str(self.mode_combo.currentData()),self.distance_spin.value() if self.distance_check.isChecked() else None,str(self.alignment_combo.currentData()),self.merged_edit.text().strip() or None,self.cloudcompare_edit.text().strip() or None,self.color_balance_check.isChecked())
+    def _selection(self):
+        return WorkflowSelection(flights=tuple(x.selection() for x in self.flight_rows),
+            calibration_override=self.calibration_edit.text().strip() or None,
+            mode=str(self.mode_combo.currentData()),
+            maximum_color_distance_m=self.distance_spin.value() if self.distance_check.isChecked() else None,
+            alignment_method=str(self.alignment_combo.currentData()),merged_source=self.merged_edit.text().strip() or None,
+            cloudcompare_executable=self.cloudcompare_edit.text().strip() or None,
+            illumination_balancing=self.color_balance_check.isChecked(),advanced=self.advanced_settings)
     def _inspection_selection(self):
-        return replace(self._selection(), illumination_balancing=False)
+        return replace(self._selection(),illumination_balancing=False,advanced=AdvancedProcessingSettings())
+    def _show_advanced_settings(self):
+        dialog=AdvancedProcessingDialog(self.advanced_settings,self)
+        if dialog.exec()==QDialog.DialogCode.Accepted:
+            self.advanced_settings=dialog.values();self._update_advanced_summary()
+    def _update_advanced_summary(self):
+        if not hasattr(self,"advanced_button"):return
+        blur=next((label for label,value in AdvancedProcessingDialog.BLUR_LEVELS if value==self.advanced_settings.minimum_sharpness),"Custom")
+        self.advanced_button.setToolTip(f"Current: {self.advanced_settings.sample_frequency_hz:g} fps · {self.advanced_settings.image_edge_exclusion_percent:g}% edges · {blur} blur rejection")
     def _restore_settings(self):
         calibration=str(self.settings.value("calibration","") or "")
         saved_theme=self.settings.value("dark_mode",False)
@@ -424,7 +487,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self,"run_button"):return
         running=self._job_kind=="run";idle=self._thread is None;names_valid=not self._duplicate_name_rows()
         for row in self.flight_rows:row.set_enabled(not running)
-        for x in (self.add_flight_button,self.calibration_edit,self.calibration_button,self.mode_combo,self.alignment_combo,self.alignment_guide_button,self.merged_edit,self.merged_button,self.cloudcompare_edit,self.cloudcompare_button,self.distance_check,self.color_balance_check,self.output_edit,self.output_button,self.refresh_button):x.setEnabled(not running)
+        for x in (self.add_flight_button,self.calibration_edit,self.calibration_button,self.mode_combo,self.alignment_combo,self.alignment_guide_button,self.merged_edit,self.merged_button,self.cloudcompare_edit,self.cloudcompare_button,self.distance_check,self.color_balance_check,self.advanced_button,self.output_edit,self.output_button,self.refresh_button):x.setEnabled(not running)
         self.distance_spin.setEnabled(not running and self.distance_check.isChecked());self.cancel_button.setVisible(running);self.cancel_button.setEnabled(running and not self._cancellation.is_set());merge_valid=self.mode_combo.currentData()!="merge" or len(self.flight_rows)>1;can=idle and names_valid and self._ready and self._inspected_selection==self._inspection_selection() and self._output_valid() and merge_valid and not self._inspection_pending;self.run_button.setEnabled(can)
     def _start_colorization(self):
         if not self.run_button.isEnabled():return

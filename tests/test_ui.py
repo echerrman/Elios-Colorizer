@@ -60,8 +60,9 @@ class FakeBackend:
             "summary": folder,
         }
 
-    def run_colorization(self, folder, output, las_override=None, calibration_override=None, *, progress, cancelled, illumination_balancing=False):
+    def run_colorization(self, folder, output, las_override=None, calibration_override=None, *, progress, cancelled, illumination_balancing=False, **kwargs):
         self.illumination_balancing = illumination_balancing
+        self.processing_settings = kwargs
         self.last_run = (folder, output, las_override, calibration_override)
         self.run_started.set()
         progress("Projecting", 0.5, "Projecting visible points")
@@ -154,6 +155,25 @@ def test_action_buttons_and_color_balance_placeholder(ui):
     assert not window._inspection_selection().illumination_balancing
 
 
+def test_advanced_processing_defaults_resets_and_selection(ui):
+    window = ui(FakeBackend())
+    dialog = ui_module.AdvancedProcessingDialog(ui_module.AdvancedProcessingSettings(4, 12, 8), window)
+    assert dialog.sample_frequency.minimum() == .25 and dialog.sample_frequency.maximum() == 30
+    dialog.findChild(QPushButton, 'sampleFrequencyIncreaseButton').click()
+    assert dialog.sample_frequency.value() == 4.25
+    dialog.findChild(QPushButton, 'edgeExclusionDecreaseButton').click()
+    assert dialog.edge_exclusion.value() == 11
+    dialog.sample_frequency.setValue(4);dialog.edge_exclusion.setValue(12)
+    assert dialog.values() == ui_module.AdvancedProcessingSettings(4, 12, 8)
+    dialog.reset_defaults()
+    assert dialog.values() == ui_module.AdvancedProcessingSettings()
+    window.advanced_settings = ui_module.AdvancedProcessingSettings(2, 5, 0)
+    selection = window._selection()
+    assert selection.advanced.sample_frequency_hz == 2
+    assert selection.advanced.image_edge_exclusion_percent == 5
+    assert window._inspection_selection().advanced == ui_module.AdvancedProcessingSettings()
+
+
 def test_old_inspection_cannot_enable_new_source(ui, tmp_path):
     backend = FakeBackend()
     backend.block_first = True
@@ -180,11 +200,14 @@ def test_processing_receives_inputs_and_reports_coverage(ui, tmp_path):
     output = tmp_path / "result.las"
     prepare(window, output)
     window.color_balance_check.setChecked(True)
+    window.advanced_settings = ui_module.AdvancedProcessingSettings(2, 5, 8)
     window._start_colorization()
     assert not window.source_edit.isEnabled()
     assert not window.run_button.isEnabled()
     wait_until(lambda: window._thread is None)
     assert backend.illumination_balancing
+    assert backend.processing_settings == {
+        'sample_interval_s': .5, 'image_border_fraction': .05, 'minimum_sharpness': 8}
     assert backend.last_run == ("flight", str(output), "source.las", "camera.json")
     assert window.progress_bar.value() == 1000
     assert window.progress_badge.text() == "100%"

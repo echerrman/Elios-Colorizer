@@ -44,6 +44,12 @@ def test_complete_service_and_source_immutability(tmp_path, monkeypatch, balanci
     assert list(colored.Colorized) == [1, 1, 1, 0]
     import json
     report = json.loads(Path(result['report']).read_text())
+    summary = report['summary']
+    assert next(iter(report)) == 'summary'
+    assert summary['mode'] == 'single_flight'
+    assert summary['coverage']['colored_points'] == 3
+    assert summary['frames']['sampling_frequency_hz'] == 1
+    assert summary['user_settings']['image_edge_exclusion_percent'] == 2
     configuration = report['processing_configuration']
     assert configuration['frame_batch_size'] == processing_tuning(4)['frame_batch_size']
     assert configuration['adaptive_view_selection']['candidate_views'] >= 1
@@ -63,6 +69,22 @@ def test_missing_calibration_and_invalid_time_window(tmp_path):
     assert any('calibration' in row['label'].lower() and row['status'] == 'missing' for row in report['checklist'])
     with pytest.raises(ValueError, match='End time'):
         run_colorization(str(source), str(tmp_path / 'result.las'), start_s=5, end_s=2)
+
+
+def test_advanced_processing_settings_are_applied_and_reported(tmp_path, monkeypatch):
+    import json
+    source = create_fixture(tmp_path / 'advanced-source')
+    monkeypatch.setenv('ELIOS_COLORIZER_CACHE', str(tmp_path / 'advanced-cache'))
+    result = run_colorization(str(source), str(tmp_path / 'advanced.las'),
+                              sample_interval_s=.5, image_border_fraction=.05,
+                              minimum_sharpness=0)
+    report = json.loads(Path(result['report']).read_text())
+    assert report['summary']['frames']['sampling_frequency_hz'] == 2
+    assert report['summary']['user_settings']['image_edge_exclusion_percent'] == 5
+    assert report['summary']['user_settings']['blur_rejection'] == 'Off'
+    assert report['processing_configuration']['minimum_sharpness'] == 0
+    with pytest.raises(ValueError, match='between 0.25 and 30'):
+        run_colorization(str(source), str(tmp_path / 'too-fast.las'), sample_interval_s=.01)
 
 
 def test_header_timestamp_not_arrival_and_wrong_clock_offset_rejected(tmp_path):
@@ -117,6 +139,9 @@ def test_complete_two_flight_merged_workflow(tmp_path, monkeypatch, balancing, m
         'Colorized', 'SourceFlight'}
     assert not {'ColorConfidence', 'ColorDistance'} & set(merged.point_format.extra_dimension_names)
     report = json.loads(Path(result['report']).read_text())
+    assert next(iter(report)) == 'summary'
+    assert report['summary']['mode'] == 'merged'
+    assert report['summary']['flight_count'] == 2
     assert report['result']['illumination_balancing']['requested'] == balancing
     assert len(report['flights']) == 2
     assert set(merged.SourceFlight) >= {0, 1}
@@ -169,6 +194,10 @@ def test_separate_outputs_use_flight_numbers_and_names(tmp_path, monkeypatch, ba
         'Flight 01 - Upper Wall - Colorized.las',
         'Flight 02 - Bottom Cap - Colorized.las',
     ]
+    report = json.loads(Path(result['report']).read_text())
+    assert next(iter(report)) == 'summary'
+    assert report['summary']['mode'] == 'separate_outputs'
+    assert report['summary']['flight_count'] == 2
 
 
 @pytest.mark.parametrize('balancing', [False, True])

@@ -5,6 +5,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-05
+
+### Added
+
+- Added desktop **Advanced Processing Settings** for RGB frame sampling from
+  0.25 to 30 frames per second, image-edge exclusion, and blur rejection.
+- Added clear step controls, per-setting reset buttons, and a global reset for
+  advanced processing values.
+- Added a concise user-focused summary at the top of every processing report.
+
 ## [1.2.0] - 2026-09-30
 
 ### Added
@@ -83,7 +93,8 @@ project follows [Semantic Versioning](https://semver.org/).
   RGB-video ingestion.
 - Explicit `Colorized` output attribute and deterministic packaged self-test.
 
-[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.2.0...v1.4.0
 [1.2.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/echerrman/Elios-Colorizer/compare/v0.2.1...v1.0.0

@@ -18,7 +18,7 @@ Run the release script from a PowerShell prompt:
 
 ```powershell
 ./scripts/setup.ps1
-./scripts/release.ps1 -Version 1.4.0
+./scripts/release.ps1 -Version 1.3.0
 ```
 
 The script verifies version consistency and a clean Git tree, runs the complete

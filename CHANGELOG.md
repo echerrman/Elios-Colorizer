@@ -5,7 +5,7 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.4.0] - 2026-10-05
+## [1.3.0] - 2026-10-05
 
 ### Added
 
@@ -93,8 +93,8 @@ project follows [Semantic Versioning](https://semver.org/).
   RGB-video ingestion.
 - Explicit `Colorized` output attribute and deterministic packaged self-test.
 
-[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.4.0...HEAD
-[1.4.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.2.0...v1.4.0
+[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/echerrman/Elios-Colorizer/compare/v0.2.1...v1.0.0

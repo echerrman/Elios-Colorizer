@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "elios-colorizer"
-version = "1.4.0"
+version = "1.3.0"
 description = "Local RGB projection onto Elios Inspector LAS point clouds"
 readme = "README.md"
 license = "MIT"

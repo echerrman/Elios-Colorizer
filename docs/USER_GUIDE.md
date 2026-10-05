@@ -51,9 +51,15 @@ Open **Advanced processing settings** to adjust settings for the current session
 - **Image edge exclusion** ignores a 0–15% border around every frame; the
   default is 2%.
 - **Blur rejection** can be Off, Normal, or Strong; the default is Normal.
+- **Process only a time range** limits RGB observations to start/end times
+  elapsed from each flight's first synchronized video frame. Leave **Through
+  end of video** selected to adapt automatically to each flight's duration.
 
 Each setting has its own reset button, and **Reset all defaults** restores the
-standard processing behavior. The selected values are recorded in the report.
+standard processing behavior. Use **Save current…** to store a named preset;
+selecting it later restores every advanced setting, including its time-range
+choice. Saved presets remain available in future desktop sessions. The selected
+values are recorded in the report.
 
 ## Readiness checklist
 

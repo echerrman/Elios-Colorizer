@@ -87,6 +87,19 @@ def test_advanced_processing_settings_are_applied_and_reported(tmp_path, monkeyp
         run_colorization(str(source), str(tmp_path / 'too-fast.las'), sample_interval_s=.01)
 
 
+def test_time_range_is_applied_and_reported(tmp_path, monkeypatch):
+    import json
+    source = create_fixture(tmp_path / 'range-source')
+    monkeypatch.setenv('ELIOS_COLORIZER_CACHE', str(tmp_path / 'range-cache'))
+    result = run_colorization(str(source), str(tmp_path / 'range.las'),
+                              sample_interval_s=.25, start_s=.5, end_s=1.5)
+    report = json.loads(Path(result['report']).read_text())
+    requested = report['summary']['user_settings']['time_range_relative_seconds']
+    assert requested == {'enabled': True, 'start': .5, 'end': 1.5}
+    assert report['processing_configuration']['time_range_applied_seconds'] == {
+        'start': .5, 'end': 1.5}
+
+
 def test_header_timestamp_not_arrival_and_wrong_clock_offset_rejected(tmp_path):
     import json
     from elios_colorizer.flight import discover_source, load_telemetry, FlightError
@@ -130,7 +143,8 @@ def test_complete_two_flight_merged_workflow(tmp_path, monkeypatch, balancing, m
                            {'folder': str(second), 'name': 'Lower Ring'}],
                           str(tmp_path / 'merged.las'), mode='merge',
                           alignment_method=method, merged_source=str(source_merged),
-                          progress=lambda *args: updates.append(args), illumination_balancing=balancing)
+                          progress=lambda *args: updates.append(args), illumination_balancing=balancing,
+                          start_s=0, end_s=1.5)
     merged = laspy.read(result['output'])
     assert result['colored_points'] == 6
     assert result['total_points'] == 8
@@ -143,6 +157,9 @@ def test_complete_two_flight_merged_workflow(tmp_path, monkeypatch, balancing, m
     assert report['summary']['mode'] == 'merged'
     assert report['summary']['flight_count'] == 2
     assert report['result']['illumination_balancing']['requested'] == balancing
+    assert report['summary']['user_settings']['time_range_relative_seconds'] == {
+        'enabled': True, 'start': 0.0, 'end': 1.5}
+    assert all(row['time_range_applied_seconds']['end'] == 1.5 for row in report['flights'])
     assert len(report['flights']) == 2
     assert set(merged.SourceFlight) >= {0, 1}
     assert any(stage == 'Upper Ring: Reading telemetry' for stage, _, _ in updates)
@@ -189,7 +206,7 @@ def test_separate_outputs_use_flight_numbers_and_names(tmp_path, monkeypatch, ba
     result = run_workflow([
         {'folder': str(first), 'name': 'Upper Wall'},
         {'folder': str(second), 'name': 'Bottom Cap'},
-    ], str(output), mode='separate', illumination_balancing=balancing)
+    ], str(output), mode='separate', illumination_balancing=balancing, start_s=0, end_s=1.5)
     assert [Path(path).name for path in result['outputs']] == [
         'Flight 01 - Upper Wall - Colorized.las',
         'Flight 02 - Bottom Cap - Colorized.las',
@@ -198,6 +215,8 @@ def test_separate_outputs_use_flight_numbers_and_names(tmp_path, monkeypatch, ba
     assert next(iter(report)) == 'summary'
     assert report['summary']['mode'] == 'separate_outputs'
     assert report['summary']['flight_count'] == 2
+    assert report['summary']['user_settings']['time_range_relative_seconds'] == {
+        'enabled': True, 'start': 0.0, 'end': 1.5}
 
 
 @pytest.mark.parametrize('balancing', [False, True])

@@ -1,14 +1,14 @@
 """Desktop interface for single- and multi-flight colorization."""
 from __future__ import annotations
-import re, shutil, sys, threading, time, traceback
+import json, math, re, shutil, sys, threading, time, traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
-from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, QThread, QTime, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont, QIcon
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QAbstractSpinBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QMenu, QScrollArea,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QInputDialog, QMenu, QScrollArea, QTimeEdit,
     QSizePolicy, QSystemTrayIcon, QVBoxLayout, QWidget)
 
 _LIGHT_STYLE = """
@@ -67,12 +67,40 @@ class AdvancedProcessingSettings:
     sample_frequency_hz:float=1.0
     image_edge_exclusion_percent:float=2.0
     minimum_sharpness:float=2.0
+    time_range_enabled:bool=False
+    start_time_s:float=0.0
+    end_time_s:float|None=None
+
+    def to_dict(self):
+        return {"sample_frequency_hz":self.sample_frequency_hz,
+                "image_edge_exclusion_percent":self.image_edge_exclusion_percent,
+                "minimum_sharpness":self.minimum_sharpness,
+                "time_range_enabled":self.time_range_enabled,
+                "start_time_s":self.start_time_s,"end_time_s":self.end_time_s}
+
+    @classmethod
+    def from_dict(cls,value):
+        if not isinstance(value,dict):raise ValueError("Preset must be an object.")
+        result=cls(float(value.get("sample_frequency_hz",1)),float(value.get("image_edge_exclusion_percent",2)),
+                   float(value.get("minimum_sharpness",2)),bool(value.get("time_range_enabled",False)),
+                   float(value.get("start_time_s",0)),
+                   None if value.get("end_time_s") is None else float(value["end_time_s"]))
+        if not .25<=result.sample_frequency_hz<=30:raise ValueError("Preset sampling frequency is outside the supported range.")
+        if not 0<=result.image_edge_exclusion_percent<=15:raise ValueError("Preset edge exclusion is outside the supported range.")
+        if result.minimum_sharpness not in (0.,2.,8.):raise ValueError("Preset blur rejection is unsupported.")
+        if not math.isfinite(result.start_time_s) or result.start_time_s<0:raise ValueError("Preset start time is invalid.")
+        if result.end_time_s is not None and (not math.isfinite(result.end_time_s) or result.end_time_s<=result.start_time_s):raise ValueError("Preset end time must follow its start time.")
+        return result
 
 class AdvancedProcessingDialog(QDialog):
     BLUR_LEVELS=(("Off",0.0),("Normal",2.0),("Strong",8.0))
-    def __init__(self,settings:AdvancedProcessingSettings,parent=None):
-        super().__init__(parent);self.setWindowTitle("Advanced Processing Settings");self.setModal(True);self.setMinimumWidth(570)
+    def __init__(self,settings:AdvancedProcessingSettings,parent=None,*,presets=None,available_duration_s=None):
+        super().__init__(parent);self.setWindowTitle("Advanced Processing Settings");self.setModal(True);self.setMinimumWidth(720)
+        self._presets=dict(presets or {});self._applying_preset=False;self.available_duration_s=available_duration_s
         root=QVBoxLayout(self);root.addWidget(_label("These settings apply to this processing session. Higher sampling can substantially increase processing time.",True))
+        preset_row=QHBoxLayout();preset_row.addWidget(_label("Saved preset"));self.preset_combo=NoWheelComboBox();self.preset_combo.setObjectName("processingPresetCombo");preset_row.addWidget(self.preset_combo,1)
+        self.save_preset_button=QPushButton("Save current…");self.save_preset_button.clicked.connect(self._prompt_save_preset);preset_row.addWidget(self.save_preset_button)
+        self.delete_preset_button=QPushButton("Delete");self.delete_preset_button.clicked.connect(self._confirm_delete_preset);preset_row.addWidget(self.delete_preset_button);root.addLayout(preset_row)
         grid=QGridLayout();grid.setColumnStretch(1,1);root.addLayout(grid)
         self.sample_frequency=QDoubleSpinBox();self.sample_frequency.setObjectName("sampleFrequencySpin");self.sample_frequency.setRange(.25,30.0);self.sample_frequency.setDecimals(2);self.sample_frequency.setSingleStep(.25);self.sample_frequency.setSuffix(" frames/sec");self.sample_frequency.setValue(settings.sample_frequency_hz)
         self.edge_exclusion=QDoubleSpinBox();self.edge_exclusion.setObjectName("edgeExclusionSpin");self.edge_exclusion.setRange(0,15);self.edge_exclusion.setDecimals(1);self.edge_exclusion.setSingleStep(1);self.edge_exclusion.setSuffix(" % per edge");self.edge_exclusion.setValue(settings.image_edge_exclusion_percent)
@@ -82,8 +110,18 @@ class AdvancedProcessingDialog(QDialog):
         self._add_row(grid,0,"Frame sampling frequency",self._arrow_control(self.sample_frequency,"sampleFrequency"),"How often RGB frames are considered. Range: 0.25–30; default: 1 frame/sec.",lambda:self.sample_frequency.setValue(1.0))
         self._add_row(grid,2,"Image edge exclusion",self._arrow_control(self.edge_exclusion,"edgeExclusion"),"Ignore projected pixels inside this border on all four edges. Range: 0–15%; default: 2%.",lambda:self.edge_exclusion.setValue(2.0))
         self._add_row(grid,4,"Blur rejection",self.blur_rejection,"Strong rejects more soft frames; Off accepts every frame. Default: Normal.",lambda:self.blur_rejection.setCurrentIndex(1))
+        self.time_range_check=QCheckBox("Process only a time range");self.time_range_check.setObjectName("timeRangeCheck");grid.addWidget(self.time_range_check,6,0,1,3)
+        time_controls=QWidget();time_layout=QHBoxLayout(time_controls);time_layout.setContentsMargins(0,0,0,0);time_layout.addWidget(_label("Start"));self.start_time=QTimeEdit();self.start_time.setObjectName("startTimeEdit");self.start_time.setDisplayFormat("HH:mm:ss");time_layout.addWidget(self.start_time);time_layout.addSpacing(12);time_layout.addWidget(_label("End"));self.end_time=QTimeEdit();self.end_time.setObjectName("endTimeEdit");self.end_time.setDisplayFormat("HH:mm:ss");time_layout.addWidget(self.end_time);self.through_end_check=QCheckBox("Through end of video");self.through_end_check.setObjectName("throughVideoEndCheck");time_layout.addWidget(self.through_end_check);time_layout.addStretch();grid.addWidget(time_controls,7,0,1,3)
+        duration_note=(f" Detected duration: approximately {self._format_seconds(available_duration_s)}." if available_duration_s else "")
+        grid.addWidget(_label("Times are elapsed from each flight's first synchronized RGB frame."+duration_note,True),8,0,1,3)
+        self.time_range_check.toggled.connect(self._update_time_controls);self.through_end_check.toggled.connect(self._update_time_controls)
+        self.preset_combo.currentIndexChanged.connect(self._preset_selected)
+        for signal in (self.sample_frequency.valueChanged,self.edge_exclusion.valueChanged,
+                       self.blur_rejection.currentIndexChanged,self.time_range_check.toggled,
+                       self.start_time.timeChanged,self.end_time.timeChanged,self.through_end_check.toggled):signal.connect(self._mark_custom)
         controls=QHBoxLayout();reset_all=QPushButton("Reset all defaults");reset_all.setObjectName("resetAllAdvancedButton");reset_all.clicked.connect(self.reset_defaults);controls.addWidget(reset_all);controls.addStretch()
         buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);buttons.accepted.connect(self.accept);buttons.rejected.connect(self.reject);controls.addWidget(buttons);root.addLayout(controls)
+        self._set_values(settings);self._rebuild_preset_combo();self._update_time_controls()
     @staticmethod
     def _add_row(grid,row,title,control,description,reset):
         label=_label(title);label.setStyleSheet("font-weight:600");grid.addWidget(label,row,0);grid.addWidget(control,row,1);button=QPushButton("Reset");button.clicked.connect(reset);grid.addWidget(button,row,2);grid.addWidget(_label(description,True),row+1,0,1,3)
@@ -97,9 +135,69 @@ class AdvancedProcessingDialog(QDialog):
         decrease.clicked.connect(spin.stepDown);increase.clicked.connect(spin.stepUp)
         layout.addWidget(decrease);layout.addWidget(spin,1);layout.addWidget(increase);return container
     def reset_defaults(self):
-        self.sample_frequency.setValue(1.0);self.edge_exclusion.setValue(2.0);self.blur_rejection.setCurrentIndex(1)
+        self._set_values(AdvancedProcessingSettings());self.preset_combo.setCurrentIndex(0)
     def values(self):
-        return AdvancedProcessingSettings(self.sample_frequency.value(),self.edge_exclusion.value(),float(self.blur_rejection.currentData()))
+        return AdvancedProcessingSettings(self.sample_frequency.value(),self.edge_exclusion.value(),float(self.blur_rejection.currentData()),
+                                          self.time_range_check.isChecked(),float(self.start_time.time().msecsSinceStartOfDay()/1000),
+                                          None if self.through_end_check.isChecked() else float(self.end_time.time().msecsSinceStartOfDay()/1000))
+    def presets(self):return dict(self._presets)
+    @staticmethod
+    def _format_seconds(value):
+        total=max(0,int(round(value or 0)));hours,remainder=divmod(total,3600);minutes,seconds=divmod(remainder,60);return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    @staticmethod
+    def _time(value):
+        total=max(0,min(86399,int(round(value or 0))));hours,remainder=divmod(total,3600);minutes,seconds=divmod(remainder,60);return QTime(hours,minutes,seconds)
+    def _set_values(self,settings):
+        self._applying_preset=True
+        self.sample_frequency.setValue(settings.sample_frequency_hz);self.edge_exclusion.setValue(settings.image_edge_exclusion_percent)
+        self.blur_rejection.setCurrentIndex(next((i for i,(_,value) in enumerate(self.BLUR_LEVELS) if value==settings.minimum_sharpness),1))
+        self.time_range_check.setChecked(settings.time_range_enabled);self.start_time.setTime(self._time(settings.start_time_s))
+        end=settings.end_time_s if settings.end_time_s is not None else self.available_duration_s
+        self.end_time.setTime(self._time(end));self.through_end_check.setChecked(settings.end_time_s is None)
+        self._applying_preset=False;self._update_time_controls()
+    def _update_time_controls(self):
+        enabled=self.time_range_check.isChecked();self.start_time.setEnabled(enabled);self.through_end_check.setEnabled(enabled);self.end_time.setEnabled(enabled and not self.through_end_check.isChecked())
+    def _rebuild_preset_combo(self,selected=None):
+        self._applying_preset=True;self.preset_combo.clear();self.preset_combo.addItem("Custom settings",None);self.preset_combo.addItem("Default settings","__default__")
+        for name in sorted(self._presets,key=str.casefold):self.preset_combo.addItem(name,name)
+        if selected:
+            index=self.preset_combo.findData(selected);self.preset_combo.setCurrentIndex(max(0,index))
+        self._applying_preset=False;self._update_delete_button()
+    def _preset_selected(self):
+        if self._applying_preset:return
+        name=self.preset_combo.currentData()
+        if name=="__default__":self._set_values(AdvancedProcessingSettings())
+        elif name in self._presets:self._set_values(self._presets[name])
+        self._update_delete_button()
+    def _update_delete_button(self):self.delete_preset_button.setEnabled(self.preset_combo.currentData() in self._presets)
+    def _mark_custom(self,*_):
+        if self._applying_preset or self.preset_combo.currentIndex()==0:return
+        self._applying_preset=True;self.preset_combo.setCurrentIndex(0);self._applying_preset=False;self._update_delete_button()
+    def save_preset(self,name):
+        name=" ".join(str(name).split())
+        if not name or len(name)>48:raise ValueError("Preset names must contain 1–48 characters.")
+        if name.casefold() in ("default settings","custom settings"):raise ValueError("Choose a different preset name.")
+        existing=next((item for item in self._presets if item.casefold()==name.casefold()),None)
+        if existing and existing!=name:del self._presets[existing]
+        self._presets[name]=self.values();self._rebuild_preset_combo(name);return name
+    def delete_preset(self,name):
+        if name not in self._presets:return False
+        del self._presets[name];self._rebuild_preset_combo();return True
+    def _prompt_save_preset(self):
+        name,ok=QInputDialog.getText(self,"Save processing preset","Preset name:")
+        if not ok:return
+        existing=next((item for item in self._presets if item.casefold()==" ".join(name.split()).casefold()),None)
+        if existing and QMessageBox.question(self,"Replace preset",f'Replace the saved preset "{existing}"?')!=QMessageBox.StandardButton.Yes:return
+        try:self.save_preset(name)
+        except ValueError as exc:QMessageBox.warning(self,"Cannot save preset",str(exc))
+    def _confirm_delete_preset(self):
+        name=self.preset_combo.currentData()
+        if name in self._presets and QMessageBox.question(self,"Delete preset",f'Delete the saved preset "{name}"?')==QMessageBox.StandardButton.Yes:self.delete_preset(name)
+    def accept(self):
+        values=self.values()
+        if values.time_range_enabled and values.end_time_s is not None and values.end_time_s<=values.start_time_s:
+            QMessageBox.warning(self,"Invalid time range","End time must be later than start time.");return
+        super().accept()
 
 @dataclass(frozen=True)
 class FlightSelection:
@@ -134,6 +232,8 @@ class ServiceWorker(QObject):
                 kw.update(sample_interval_s=1/self.selection.advanced.sample_frequency_hz,
                           image_border_fraction=self.selection.advanced.image_edge_exclusion_percent/100,
                           minimum_sharpness=self.selection.advanced.minimum_sharpness)
+                if self.selection.advanced.time_range_enabled:
+                    kw.update(start_s=self.selection.advanced.start_time_s,end_s=self.selection.advanced.end_time_s)
                 result=self.backend.run_colorization(**kw)
             else:
                 result=self.backend.run_workflow(flights,self.output,calibration_override=self.selection.calibration_override,mode=self.selection.mode,
@@ -142,6 +242,8 @@ class ServiceWorker(QObject):
                     sample_interval_s=1/self.selection.advanced.sample_frequency_hz,
                     image_border_fraction=self.selection.advanced.image_edge_exclusion_percent/100,
                     minimum_sharpness=self.selection.advanced.minimum_sharpness,
+                    start_s=(self.selection.advanced.start_time_s if self.selection.advanced.time_range_enabled else None),
+                    end_s=(self.selection.advanced.end_time_s if self.selection.advanced.time_range_enabled else None),
                     progress=self.progress.emit,cancelled=self.cancellation.is_set)
             self.result.emit(result)
         except Exception as exc:self.error.emit(str(exc) or type(exc).__name__,traceback.format_exc())
@@ -242,7 +344,7 @@ class MainWindow(QMainWindow):
         self._thread=self._worker=None; self._job_kind=""; self._job_selection=None; self._job_revision=self._revision=0
         self._inspection_pending=False; self._inspected_selection=None; self._ready=False; self._cancellation=threading.Event(); self._close_when_idle=False
         self._last_result=None; self._last_inspection_result=None; self._last_progress_message=""; self._run_started_at=None; self._progress_fraction=0.0; self._eta_seconds=None; self._eta_as_of=None; self._eta_samples=[]; self._eta_rate=None; self._dark_mode=False
-        self.advanced_settings=AdvancedProcessingSettings()
+        self.advanced_settings=AdvancedProcessingSettings();self.advanced_presets={}
         self._elapsed_timer=QTimer(self); self._elapsed_timer.setInterval(1000); self._elapsed_timer.timeout.connect(self._update_elapsed)
         self.setWindowTitle("Elios Colorizer"); self.resize(1080,920); self.setMinimumSize(820,680); self._build()
         self._debounce=QTimer(self); self._debounce.setSingleShot(True); self._debounce.setInterval(350); self._debounce.timeout.connect(self._start_pending_inspection)
@@ -318,20 +420,40 @@ class MainWindow(QMainWindow):
     def _inspection_selection(self):
         return replace(self._selection(),illumination_balancing=False,advanced=AdvancedProcessingSettings())
     def _show_advanced_settings(self):
-        dialog=AdvancedProcessingDialog(self.advanced_settings,self)
+        durations=[]
+        if self._last_inspection_result:
+            reports=self._last_inspection_result.get("flights") or [self._last_inspection_result]
+            durations=[float(item["video_duration_s"]) for item in reports if item.get("video_duration_s")]
+        available_duration=min(durations) if durations else None
+        dialog=AdvancedProcessingDialog(self.advanced_settings,self,presets=self.advanced_presets,available_duration_s=available_duration)
         if dialog.exec()==QDialog.DialogCode.Accepted:
-            self.advanced_settings=dialog.values();self._update_advanced_summary()
+            self.advanced_settings=dialog.values();self.advanced_presets=dialog.presets();self._save_advanced_presets();self._update_advanced_summary()
     def _update_advanced_summary(self):
         if not hasattr(self,"advanced_button"):return
         blur=next((label for label,value in AdvancedProcessingDialog.BLUR_LEVELS if value==self.advanced_settings.minimum_sharpness),"Custom")
-        self.advanced_button.setToolTip(f"Current: {self.advanced_settings.sample_frequency_hz:g} fps · {self.advanced_settings.image_edge_exclusion_percent:g}% edges · {blur} blur rejection")
+        window=("all video" if not self.advanced_settings.time_range_enabled else
+                f"{AdvancedProcessingDialog._format_seconds(self.advanced_settings.start_time_s)}–"+
+                (AdvancedProcessingDialog._format_seconds(self.advanced_settings.end_time_s) if self.advanced_settings.end_time_s is not None else "end"))
+        self.advanced_button.setToolTip(f"Current: {self.advanced_settings.sample_frequency_hz:g} fps · {self.advanced_settings.image_edge_exclusion_percent:g}% edges · {blur} blur rejection · {window}")
     def _restore_settings(self):
         calibration=str(self.settings.value("calibration","") or "")
         saved_theme=self.settings.value("dark_mode",False)
         self._dark_mode=(saved_theme is True or str(saved_theme).strip().lower() in ("1","true","yes","on"))
+        self.advanced_presets={}
+        try:raw=json.loads(str(self.settings.value("advanced_presets_json","{}") or "{}"))
+        except (ValueError,TypeError,json.JSONDecodeError):raw={}
+        if isinstance(raw,dict):
+            for name,value in raw.items():
+                name=" ".join(str(name).split())
+                if not name or len(name)>48 or name.casefold() in ("default settings","custom settings"):continue
+                try:self.advanced_presets[name]=AdvancedProcessingSettings.from_dict(value)
+                except (ValueError,TypeError,OverflowError):continue
         for key in ("flights","source","output","mode","distance_enabled","distance_m"):
             self.settings.remove(key)
         self.calibration_edit.setText(calibration)
+    def _save_advanced_presets(self):
+        payload={name:value.to_dict() for name,value in self.advanced_presets.items()}
+        self.settings.setValue("advanced_presets_json",json.dumps(payload,sort_keys=True,separators=(",",":")))
     def _save_settings(self):
         calibration=self.calibration_edit.text().strip()
         if calibration:self.settings.setValue("calibration",calibration)

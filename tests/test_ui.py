@@ -12,6 +12,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import QTime
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
@@ -174,6 +175,27 @@ def test_advanced_processing_defaults_resets_and_selection(ui):
     assert window._inspection_selection().advanced == ui_module.AdvancedProcessingSettings()
 
 
+def test_advanced_presets_and_time_range_controls(ui):
+    window = ui(FakeBackend())
+    settings = ui_module.AdvancedProcessingSettings(5, 4, 8, True, 15, 75)
+    dialog = ui_module.AdvancedProcessingDialog(settings, window, available_duration_s=125)
+    assert dialog.time_range_check.isChecked()
+    assert dialog.start_time.time() == QTime(0, 0, 15)
+    assert dialog.end_time.time() == QTime(0, 1, 15)
+    assert dialog.end_time.isEnabled()
+    assert dialog.save_preset("Glare wall") == "Glare wall"
+    assert dialog.presets()["Glare wall"] == settings
+    dialog.reset_defaults()
+    assert dialog.values() == ui_module.AdvancedProcessingSettings()
+    index = dialog.preset_combo.findData("Glare wall")
+    dialog.preset_combo.setCurrentIndex(index)
+    assert dialog.values() == settings
+    assert dialog.delete_preset("Glare wall")
+    assert not dialog.presets()
+    with pytest.raises(ValueError, match="1–48"):
+        dialog.save_preset("")
+
+
 def test_old_inspection_cannot_enable_new_source(ui, tmp_path):
     backend = FakeBackend()
     backend.block_first = True
@@ -215,6 +237,17 @@ def test_processing_receives_inputs_and_reports_coverage(ui, tmp_path):
     assert window.state_label.text() == "Colorization complete."
     assert window.eta_label.text() == "Estimated time left: Complete"
     assert window.source_edit.isEnabled()
+
+
+def test_processing_receives_enabled_time_range(ui, tmp_path):
+    backend = FakeBackend()
+    window = ui(backend)
+    prepare(window, tmp_path / "range.las")
+    window.advanced_settings = ui_module.AdvancedProcessingSettings(5, 2, 2, True, 10, 25)
+    window._start_colorization()
+    wait_until(lambda: window._thread is None)
+    assert backend.processing_settings["start_s"] == 10
+    assert backend.processing_settings["end_s"] == 25
 
 
 def test_estimated_time_left_updates_during_processing(ui):

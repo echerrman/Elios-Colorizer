@@ -203,6 +203,7 @@ def inspect_source(folder: str, las_override: str | None = None,
               'A calibrated 4K RGB lens and camera mount profile is required once per camera/recording mode. '
               'Navigation-camera YAMLs cannot be used. See docs/CALIBRATION.md.')
     estimated_views = 0
+    duration_s = 0.0
     if videos:
         import cv2
         cap = cv2.VideoCapture(str(videos[0]))
@@ -219,7 +220,6 @@ def inspect_source(folder: str, las_override: str | None = None,
             check('Video decoding', False, str(exc))
         finally:
             cap.release()
-        duration_s = 0.0
         for video in videos:
             probe = cv2.VideoCapture(str(video))
             try:
@@ -235,7 +235,8 @@ def inspect_source(folder: str, las_override: str | None = None,
     return dict(ready=all(row['status'] != 'missing' for row in rows), checklist=rows,
                 dependencies=dependencies, summary=f'{point_count:,} source points. '
                 'Coordinates and original attributes are retained; points without a usable view remain uncolored.',
-                point_count=point_count, estimated_views=estimated_views)
+                point_count=point_count, estimated_views=estimated_views,
+                video_duration_s=duration_s)
 
 
 def inspect_sources(flights: Iterable[dict[str, str | None]],
@@ -521,7 +522,9 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
                                                  ('Normal' if minimum_sharpness <= 2 else 'Strong')),
                               'illumination_balancing_requested': illumination_balancing,
                               'illumination_balancing_applied': bool(illumination.get('applied')),
-                              'maximum_color_distance_m': maximum_color_distance_m},
+                              'maximum_color_distance_m': maximum_color_distance_m,
+                              'time_range_relative_seconds': {'enabled': start_s is not None or end_s is not None,
+                                                              'start': start_s or 0., 'end': end_s}},
             'warnings_count': len(set([*source.warnings, *telemetry.warnings])),
         },
         'application_version': __version__, 'created_utc': datetime.now(timezone.utc).isoformat(),
@@ -540,6 +543,9 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
             'sample_frequency_hz': 1 / sample_interval_s,
             'image_edge_exclusion_percent': image_border_fraction * 100,
             'minimum_sharpness': minimum_sharpness,
+            'time_range_relative_seconds': {'enabled': start_s is not None or end_s is not None,
+                                            'start': start_s or 0., 'end': end_s},
+            'time_range_applied_seconds': {'start': first-origin, 'end': last-origin},
             'xyz_cache_used': result.xyz_cache_used,
             'worker_threads': options.worker_threads,
             'logical_cpus_detected': logical_cpus,
@@ -604,7 +610,8 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                          maximum_color_distance_m: float | None, progress, cancelled,
                          started: float, flight_checks: list[dict], illumination_balancing: bool = False,
                          sample_interval_s: float = 1.0, image_border_fraction: float = .02,
-                         minimum_sharpness: float = 2.0) -> dict[str, Any]:
+                         minimum_sharpness: float = 2.0,
+                         start_s: float | None = None, end_s: float | None = None) -> dict[str, Any]:
     """Color one final geometry with globally competing observations from all flights."""
     from itertools import chain
     from .camera import Calibration
@@ -687,9 +694,12 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
             end = (float(telemetry.frame_times_s[-1]) if coverage.last_available_sync_time_s is None
                    else coverage.last_available_sync_time_s)
             begin = float(telemetry.frame_times_s[0])
-            expected_views.append(max(1, int((end - begin) / sample_interval_s) + 1))
+            selected_begin=begin+(start_s or 0);selected_end=end if end_s is None else min(begin+end_s,end)
+            if selected_begin>=selected_end:
+                raise ValueError(f'Time range does not overlap recorded video timing for {flight_name}.')
+            expected_views.append(max(1, int((selected_end - selected_begin) / sample_interval_s) + 1))
             raw = iter_observations(source, telemetry, sample_interval_s=sample_interval_s, cancelled=cancelled,
-                                    video_coverage=coverage)
+                                    start_s=start_s,end_s=end_s,video_coverage=coverage)
             adaptive_stats: dict[str, int] = {}
             transformed = transform_observations(raw, matrix, index)
             streams.append(adaptively_select_observations(transformed, stats=adaptive_stats))
@@ -702,6 +712,9 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                 'transform_input': ('entered_values' if selections[index - 1].get('transform_values') else
                                     ('file' if selections[index - 1].get('transform_path') else 'identity')),
                 'transform_source_to_merged': matrix.tolist(),
+                'time_range_relative_seconds': {'enabled': start_s is not None or end_s is not None,
+                                                'start': start_s or 0., 'end': end_s},
+                'time_range_applied_seconds': {'start': selected_begin-begin, 'end': selected_end-begin},
                 'time_synchronization': telemetry.timing_diagnostics,
                 'warnings': list(dict.fromkeys([*source.warnings, *telemetry.warnings])),
             })
@@ -788,7 +801,9 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                                                  ('Normal' if minimum_sharpness <= 2 else 'Strong')),
                               'illumination_balancing_requested': illumination_balancing,
                               'illumination_balancing_applied': bool(illumination.get('applied')),
-                              'maximum_color_distance_m': maximum_color_distance_m},
+                              'maximum_color_distance_m': maximum_color_distance_m,
+                              'time_range_relative_seconds': {'enabled': start_s is not None or end_s is not None,
+                                                              'start': start_s or 0., 'end': end_s}},
             'warnings_count': sum(len(row.get('warnings', [])) for row in telemetry_rows),
         },
         'application_version': __version__, 'created_utc': datetime.now(timezone.utc).isoformat(),
@@ -802,6 +817,8 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
             'sample_frequency_hz': 1 / sample_interval_s,
             'image_edge_exclusion_percent': image_border_fraction * 100,
             'minimum_sharpness': minimum_sharpness,
+            'time_range_relative_seconds': {'enabled': start_s is not None or end_s is not None,
+                                            'start': start_s or 0., 'end': end_s},
             'frame_batch_size': options.frame_batch_size,
             'worker_threads': options.worker_threads,
             'acceleration': result.acceleration,
@@ -841,6 +858,8 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
                  sample_interval_s: float = 1.0,
                  image_border_fraction: float = .02,
                  minimum_sharpness: float = 2.0,
+                 start_s: float | None = None,
+                 end_s: float | None = None,
                  progress: Callable[[str, float, str], None] | None = None,
                  cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
     """Colorize one or more flights, optionally align and fuse colored results."""
@@ -852,6 +871,10 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
         raise ValueError('Image edge exclusion must be between 0 and 15 percent.')
     if not math.isfinite(minimum_sharpness) or not 0 <= minimum_sharpness <= 50:
         raise ValueError('Minimum frame sharpness must be between 0 and 50.')
+    if any(t is not None and (not math.isfinite(t) or t < 0) for t in (start_s, end_s)):
+        raise ValueError('Time window must contain nonnegative video elapsed seconds.')
+    if start_s is not None and end_s is not None and end_s <= start_s:
+        raise ValueError('End time must follow start time.')
     if not selections:
         raise ValueError('Add at least one flight.')
     duplicate_names = _duplicate_flight_names(selections)
@@ -885,7 +908,8 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
             item.get('las_override'), calibration_override, progress, cancelled,
             maximum_color_distance_m=maximum_color_distance_m,
             illumination_balancing=illumination_balancing,sample_interval_s=sample_interval_s,
-            image_border_fraction=image_border_fraction,minimum_sharpness=minimum_sharpness)
+            image_border_fraction=image_border_fraction,minimum_sharpness=minimum_sharpness,
+            start_s=start_s,end_s=end_s)
 
     started = time.monotonic()
     if mode == 'separate':
@@ -920,7 +944,8 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
                 item.get('las_override'), calibration_override, flight_progress, cancelled,
                 maximum_color_distance_m=maximum_color_distance_m,
                 illumination_balancing=illumination_balancing,sample_interval_s=sample_interval_s,
-                image_border_fraction=image_border_fraction,minimum_sharpness=minimum_sharpness)
+                image_border_fraction=image_border_fraction,minimum_sharpness=minimum_sharpness,
+                start_s=start_s,end_s=end_s)
             reports.append(result)
         total = sum(int(result['total_points']) for result in reports)
         colored = sum(int(result['colored_points']) for result in reports)
@@ -937,7 +962,9 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
                                   'blur_rejection': ('Off' if minimum_sharpness == 0 else
                                                      ('Normal' if minimum_sharpness <= 2 else 'Strong')),
                                   'illumination_balancing_requested': illumination_balancing,
-                                  'maximum_color_distance_m': maximum_color_distance_m},
+                                  'maximum_color_distance_m': maximum_color_distance_m,
+                                  'time_range_relative_seconds': {'enabled': start_s is not None or end_s is not None,
+                                                                  'start': start_s or 0., 'end': end_s}},
                 'outputs': [item['output'] for item in reports],
             },
             'application_version': __version__, 'created_utc': datetime.now(timezone.utc).isoformat(),
@@ -955,4 +982,5 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
         maximum_color_distance_m=maximum_color_distance_m, progress=progress,
         cancelled=cancelled, started=started, flight_checks=flight_checks,
         illumination_balancing=illumination_balancing,sample_interval_s=sample_interval_s,
-        image_border_fraction=image_border_fraction,minimum_sharpness=minimum_sharpness)
+        image_border_fraction=image_border_fraction,minimum_sharpness=minimum_sharpness,
+        start_s=start_s,end_s=end_s)

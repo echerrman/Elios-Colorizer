@@ -5,6 +5,15 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-10-05
+
+### Added
+
+- Added named, reusable presets for all Advanced Processing Settings.
+- Added optional start/end controls for processing only a selected elapsed-time
+  range of each flight, including an adaptive **Through end of video** choice.
+- Added time-range details to single-flight, separate-output, and merged reports.
+
 ## [1.3.0] - 2026-10-05
 
 ### Added
@@ -93,7 +102,8 @@ project follows [Semantic Versioning](https://semver.org/).
   RGB-video ingestion.
 - Explicit `Colorized` output attribute and deterministic packaged self-test.
 
-[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/echerrman/Elios-Colorizer/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.0.0...v1.1.0

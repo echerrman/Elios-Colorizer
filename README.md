@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml?query=branch%3Amain"><img alt="Tests" src="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.3.0"><img alt="Release v1.3.0" src="https://img.shields.io/badge/release-v1.3.0-2f6f89"></a>
+  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.3.1"><img alt="Release v1.3.1" src="https://img.shields.io/badge/release-v1.3.1-2f6f89"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2f6f89"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2f6f89">
   <img alt="Local processing" src="https://img.shields.io/badge/processing-local-187548">
@@ -34,9 +34,8 @@ native flight telemetry, and recorded 4K video. It preserves unobserved geometry
 marks every point with an explicit colorization status, and performs all work on
 the local computer. Flight data is not uploaded to a cloud service.
 
-> **Version 1.3:** advanced controls for RGB sampling frequency, image-edge
-> exclusion, and blur rejection complement single-flight and multi-flight
-> colorization, illumination balancing, and NVIDIA CUDA acceleration.
+> **Version 1.3.1:** reusable processing presets and optional elapsed-time ranges
+> complement the advanced RGB sampling, edge-exclusion, and blur controls.
 
 ## Install
 
@@ -176,6 +175,11 @@ Elios Colorizer is available under the [MIT License](LICENSE).
 Elios, Elios 3, Inspector, and Flyability are trademarks of their respective
 owners. This independent open-source project is not affiliated with, sponsored
 by, or endorsed by Flyability.
+
+### v1.3.1
+
+Version 1.3.1 adds reusable named presets and optional start/end controls for
+processing only a selected elapsed-time range of every flight.
 
 ### v1.3.0
 

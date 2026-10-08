@@ -73,8 +73,9 @@ def test_compiled_cuda_checkpoint_executes_when_present(monkeypatch):
     ('opencv', (0., 0., 0., 0., 0.)),
     ('fisheye', (0., 0., 0., 0.)),
 ])
+@pytest.mark.parametrize('fusion', [False, True])
 def test_cuda_projection_matches_cpu_reference(tmp_path, monkeypatch,
-                                               distortion_model, coefficients):
+                                               distortion_model, coefficients, fusion):
     import laspy
     import numpy as np
     from elios_colorizer.camera import Calibration
@@ -100,13 +101,16 @@ def test_cuda_projection_matches_cpu_reference(tmp_path, monkeypatch,
                       (xx + yy * 2) % 220 + 10,
                       (xx + yy) % 220 + 10), axis=2).astype(np.uint8)
     second = np.roll(first, 3, axis=1)
+    third = np.roll(first, -3, axis=1)
     frames = [
         FrameObservation(first, (0, 0, 0), (0, 0, 0, 1), 0, 0, source_flight=1),
         FrameObservation(second, (.08, 0, 0), (0, 0, 0, 1), 0, 1, source_flight=2),
+        FrameObservation(third, (-.08, 0, 0), (0, 0, 0, 1), 0, 2, source_flight=3),
     ]
     options = ColorizationOptions(chunk_size=47, frame_batch_size=2,
                                   depth_buffer_width=100, minimum_sharpness=0,
-                                  occlusion_radius_pixels=1, worker_threads=2)
+                                  occlusion_radius_pixels=1, worker_threads=2,
+                                  multi_frame_fusion=fusion)
 
     monkeypatch.setenv('ELIOS_COLORIZER_DISABLE_CUDA', '1')
     cpu = colorize_las(tmp_path / 'source.las', tmp_path / 'cpu.las', frames,
@@ -128,4 +132,6 @@ def test_cuda_projection_matches_cpu_reference(tmp_path, monkeypatch,
     np.testing.assert_allclose(cpu_las.ColorDistance, gpu_las.ColorDistance,
                                rtol=2e-6, atol=2e-6)
     assert gpu.acceleration['cuda_acceleration_active']
+    assert gpu.acceleration['processing_backend'] == ('cuda_fusion' if fusion else 'cuda_projection')
     assert gpu.acceleration['color_chunks'] > 0
+    assert gpu.multi_frame_fusion['requested'] == fusion

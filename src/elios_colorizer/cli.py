@@ -20,6 +20,8 @@ def main() -> int:
     run.add_argument('--experimental', action='store_true', help='Diagnostic output with an unvalidated calibration; do not treat as reliable colorization')
     run.add_argument('--max-color-distance', dest='maximum_color_distance_m', type=float,
                      help='Optional maximum camera-to-point colorization distance in meters')
+    run.add_argument('--multi-frame-fusion', action='store_true',
+                     help='Robustly combine several RGB observations per point')
     args = vars(parser.parse_args())
     command = args.pop('command')
     try:

@@ -12,9 +12,9 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QTime
+from PySide6.QtCore import QPoint, QTime, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QGroupBox
 
 import elios_colorizer.ui as ui_module
 from elios_colorizer.ui import MainWindow
@@ -94,8 +94,8 @@ class FakeBackend:
 def ui(app):
     windows = []
 
-    def create(backend):
-        window = MainWindow(backend, restore_settings=False)
+    def create(backend, **kwargs):
+        window = MainWindow(backend, restore_settings=False, **kwargs)
         windows.append(window)
         return window
 
@@ -125,6 +125,10 @@ def test_ready_requires_validated_inputs_and_las_output(ui, tmp_path):
     assert not window.run_button.isEnabled()
     window.output_edit.setText(str(tmp_path / "result.las"))
     assert window.run_button.isEnabled()
+    (tmp_path / "result.las").touch();window._update_actions()
+    assert not window.run_button.isEnabled()
+    (tmp_path / "result.las").unlink();window._update_actions()
+    assert window.run_button.isEnabled()
     window.calibration_edit.setText("new-camera.json")
     assert not window.run_button.isEnabled()
 
@@ -145,7 +149,11 @@ def test_action_buttons_and_color_balance_placeholder(ui):
     assert window.add_flight_button.objectName() == "addFlightButton"
     assert "Add flight" in window.add_flight_button.text()
     assert second.remove_button.objectName() == "removeFlightButton"
-    assert "✕" in second.remove_button.text() and "Remove" in second.remove_button.text()
+    assert second.remove_button.text() == "Remove"
+    assert second.duplicate_button.text() == "Duplicate"
+    assert second.up_button.width() == second.down_button.width() == 38
+    assert window.bulk_add_button.text() == "Import Flights…"
+    assert not window.bulk_add_button.icon().isNull()
     assert "↻" in window.refresh_button.text()
     assert window.color_balance_check.isEnabled()
     assert window.color_balance_check.text() == "Illumination Balancing"
@@ -156,6 +164,164 @@ def test_action_buttons_and_color_balance_placeholder(ui):
     assert not window._inspection_selection().illumination_balancing
 
 
+def test_responsive_layout_switches_to_two_columns(ui, app):
+    window = ui(FakeBackend())
+    processing_title = window.processing_card.findChild(QLabel, "sectionTitle")
+    assert processing_title.text() == "Choose Processing and Output"
+    assert not processing_title.wordWrap()
+    window.resize(1000, 850)
+    QApplication.processEvents()
+    assert not window._wide_layout
+    assert window.workflow_layout.getItemPosition(window.workflow_layout.indexOf(window.processing_card))[:2] == (2, 0)
+    # Offscreen Qt test screens can clamp top-level window sizes, so exercise
+    # the same breakpoint method with the intended viewport width directly.
+    window._apply_responsive_layout(1500)
+    assert window._wide_layout
+    assert window.workflow_layout.getItemPosition(window.workflow_layout.indexOf(window.processing_card)) == (0, 1, 2, 1)
+
+
+def test_startup_reveals_only_fully_initialized_window(ui, app):
+    window = ui(FakeBackend(), startup_hidden=True)
+    assert window.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+    assert window.windowOpacity() == 0.0
+    assert not window.updatesEnabled()
+    ui_module._show_fully_initialized(window, app)
+    assert window.isVisible()
+    assert not window.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+    assert window.windowOpacity() == 1.0
+    assert window.updatesEnabled()
+
+
+def test_startup_splash_has_visible_staged_progress(app):
+    splash = ui_module.StartupSplash(dark=True)
+    try:
+        initial = splash.progress.value()
+        for _ in range(5):
+            splash._advance_progress()
+        assert initial < splash.progress.value() < 100
+        splash.complete()
+        assert splash.progress.value() == 100
+        assert splash.status.text() == "Ready"
+    finally:
+        splash.close()
+        splash.deleteLater()
+
+
+def test_flight_controls_remain_aligned_across_window_sizes(ui, app):
+    window = ui(FakeBackend())
+    window._add_flight(trigger=False); window._add_flight(trigger=False)
+    window.flight_rows[1].set_readiness({"ready": True, "point_count": 12, "video_duration_s": 8})
+    window.flight_rows[2].set_readiness({"ready": False, "point_count": 12, "video_duration_s": 8})
+    for width in (820, 1100, 1600):
+        window.resize(width, 820); window._apply_responsive_layout(width); window.show(); QApplication.processEvents()
+        assert len({row.up_button.width() for row in window.flight_rows}) == 1
+        assert len({row.duplicate_button.width() for row in window.flight_rows}) == 1
+        assert len({row.remove_button.width() for row in window.flight_rows}) == 1
+        assert all(row.folder_button.width() == row.las_button.width() == 100 for row in window.flight_rows)
+        assert window.scroll_area.horizontalScrollBar().maximum() == 0
+    window._apply_responsive_layout(1600); QApplication.processEvents()
+    assert window.settings_chips[0].height() < 50
+    assert window.processing_plan_label.height() < 70
+
+
+def test_per_flight_progress_panel_tracks_local_and_aggregate_progress(ui):
+    window = ui(FakeBackend())
+    window.flight_progress.reset(["Upper Wall", "Lower Wall"])
+    window._on_progress("Upper Wall: Assigning RGB", .25,
+                        "CUDA GPU 1 · 2 flight jobs active · flight 40.0%")
+    upper = window.flight_progress._rows["Upper Wall"]
+    assert upper[0].value() == 400
+    assert upper[1].text() == "40%"
+    assert "Assigning RGB" in upper[2].text()
+    assert "flight 40.0%" not in window.progress_detail.text()
+    assert window.progress_bar.value() == 250
+    window._on_progress("Lower Wall: Assigning RGB", .1,
+                        "CUDA GPU 2 · 2 flight jobs active · flight 10.0%")
+    assert window.progress_bar.value() == 250
+    window.flight_progress.toggle.setChecked(False)
+    assert not window.flight_progress.body.isVisible()
+
+
+def test_flight_cards_support_bulk_add_collapse_duplicate_and_reorder(ui, tmp_path):
+    window = ui(FakeBackend())
+    first_folder = tmp_path / "Upper"; second_folder = tmp_path / "Lower"
+    first_folder.mkdir(); second_folder.mkdir()
+    window._add_flight_folders([first_folder, second_folder])
+    assert [row.folder_edit.text() for row in window.flight_rows] == [str(first_folder), str(second_folder)]
+    assert [row.name_edit.text() for row in window.flight_rows] == ["Flight 1", "Flight 2"]
+    replacement = tmp_path / "Replacement"; replacement.mkdir()
+    window.flight_rows[0].las_edit.path_dropped.emit(str(replacement))
+    assert window.flight_rows[0].las_edit.text() == str(replacement)
+    assert len(window.flight_rows) == 2
+    field = window.flight_rows[0].folder_edit
+    field._set_drop_highlight(True)
+    assert field.property("folderDropActive") is True
+    field._set_drop_highlight(False)
+    window._set_application_drop_highlight(True)
+    assert not window.drop_overlay.isHidden()
+    assert window.app_shell_layout.contentsMargins().left() == 0
+    window._set_application_drop_highlight(False)
+    assert window.drop_overlay.isHidden()
+    merged = tmp_path / "merged.las"; merged.touch()
+    window.merged_edit.path_dropped.emit(str(merged))
+    assert window.merged_edit.text() == str(merged)
+    first = window.flight_rows[0]
+    first.collapse_button.setChecked(False)
+    assert first.body.isHidden() and not first.compact_summary.isHidden()
+    window._duplicate_flight(first)
+    duplicate = window.flight_rows[-1]
+    assert duplicate.folder_edit.text() == str(first_folder)
+    window._move_flight(duplicate, -1)
+    assert window.flight_rows[1] is duplicate
+
+
+def test_sticky_focus_preflight_settings_and_output_preview(ui, tmp_path):
+    window = ui(FakeBackend())
+    window._last_inspection_result = {
+        "point_count": 2_000_000, "video_duration_s": 120, "estimated_views": 120}
+    window.advanced_settings = ui_module.AdvancedProcessingSettings(5, 4, 8, True, 10, 30, True)
+    output = tmp_path / "result.las"
+    window.output_edit.setText(str(output));window._update_processing_summaries()
+    assert [chip.text() for chip in window.settings_chips] == ["5 fps", "Exclude outer 4%", "Strong blur", "Fusion On", "00:00:10–00:00:30"]
+    assert "approximately 100 sampled frames" in window.preflight_summary.text()
+    assert "Will create: result.las" in window.output_preview.text()
+    assert window.sticky_bar.parent() is window.centralWidget()
+    window._apply_responsive_layout(1600)
+    before = window.workflow_layout.getItemPosition(window.workflow_layout.indexOf(window.processing_card))
+    window._set_processing_focus(True)
+    assert not window.flight_card.isHidden() and not window.check_card.isHidden()
+    assert not window.processing_card.isHidden() and not window.sticky_bar.isHidden()
+    assert window.workflow_layout.getItemPosition(window.workflow_layout.indexOf(window.processing_card)) == before
+    window._set_processing_focus(False)
+    output.touch();window._update_processing_summaries()
+    assert "Conflict:" in window.output_preview.text()
+
+
+def test_actionable_readiness_results_and_completed_flight_action(ui, tmp_path):
+    window = ui(FakeBackend());second = window._add_flight(trigger=False)
+    second.collapse_button.setChecked(False)
+    window._navigate_to_check({"label": "Existing point cloud", "detail": "Flight 2: missing"})
+    assert second.collapse_button.isChecked() and window.focusWidget() is second.las_edit
+    output = tmp_path / "lower.las";output.touch()
+    window.flight_progress.reset(["Upper", "Lower"], {"Lower": output})
+    window.flight_progress.update_flight("Lower", 1, "Complete")
+    assert window.flight_progress._rows["Lower"][3].isEnabled()
+    report = tmp_path / "report.json"
+    report.write_text('{"summary":{"elapsed_seconds":65,"warnings_count":2,"frames":{"used":50,"rejected":3}}}')
+    window._show_result_summary({"output":str(output),"report":str(report),"colored_points":75,"total_points":100,"processing_strategy":"parallel_separate_outputs"})
+    assert not window.result_panel.isHidden()
+    assert "75.0%" in window.result_headline.text()
+    assert "50 frames used" in window.result_summary.text()
+
+
+def test_advanced_dialog_is_grouped_and_summarizes_active_values(ui):
+    dialog = ui_module.AdvancedProcessingDialog(ui_module.AdvancedProcessingSettings(5, 4, 8, True, 10, 30, True))
+    headings = [label.text() for label in dialog.findChildren(QLabel) if label.objectName() == "dialogSectionTitle"]
+    assert headings == ["Processing preset", "Frame selection", "Color quality", "Video time range"]
+    assert "5 fps" in dialog.active_summary.text() and "Fusion On" in dialog.active_summary.text()
+    dialog.deleteLater()
+
+
 def test_advanced_processing_defaults_resets_and_selection(ui):
     window = ui(FakeBackend())
     dialog = ui_module.AdvancedProcessingDialog(ui_module.AdvancedProcessingSettings(4, 12, 8), window)
@@ -164,6 +330,7 @@ def test_advanced_processing_defaults_resets_and_selection(ui):
     assert dialog.sample_frequency.value() == 4.25
     dialog.findChild(QPushButton, 'edgeExclusionDecreaseButton').click()
     assert dialog.edge_exclusion.value() == 11
+
     dialog.sample_frequency.setValue(4);dialog.edge_exclusion.setValue(12)
     assert dialog.values() == ui_module.AdvancedProcessingSettings(4, 12, 8)
     dialog.reset_defaults()
@@ -175,14 +342,24 @@ def test_advanced_processing_defaults_resets_and_selection(ui):
     assert window._inspection_selection().advanced == ui_module.AdvancedProcessingSettings()
 
 
+def test_resource_switch_is_clickable_across_entire_track(app):
+    switch = ui_module.ToggleSwitch()
+    switch.show()
+    assert not switch.isChecked()
+    QTest.mouseClick(switch, Qt.MouseButton.LeftButton, pos=QPoint(switch.width()-3,switch.height()//2))
+    assert switch.isChecked()
+    switch.close();switch.deleteLater()
+
+
 def test_advanced_presets_and_time_range_controls(ui):
     window = ui(FakeBackend())
-    settings = ui_module.AdvancedProcessingSettings(5, 4, 8, True, 15, 75)
+    settings = ui_module.AdvancedProcessingSettings(5, 4, 8, True, 15, 75, True)
     dialog = ui_module.AdvancedProcessingDialog(settings, window, available_duration_s=125)
     assert dialog.time_range_check.isChecked()
     assert dialog.start_time.time() == QTime(0, 0, 15)
     assert dialog.end_time.time() == QTime(0, 1, 15)
     assert dialog.end_time.isEnabled()
+    assert dialog.fusion_check.isChecked()
     assert dialog.save_preset("Glare wall") == "Glare wall"
     assert dialog.presets()["Glare wall"] == settings
     dialog.reset_defaults()
@@ -229,7 +406,8 @@ def test_processing_receives_inputs_and_reports_coverage(ui, tmp_path):
     wait_until(lambda: window._thread is None)
     assert backend.illumination_balancing
     assert backend.processing_settings == {
-        'sample_interval_s': .5, 'image_border_fraction': .05, 'minimum_sharpness': 8}
+        'sample_interval_s': .5, 'image_border_fraction': .05, 'minimum_sharpness': 8,
+        'resource_settings': ui_module.ResourcePreferences().to_dict()}
     assert backend.last_run == ("flight", str(output), "source.las", "camera.json")
     assert window.progress_bar.value() == 1000
     assert window.progress_badge.text() == "100%"
@@ -243,11 +421,12 @@ def test_processing_receives_enabled_time_range(ui, tmp_path):
     backend = FakeBackend()
     window = ui(backend)
     prepare(window, tmp_path / "range.las")
-    window.advanced_settings = ui_module.AdvancedProcessingSettings(5, 2, 2, True, 10, 25)
+    window.advanced_settings = ui_module.AdvancedProcessingSettings(5, 2, 2, True, 10, 25, True)
     window._start_colorization()
     wait_until(lambda: window._thread is None)
     assert backend.processing_settings["start_s"] == 10
     assert backend.processing_settings["end_s"] == 25
+    assert backend.processing_settings["multi_frame_fusion"] is True
 
 
 def test_estimated_time_left_updates_during_processing(ui):
@@ -346,7 +525,7 @@ def test_long_paths_stay_inside_panels(ui):
     window.show()
     QApplication.processEvents()
 
-    scroll = window.centralWidget()
+    scroll = window.scroll_area
     assert scroll.horizontalScrollBar().maximum() == 0
     assert any('\u200b' in label.text() for label in window.checklist.findChildren(QLabel))
 
@@ -424,7 +603,7 @@ def test_duplicate_flight_names_block_readiness(ui, tmp_path):
     assert not any(row.name_edit.property("duplicateName") for row in window.flight_rows)
 
 
-def test_only_camera_calibration_and_theme_are_restored_between_sessions(app, monkeypatch):
+def test_camera_theme_and_resource_preferences_are_restored_between_sessions(app, monkeypatch):
     class MemorySettings:
         values = {
             "flights": '[{"folder":"old-flight","las_override":"old.las"}]',
@@ -435,6 +614,7 @@ def test_only_camera_calibration_and_theme_are_restored_between_sessions(app, mo
             "distance_enabled": True,
             "distance_m": 12.0,
             "dark_mode": True,
+            "resource_preferences_json": '{"use_recommended":false,"cpu_percent":50,"memory_percent":45,"cuda_enabled":false,"max_gpus":2,"vram_percent":65,"concurrent_flights":3,"process_priority":"low"}',
         }
 
         def __init__(self, *_): pass
@@ -454,12 +634,15 @@ def test_only_camera_calibration_and_theme_are_restored_between_sessions(app, mo
         assert not window.distance_check.isChecked()
         assert window._dark_mode
         assert window.theme_button.isChecked()
+        assert window.resource_preferences == ui_module.ResourcePreferences(False,50,45,False,2,65,3,"low")
         window.source_edit.setText("new-flight")
         window.las_edit.setText("new.las")
         window.output_edit.setText("new-output.las")
         window.calibration_edit.setText("new-camera.json")
         window._save_settings()
-        assert MemorySettings.values == {"calibration": "new-camera.json", "dark_mode": True}
+        assert MemorySettings.values == {
+            "calibration": "new-camera.json", "dark_mode": True,
+            "resource_preferences_json": '{"concurrent_flights":3,"cpu_percent":50,"cuda_enabled":false,"max_gpus":2,"memory_percent":45,"process_priority":"low","use_recommended":false,"vram_percent":65}'}
     finally:
         window._debounce.stop()
         window.close()

@@ -12,8 +12,35 @@ from elios_colorizer.camera import Calibration, CalibrationError
 from elios_colorizer.colorize import (
     adaptively_select_observations,
     ColorizationCancelled, ColorizationError, ColorizationOptions,
-    FrameObservation, colorize_las, group_nearby_observations,
+    FrameObservation, colorize_las, group_nearby_observations, reduce_candidate_shards,
 )
+
+
+def test_parallel_candidate_reduction_matches_global_best_view(tmp_path):
+    camera = Calibration(100, 100, 50, 50, 50, 50, (0, 0, 0, 1), (0, 0, 0),
+                         (0, 1, 0), (0, 0, 0), 1, 0, validated=True)
+    make_las(tmp_path / 'source.las', [(0, 0, 2), (.2, 0, 2), (-.2, 0, 2)])
+    red = solid_frame((220, 20, 20), source_flight=1)
+    blue_image = np.full((100, 100, 3), (20, 20, 220), dtype=np.uint8)
+    blue = FrameObservation(blue_image, (.15, 0, 0), (0, 0, 0, 1), 0, 2., source_flight=2)
+    options = ColorizationOptions(chunk_size=2, frame_batch_size=1,
+                                  depth_buffer_width=100, minimum_sharpness=0,
+                                  reject_exposure_extremes=False,
+                                  occlusion_absolute_tolerance_m=.01,
+                                  occlusion_relative_tolerance=0, merged_output=True)
+    expected = colorize_las(tmp_path / 'source.las', tmp_path / 'expected.las',
+                            [red, blue], camera, options=options)
+    first = colorize_las(tmp_path / 'source.las', tmp_path / 'unused-1.las',
+                         [red], camera, options=options,
+                         candidate_directory=tmp_path / 'candidate-1')
+    second = colorize_las(tmp_path / 'source.las', tmp_path / 'unused-2.las',
+                          [blue], camera, options=options,
+                          candidate_directory=tmp_path / 'candidate-2')
+    reduced = reduce_candidate_shards(tmp_path / 'source.las', tmp_path / 'reduced.las',
+                                      [first.output_path, second.output_path], chunk_size=2)
+    expected_las, reduced_las = laspy.read(expected.output_path), laspy.read(reduced.output_path)
+    for name in expected_las.point_format.dimension_names:
+        np.testing.assert_array_equal(expected_las[name], reduced_las[name])
 
 
 @pytest.fixture
@@ -134,6 +161,51 @@ def test_best_observation_wins(tmp_path, camera, options):
     assert output.SourceFlight[0] == 2
 
 
+def test_multi_frame_fusion_rejects_bright_glare_outlier(tmp_path, camera, options):
+    make_las(tmp_path / "source.las", [(0, 0, 3)])
+    true_values = [90, 100, 105, 110]
+    frames = [replace(solid_frame((value, value, value)), timestamp_s=float(index),
+                      source_flight=index + 1)
+              for index, value in enumerate(true_values)]
+    glare = solid_frame((240, 240, 240), source_flight=5)
+    glare.rgb[::2, ::2] = 225
+    glare.rgb[1::2, 1::2] = 225
+    frames.append(replace(glare, timestamp_s=5.0))
+
+    legacy = colorize_las(tmp_path / "source.las", tmp_path / "legacy.las", frames,
+                          camera, options=options)
+    fused = colorize_las(tmp_path / "source.las", tmp_path / "fused.las", frames,
+                         camera, options=replace(options, multi_frame_fusion=True))
+    legacy_cloud, fused_cloud = laspy.read(legacy.output_path), laspy.read(fused.output_path)
+    assert legacy_cloud.red[0] // 257 >= 225
+    assert fused_cloud.red[0] // 257 in true_values
+    assert fused_cloud.SourceFlight[0] in (1, 2, 3, 4)
+    assert fused.multi_frame_fusion['applied']
+    assert fused.multi_frame_fusion['points_fused'] == 1
+    assert fused.multi_frame_fusion['rejected_outlier_observations'] == 1
+
+
+def test_multi_frame_fusion_falls_back_and_off_is_identical(tmp_path, camera, options):
+    make_las(tmp_path / "source.las", [(0, 0, 3), (.5, 0, 3)])
+    frames = [solid_frame((80, 120, 200), source_flight=1),
+              replace(solid_frame((100, 140, 220), source_flight=2), timestamp_s=2)]
+    default = colorize_las(tmp_path / "source.las", tmp_path / "default.las", frames,
+                           camera, options=options)
+    explicit_off = colorize_las(tmp_path / "source.las", tmp_path / "off.las", frames,
+                                camera, options=replace(options, multi_frame_fusion=False))
+    fused = colorize_las(tmp_path / "source.las", tmp_path / "fallback.las", frames,
+                         camera, options=replace(options, multi_frame_fusion=True))
+    baseline = laspy.read(default.output_path)
+    for path in (explicit_off.output_path, fused.output_path):
+        candidate = laspy.read(path)
+        for name in ('red', 'green', 'blue', 'Colorized', 'ColorConfidence',
+                     'ColorDistance', 'SourceFlight'):
+            np.testing.assert_array_equal(candidate[name], baseline[name])
+    assert not default.multi_frame_fusion['requested']
+    assert not fused.multi_frame_fusion['applied']
+    assert fused.multi_frame_fusion['points_using_best_observation_fallback'] == 2
+
+
 def test_optional_distance_limit_and_provenance(tmp_path, camera, options):
     make_las(tmp_path / "source.las", [(0, 0, 2), (3, 0, 5)])
     colorize_las(tmp_path / "source.las", tmp_path / "output.las", [solid_frame()], camera,
@@ -229,18 +301,25 @@ def test_unvalidated_camera_requires_explicit_experiment(tmp_path, camera, optio
     assert result.experimental_calibration
 
 
-def test_acceleration_cache_is_color_identical(tmp_path, camera, options):
+@pytest.mark.parametrize('fusion', [False, True])
+def test_acceleration_cache_is_color_identical(tmp_path, camera, options, fusion):
     points = [(x / 10, y / 10, 2 + ((x + y) % 3) / 10)
               for x in range(-5, 6) for y in range(-5, 6)]
     make_las(tmp_path / 'source.las', points)
-    frames = [solid_frame((80, 120, 200)),
-              replace(solid_frame((200, 100, 60)), position_world_m=(.1, 0, 0))]
+    frames = [replace(solid_frame(color, source_flight=index + 1),
+                      position_world_m=(position, 0, 0), timestamp_s=float(index))
+              for index, (color, position) in enumerate([
+                  ((80, 120, 200), 0), ((200, 100, 60), .1), ((90, 125, 195), -.1),
+                  ((85, 118, 205), .05), ((88, 122, 198), -.05)])]
     colorize_las(tmp_path / 'source.las', tmp_path / 'streamed.las', frames, camera,
-                 options=replace(options, chunk_size=13, frame_batch_size=1, cache_xyz=False))
+                 options=replace(options, chunk_size=13, frame_batch_size=1, cache_xyz=False,
+                                 multi_frame_fusion=fusion))
     result = colorize_las(tmp_path / 'source.las', tmp_path / 'cached.las', frames, camera,
                           options=replace(options, chunk_size=17, frame_batch_size=2, cache_xyz=True,
-                                          worker_threads=4))
+                                          worker_threads=4, multi_frame_fusion=fusion))
     streamed, cached = laspy.read(tmp_path / 'streamed.las'), laspy.read(tmp_path / 'cached.las')
-    for name in ('red', 'green', 'blue', 'Colorized'):
+    for name in ('red', 'green', 'blue', 'Colorized', 'ColorConfidence',
+                 'ColorDistance', 'SourceFlight'):
         np.testing.assert_array_equal(streamed[name], cached[name])
     assert result.xyz_cache_used
+    assert result.multi_frame_fusion['requested'] == fusion

@@ -14,12 +14,14 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import copy
 import ctypes
+import json
 from itertools import islice
 import math
 import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from typing import Callable, Iterable, Iterator, Any
 
 import cv2
@@ -71,10 +73,22 @@ class ColorizationOptions:
     worker_threads: int = 1
     illumination_balancing: bool = False
     merged_output: bool = False
+    multi_frame_fusion: bool = False
+    fusion_max_observations: int = 5
+    fusion_min_observations: int = 3
+    cuda_device_index: int = 0
+    cuda_enabled: bool = True
+    memory_budget_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if self.chunk_size < 1 or self.frame_batch_size < 1 or self.depth_buffer_width < 8 or self.worker_threads < 1:
             raise ValueError("Chunk size, frame batch size, and depth-buffer width must be positive")
+        if (self.fusion_max_observations < 3 or self.fusion_max_observations > 8
+                or self.fusion_min_observations < 2
+                or self.fusion_min_observations > self.fusion_max_observations):
+            raise ValueError("Multi-frame fusion observation counts are invalid")
+        if self.cuda_device_index < 0:
+            raise ValueError("CUDA device index must be nonnegative")
         if (not 0 <= self.occlusion_radius_pixels <= 4
                 or not 0 <= self.image_border_fraction < 0.25
                 or not 0 < self.minimum_depth_m < self.maximum_depth_m
@@ -100,7 +114,9 @@ class ColorizationResult:
     experimental_calibration: bool = False
     xyz_cache_used: bool = False
     illumination_balancing: dict | None = None
+    multi_frame_fusion: dict | None = None
     acceleration: dict | None = None
+    performance: dict | None = None
 
     @property
     def coverage_fraction(self) -> float:
@@ -300,6 +316,8 @@ def _use_xyz_cache(point_count: int, options: ColorizationOptions) -> bool:
         return options.cache_xyz
     needed = point_count * 3 * np.dtype(np.float64).itemsize
     available = _available_memory_bytes()
+    if options.memory_budget_bytes is not None:
+        available=min(available,options.memory_budget_bytes) if available is not None else options.memory_budget_bytes
     # Keep at least 2 GiB and 65% of currently available physical memory free
     # for 4K frames, projection temporaries, the UI, and other applications.
     return available is not None and needed <= 4 * 1024**3 and needed <= max(0, available - 2 * 1024**3) * .35
@@ -450,6 +468,146 @@ def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
     return offset, len(xyz), corrected_count, rejected_count
 
 
+def _assign_chunk_fusion(offset: int, xyz: np.ndarray, batch: list[_PreparedFrame],
+                         colors: np.ndarray, quality: np.ndarray, distances: np.ndarray,
+                         sources: np.ndarray, fusion_colors: np.ndarray,
+                         fusion_weights: np.ndarray, fusion_distances: np.ndarray,
+                         fusion_sources: np.ndarray, calibration: Calibration,
+                         options: ColorizationOptions) -> tuple[int, int, int, int]:
+    """Retain the strongest visible observations for later robust per-point fusion."""
+    corrected_count = rejected_count = 0
+    for frame in batch:
+        selected, uv, z, camera = _project(xyz, frame, calibration, options, border=True)
+        x, y = _pixel_indices(uv, frame)
+        near = frame.depth[y, x]
+        visible = z <= near + options.occlusion_absolute_tolerance_m + near * options.occlusion_relative_tolerance
+        if not visible.any():
+            continue
+        selected, uv, z, camera = selected[visible], uv[visible], z[visible], camera[visible]
+        rgb = _sample_rgb(frame.observation.rgb, uv)
+        adjusted_rgb = rgb.copy()
+        luminance = rgb @ np.array([0.2126, 0.7152, 0.0722])
+        usable = np.ones(len(rgb), dtype=bool)
+        if options.reject_exposure_extremes:
+            usable &= (luminance >= options.minimum_luminance) & (luminance <= options.maximum_luminance)
+        if options.illumination_balancing:
+            exposure_ok = raw_usable(rgb, options.minimum_luminance, options.maximum_luminance, luminance)
+            rejected_count += int(np.count_nonzero(~exposure_ok))
+            usable &= exposure_ok
+        point_distance = np.linalg.norm(camera, axis=1)
+        if options.maximum_color_distance_m is not None:
+            usable &= point_distance <= options.maximum_color_distance_m
+        cosine = z / point_distance
+        border_distance = np.minimum.reduce((uv[:, 0] / calibration.image_width,
+            uv[:, 1] / calibration.image_height,
+            1 - uv[:, 0] / calibration.image_width, 1 - uv[:, 1] / calibration.image_height))
+        edge_weight = np.clip(border_distance / 0.15, 0.05, 1)
+        exposure_weight = 0.5 + 0.5 * (1 - np.abs(luminance - 127.5) / 127.5)
+        score = (frame.sharpness_weight * cosine**2 * edge_weight * exposure_weight
+                 / (1 + (z / 5)**2)).astype(np.float32)
+        if frame.illumination_model is not None:
+            candidates = np.flatnonzero(usable)
+            gains, penalty = frame.illumination_model.adjustment(
+                rgb[candidates], radius_squared(uv[candidates], calibration), frame.illumination_frame)
+            score[candidates] *= penalty
+            corrected = apply_gain(rgb[candidates], gains)
+            corrected_count += int(np.count_nonzero(np.any(corrected != rgb[candidates], axis=1)))
+            adjusted_rgb[candidates] = corrected
+        candidates = np.flatnonzero(usable & (score > 0))
+        if not len(candidates):
+            continue
+        indices = selected[candidates] + offset
+        candidate_scores = score[candidates]
+        candidate_rgb = adjusted_rgb[candidates]
+        candidate_distances = point_distance[candidates].astype(np.float32)
+
+        # Maintain the legacy best observation as the exact fallback for points
+        # that never accumulate enough views for robust fusion.
+        better = candidate_scores > quality[indices]
+        if better.any():
+            chosen = indices[better]
+            colors[chosen] = candidate_rgb[better].astype(np.uint16) * 257
+            quality[chosen] = candidate_scores[better]
+            distances[chosen] = candidate_distances[better]
+            sources[chosen] = frame.observation.source_flight
+
+        rows = fusion_weights[indices]
+        slots = np.argmin(rows, axis=1)
+        weakest = rows[np.arange(len(indices)), slots]
+        retain = candidate_scores > weakest
+        if retain.any():
+            chosen = indices[retain]
+            slot = slots[retain]
+            fusion_colors[chosen, slot] = candidate_rgb[retain]
+            fusion_weights[chosen, slot] = candidate_scores[retain]
+            fusion_distances[chosen, slot] = candidate_distances[retain]
+            fusion_sources[chosen, slot] = frame.observation.source_flight
+    return offset, len(xyz), corrected_count, rejected_count
+
+
+def _finalize_fusion(colors: np.ndarray, quality: np.ndarray, distances: np.ndarray,
+                     sources: np.ndarray, fusion_colors: np.ndarray,
+                     fusion_weights: np.ndarray, fusion_distances: np.ndarray,
+                     fusion_sources: np.ndarray, options: ColorizationOptions) -> dict[str, Any]:
+    """Choose a robust observed-color medoid after rejecting luminance outliers."""
+    report = dict(requested=True, applied=False, maximum_observations=options.fusion_max_observations,
+                  minimum_observations=options.fusion_min_observations,
+                  points_with_multiple_observations=0, points_fused=0,
+                  points_using_best_observation_fallback=0, rejected_outlier_observations=0,
+                  method='top-quality reservoir; linear-RGB luminance outlier rejection; weighted observed-color medoid')
+    for offset in range(0, len(colors), options.chunk_size):
+        end = min(len(colors), offset + options.chunk_size)
+        weights = np.asarray(fusion_weights[offset:end])
+        counts = np.count_nonzero(weights > 0, axis=1)
+        report['points_with_multiple_observations'] += int(np.count_nonzero(counts >= 2))
+        eligible = np.flatnonzero(counts >= options.fusion_min_observations)
+        report['points_using_best_observation_fallback'] += int(np.count_nonzero(counts > 0))
+        if not len(eligible):
+            continue
+        candidate_weights = weights[eligible].astype(np.float32, copy=True)
+        candidate_colors = np.asarray(fusion_colors[offset:end][eligible])
+        active = candidate_weights > 0
+        linear = LINEAR[candidate_colors].astype(np.float32, copy=False)
+        luminance = linear @ np.array([.2126, .7152, .0722], dtype=np.float32)
+        luminance[~active] = np.nan
+        median = np.nanmedian(luminance, axis=1)
+        deviation = np.abs(luminance - median[:, None])
+        mad = np.nanmedian(deviation, axis=1)
+        threshold = np.maximum(.04, 3.0 * mad)
+        inlier = active & (deviation <= threshold[:, None])
+        # The median/MAD rule always retains a central observation, but require
+        # two agreeing views; otherwise preserve the legacy best observation.
+        consensus = np.count_nonzero(inlier, axis=1) >= 2
+        report['rejected_outlier_observations'] += int(np.count_nonzero(active & ~inlier))
+        if not consensus.any():
+            continue
+        eligible = eligible[consensus]
+        candidate_weights = candidate_weights[consensus]
+        candidate_colors = candidate_colors[consensus]
+        linear = linear[consensus]
+        inlier = inlier[consensus]
+        positive = np.where(inlier, candidate_weights, np.nan)
+        typical_weight = np.nanmedian(positive, axis=1)
+        robust_weights = np.where(inlier,
+                                  np.minimum(candidate_weights, 2 * typical_weight[:, None]), 0)
+        objectives = np.full(candidate_weights.shape, np.inf, dtype=np.float32)
+        for candidate in range(options.fusion_max_observations):
+            distance = np.abs(linear - linear[:, candidate:candidate + 1]).sum(axis=2)
+            objectives[:, candidate] = np.sum(distance * robust_weights, axis=1)
+        objectives[~inlier] = np.inf
+        chosen_slots = np.argmin(objectives, axis=1)
+        rows = np.arange(len(eligible))
+        chosen = offset + eligible
+        colors[chosen] = candidate_colors[rows, chosen_slots].astype(np.uint16) * 257
+        quality[chosen] = candidate_weights[rows, chosen_slots]
+        distances[chosen] = fusion_distances[chosen, chosen_slots]
+        sources[chosen] = fusion_sources[chosen, chosen_slots]
+        report['points_fused'] += len(chosen)
+        report['points_using_best_observation_fallback'] -= len(chosen)
+    report['applied'] = report['points_fused'] > 0
+    return report
+
+
 def _bounded_parallel_map(executor: ThreadPoolExecutor, function: Callable,
                           items: Iterable, width: int) -> Iterator:
     """Submit at most one worker-width group so cancellation stays responsive."""
@@ -483,8 +641,8 @@ def _output_header(source: laspy.LasHeader, merged_output: bool = False) -> lasp
     else:
         header.add_extra_dim(laspy.ExtraBytesParams("Colorized", "uint8", description="1=RGB observed; 0=unobserved"))
     for name, description in (
-        ("ColorConfidence", "RGB observation confidence"),
-        ("ColorDistance", "Winning camera distance (m)"),
+        ("ColorConfidence", "Selected RGB confidence"),
+        ("ColorDistance", "Selected camera distance (m)"),
     ):
         if merged_output:
             continue
@@ -498,7 +656,7 @@ def _output_header(source: laspy.LasHeader, merged_output: bool = False) -> lasp
             raise ColorizationError("Existing SourceFlight dimension must be uint16")
     else:
         header.add_extra_dim(laspy.ExtraBytesParams("SourceFlight", "uint16",
-                                                    description="Winning source flight (1-based)"))
+                                                    description="Selected source flight (1-based)"))
     if merged_output:
         header.remove_extra_dims([name for name in ("ColorConfidence", "ColorDistance")
                                   if name in header.point_format.extra_dimension_names])
@@ -514,6 +672,7 @@ def colorize_las(
     options: ColorizationOptions | None = None,
     progress: ProgressCallback | None = None,
     cancelled: Callable[[], bool] | None = None,
+    candidate_directory: str | Path | None = None,
 ) -> ColorizationResult:
     """Color an existing LAS/LAZ and atomically publish a new .las file.
 
@@ -528,6 +687,12 @@ def colorize_las(
     re-iterable source to run again. Cancellation is checked at each LAS chunk.
     """
     options = options or ColorizationOptions()
+    candidate_path = Path(candidate_directory).resolve() if candidate_directory is not None else None
+    if candidate_path is not None and options.multi_frame_fusion:
+        raise ColorizationError("Per-flight candidate shards currently require multi-frame fusion to be Off")
+    from .runtime import StageTimings, prefetch
+    timings = StageTimings()
+    processing_started = time.perf_counter()
     from .cuda_backend import (CudaBackendError, cuda_checkpoint,
                                cuda_projection_backend)
     acceleration = cuda_checkpoint().to_dict()
@@ -538,22 +703,32 @@ def colorize_las(
         raise ColorizationError("Output must use .las; this preserves geometry without compression dependencies")
     if not isinstance(calibration, Calibration) or (not calibration.validated and not options.experimental_calibration):
         raise ColorizationError("A validated RGB camera calibration is required")
-    cuda_backend, cuda_reason = cuda_projection_backend(calibration)
+    cuda_backend, cuda_reason = (cuda_projection_backend(calibration) if options.cuda_enabled else
+                                 (None,'CUDA disabled by custom hardware resource settings'))
     acceleration.update(
-        processing_backend='cuda_projection' if cuda_backend else 'cpu_reference',
+        processing_backend=('cuda_fusion' if cuda_backend and options.multi_frame_fusion else
+                            ('cuda_projection' if cuda_backend else 'cpu_reference')),
         cuda_acceleration_active=cuda_backend is not None,
         fallback_reason=cuda_reason,
         visibility_chunks=0,
         color_chunks=0,
         points_projected_for_visibility=0,
         points_processed_for_color=0,
+        cuda_streams=1 if cuda_backend is not None else 0,
+        bounded_prefetch_depth=2,
+        cpu_gpu_io_overlap=cuda_backend is not None,
+        selected_cuda_device=options.cuda_device_index if cuda_backend is not None else None,
     )
     acceleration['summary'] = (
-        f"CUDA projection enabled on {acceleration.get('device_name')}"
+        (f"CUDA device {options.cuda_device_index + 1} projection and fusion candidate collection enabled on {acceleration.get('device_name')}"
+         if cuda_backend and options.multi_frame_fusion else
+         f"CUDA device {options.cuda_device_index + 1} projection enabled on {acceleration.get('device_name')}")
         if cuda_backend else f"CPU fallback: {cuda_reason}")
     _emit(progress, "acceleration", **acceleration)
     if destination.exists() and not options.overwrite:
         raise ColorizationError("Output already exists; choose another file name")
+    if candidate_path is not None and candidate_path.exists():
+        raise ColorizationError("Candidate shard directory already exists")
     _check_cancel(cancelled)
     with laspy.open(source) as reader:
         original_header = copy.deepcopy(reader.header)
@@ -563,7 +738,9 @@ def colorize_las(
     header = _output_header(original_header, options.merged_output)
     destination.parent.mkdir(parents=True, exist_ok=True)
     use_xyz_cache = _use_xyz_cache(count, options)
-    required_bytes = count * (header.point_format.size + 14) + 64 * 1024**2
+    fusion_bytes = (count * options.fusion_max_observations * (3 + 4 + 4 + 2)
+                    if options.multi_frame_fusion else 0)
+    required_bytes = count * ((16 if candidate_path is not None else header.point_format.size + 14)) + fusion_bytes + 64 * 1024**2
     if shutil.disk_usage(destination.parent).free < required_bytes:
         raise ColorizationError(f"Insufficient output disk space; need about {required_bytes / 1024**3:.2f} GiB")
     received, used, rejected = 0, 0, 0
@@ -573,15 +750,36 @@ def colorize_las(
         corrected_observations=0, rejected_exposure_observations=0,
         minimum_model_confidence=None, fallback_reasons={},
         scope="batch-local radial response and matched per-frame exposure offsets")
+    fusion = dict(requested=options.multi_frame_fusion, applied=False,
+                  maximum_observations=options.fusion_max_observations,
+                  minimum_observations=options.fusion_min_observations,
+                  points_with_multiple_observations=0, points_fused=0,
+                  points_using_best_observation_fallback=0,
+                  rejected_outlier_observations=0,
+                  method=('top-quality reservoir; linear-RGB luminance outlier rejection; '
+                          'weighted observed-color medoid'))
     sample_ids = (np.linspace(0, count - 1, min(count, 8192), dtype=np.int64)
                   if options.illumination_balancing else np.empty(0, dtype=np.int64))
     sample_xyz = np.empty((len(sample_ids), 3))
     with tempfile.TemporaryDirectory(prefix=".elios-colorize-", dir=destination.parent) as scratch:
-        work = Path(scratch)
+        work = candidate_path if candidate_path is not None else Path(scratch)
+        if candidate_path is not None:
+            candidate_path.mkdir(parents=True, exist_ok=False)
         colors = np.memmap(work / "rgb.u16", mode="w+", dtype=np.uint16, shape=(count, 3))
         quality = np.memmap(work / "quality.f32", mode="w+", dtype=np.float32, shape=(count,))
         distances = np.memmap(work / "distance.f32", mode="w+", dtype=np.float32, shape=(count,))
         sources = np.memmap(work / "source.u16", mode="w+", dtype=np.uint16, shape=(count,))
+        fusion_colors = fusion_weights = fusion_distances = fusion_sources = None
+        if options.multi_frame_fusion:
+            shape = (count, options.fusion_max_observations)
+            fusion_colors = np.memmap(work / "fusion-rgb.u8", mode="w+", dtype=np.uint8,
+                                      shape=(*shape, 3))
+            fusion_weights = np.memmap(work / "fusion-weight.f32", mode="w+", dtype=np.float32,
+                                       shape=shape)
+            fusion_distances = np.memmap(work / "fusion-distance.f32", mode="w+", dtype=np.float32,
+                                         shape=shape)
+            fusion_sources = np.memmap(work / "fusion-source.u16", mode="w+", dtype=np.uint16,
+                                       shape=shape)
         # Freshly created mapped files are zero initialized by the operating system.
         active_cuda_batch = None
         try:
@@ -589,6 +787,7 @@ def colorize_las(
             # seek past distant/behind-camera chunks without decoding their XYZ.
             chunk_bounds: dict[int, np.ndarray] = {}
             xyz_cache = np.empty((count, 3), dtype=np.float64) if use_xyz_cache else None
+            indexing_started = time.perf_counter()
             for offset, xyz in _xyz_chunks(source, options.chunk_size):
                 _check_cancel(cancelled)
                 if not np.isfinite(xyz).all():
@@ -600,7 +799,10 @@ def colorize_las(
                     xyz_cache[offset:offset + len(xyz)] = xyz
                 _emit(progress, "indexing", points_processed=offset + len(xyz), point_count=count,
                       xyz_cache_used=use_xyz_cache, worker_threads=options.worker_threads)
-            stream = iter(frames)
+            timings.add('geometry_indexing', time.perf_counter() - indexing_started)
+            # Decode the next observations while the current batch is projected.
+            # This queue stays tiny because full-resolution RGB frames are large.
+            stream = iter(prefetch(frames, depth=2))
             batch_index = 0
             pool_context = (ThreadPoolExecutor(max_workers=options.worker_threads,
                                                thread_name_prefix='elios-project')
@@ -627,12 +829,14 @@ def colorize_las(
                 used += len(batch)
                 active_offsets = {offset for offset, bounds in chunk_bounds.items()
                                   if any(_chunk_may_be_visible(bounds, frame, calibration, options) for frame in batch)}
+                visibility_started = time.perf_counter()
                 cuda_batch = None
                 if cuda_backend is not None:
                     try:
                         cuda_batch = cuda_backend.begin_batch(batch, calibration, options)
                         active_cuda_batch = cuda_batch
-                        for offset, xyz in _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache):
+                        for offset, xyz in prefetch(
+                                _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache), 2):
                             _check_cancel(cancelled)
                             cuda_batch.visibility(xyz)
                             acceleration['visibility_chunks'] += 1
@@ -655,7 +859,8 @@ def colorize_las(
                         for frame in batch:
                             frame.depth.fill(np.inf)
                 if cuda_batch is None:
-                    for offset, xyz in _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache):
+                    for offset, xyz in prefetch(
+                            _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache), 2):
                         _check_cancel(cancelled)
                         if executor is None or len(batch) == 1:
                             for frame in batch:
@@ -669,8 +874,12 @@ def colorize_las(
                         for frame in batch:
                             frame.depth = cv2.erode(frame.depth, np.ones((size, size), np.uint8),
                                                     borderType=cv2.BORDER_CONSTANT, borderValue=float("inf"))
+                timings.add('cuda_visibility' if cuda_batch is not None else 'cpu_visibility',
+                            time.perf_counter() - visibility_started)
                 if options.illumination_balancing:
+                    illumination_started = time.perf_counter()
                     fit = _estimate_illumination(sample_xyz, batch, calibration, options)
+                    timings.add('illumination_fitting', time.perf_counter() - illumination_started)
                     illumination['overlap_sample_count'] += fit['overlap_sample_count']
                     key = 'accepted_batches' if fit['accepted'] else 'skipped_batches'
                     illumination[key] += 1
@@ -697,8 +906,56 @@ def colorize_las(
                                                 fallback_reason=cuda_reason,
                                                 summary=f'CPU fallback: {cuda_reason}')
                             _emit(progress, "acceleration", **acceleration)
-                chunks = _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache)
-                if cuda_batch is not None:
+                chunks = prefetch(_xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache), 2)
+                color_started = time.perf_counter()
+                if options.multi_frame_fusion:
+                    if cuda_batch is not None:
+                        for offset, xyz in chunks:
+                            try:
+                                length = len(xyz)
+                                corrected_count, rejected_count = cuda_batch.assign_fusion(
+                                    xyz, colors[offset:offset + length], quality[offset:offset + length],
+                                    distances[offset:offset + length], sources[offset:offset + length],
+                                    fusion_colors[offset:offset + length],
+                                    fusion_weights[offset:offset + length],
+                                    fusion_distances[offset:offset + length],
+                                    fusion_sources[offset:offset + length])
+                                acceleration['color_chunks'] += 1
+                                acceleration['points_processed_for_color'] += length * len(batch)
+                            except CudaBackendError as exc:
+                                cuda_batch.close()
+                                cuda_batch = active_cuda_batch = None
+                                cuda_backend = None
+                                cuda_reason = str(exc)
+                                acceleration.update(processing_backend='cpu_reference',
+                                                    cuda_acceleration_active=False,
+                                                    fallback_reason=cuda_reason,
+                                                    summary=f'CPU fallback: {cuda_reason}')
+                                _emit(progress, "acceleration", **acceleration)
+                                _, length, corrected_count, rejected_count = _assign_chunk_fusion(
+                                    offset, xyz, batch, colors, quality, distances, sources,
+                                    fusion_colors, fusion_weights, fusion_distances, fusion_sources,
+                                    calibration, options)
+                            illumination['corrected_observations'] += corrected_count
+                            illumination['rejected_exposure_observations'] += rejected_count
+                            _check_cancel(cancelled)
+                            _emit(progress, "colorizing", batch=batch_index,
+                                  points_processed=offset + length, point_count=count,
+                                  frames_received=received, frames_used=used)
+                    else:
+                        assign = lambda item: _assign_chunk_fusion(
+                            item[0], item[1], batch, colors, quality, distances, sources,
+                            fusion_colors, fusion_weights, fusion_distances, fusion_sources,
+                            calibration, options)
+                        completed_chunks = (map(assign, chunks) if executor is None else
+                                            _bounded_parallel_map(executor, assign, chunks, options.worker_threads))
+                        for offset, length, corrected_count, rejected_count in completed_chunks:
+                            illumination['corrected_observations'] += corrected_count
+                            illumination['rejected_exposure_observations'] += rejected_count
+                            _check_cancel(cancelled)
+                            _emit(progress, "colorizing", batch=batch_index, points_processed=offset + length,
+                                  point_count=count, frames_received=received, frames_used=used)
+                elif cuda_batch is not None:
                     for offset, xyz in chunks:
                         if cuda_batch is not None:
                             try:
@@ -745,6 +1002,9 @@ def colorize_las(
                         _check_cancel(cancelled)
                         _emit(progress, "colorizing", batch=batch_index, points_processed=offset + length,
                               point_count=count, frames_received=received, frames_used=used)
+                timings.add('cpu_fusion_candidates' if options.multi_frame_fusion else
+                            ('cuda_color_assignment' if cuda_batch is not None else 'cpu_color_assignment'),
+                            time.perf_counter() - color_started)
                 if cuda_batch is not None:
                     cuda_batch.close()
                     cuda_batch = active_cuda_batch = None
@@ -753,8 +1013,40 @@ def colorize_las(
             if used == 0:
                 raise ColorizationError("No usable video observations; check frame timing, image quality and calibration")
             _check_cancel(cancelled)
+            if candidate_path is not None:
+                for array in (colors, quality, distances, sources):
+                    array.flush()
+                colored = sum(int(np.count_nonzero(quality[offset:offset + options.chunk_size] > 0))
+                              for offset in range(0, count, options.chunk_size))
+                timings.add('total', time.perf_counter() - processing_started)
+                metadata = {
+                    'format': 'elios-color-candidates-v1', 'point_count': count,
+                    'frames_received': received, 'frames_used': used, 'frames_rejected': rejected,
+                    'colored_point_count': colored, 'source_flight_values_preserved': True,
+                    'acceleration': acceleration, 'performance': timings.to_dict(),
+                }
+                (candidate_path / 'candidate.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+                result = ColorizationResult(candidate_path, count, colored, received, used, rejected,
+                                             experimental_calibration=not calibration.validated,
+                                             xyz_cache_used=use_xyz_cache,
+                                             illumination_balancing=illumination,
+                                             multi_frame_fusion=fusion,
+                                             acceleration=acceleration,
+                                             performance=timings.to_dict())
+                _emit(progress, "candidate_complete", **result.to_dict())
+                return result
+            if options.multi_frame_fusion:
+                fusion_started = time.perf_counter()
+                _emit(progress, "fusion", points_processed=0, point_count=count)
+                fusion = _finalize_fusion(colors, quality, distances, sources,
+                                          fusion_colors, fusion_weights, fusion_distances,
+                                          fusion_sources, options)
+                _emit(progress, "fusion", points_processed=count, point_count=count, **fusion)
+                timings.add('final_fusion', time.perf_counter() - fusion_started)
+                _check_cancel(cancelled)
             temporary_output = work / "result.las"
             colored = 0
+            writing_started = time.perf_counter()
             with laspy.open(source) as reader, laspy.open(temporary_output, mode="w", header=header) as writer:
                 offset = 0
                 for original_points in reader.chunk_iterator(options.chunk_size):
@@ -778,6 +1070,7 @@ def colorize_las(
                           colored_point_count=colored, frames_used=used)
                 if original_header.evlrs:
                     writer.write_evlrs(original_header.evlrs)
+            timings.add('las_writing', time.perf_counter() - writing_started)
             if colored == 0:
                 raise ColorizationError("No LAS points received color; verify LAS/pose coordinates, camera calibration and time synchronization")
             _check_cancel(cancelled)
@@ -792,10 +1085,13 @@ def colorize_las(
             else:
                 os.rename(temporary_output, destination)
             illumination['applied'] = illumination['corrected_observations'] > 0
+            timings.add('total', time.perf_counter() - processing_started)
             result = ColorizationResult(destination, count, colored, received, used, rejected,
                                          experimental_calibration=not calibration.validated,
                                          xyz_cache_used=use_xyz_cache, illumination_balancing=illumination,
-                                         acceleration=acceleration)
+                                         multi_frame_fusion=fusion,
+                                         acceleration=acceleration,
+                                         performance=timings.to_dict())
             _emit(progress, "complete", **result.to_dict())
             return result
         finally:
@@ -806,3 +1102,96 @@ def colorize_las(
             quality._mmap.close()
             distances._mmap.close()
             sources._mmap.close()
+            for array in (fusion_colors, fusion_weights, fusion_distances, fusion_sources):
+                if array is not None:
+                    array._mmap.close()
+
+
+def reduce_candidate_shards(input_path: str | Path, output_path: str | Path,
+                            candidate_directories: Iterable[str | Path], *,
+                            chunk_size: int = 250_000,
+                            progress: ProgressCallback | None = None,
+                            cancelled: Callable[[], bool] | None = None) -> ColorizationResult:
+    """Deterministically reduce independent flight winners onto unchanged geometry."""
+    from .runtime import StageTimings
+    source = Path(input_path).resolve()
+    destination = Path(output_path).resolve()
+    shards = [Path(path).resolve() for path in candidate_directories]
+    if not shards:
+        raise ColorizationError('At least one candidate shard is required')
+    if destination.exists():
+        raise ColorizationError('Output already exists; choose another file name')
+    with laspy.open(source) as reader:
+        original_header = copy.deepcopy(reader.header)
+    count = int(original_header.point_count)
+    header = _output_header(original_header, merged_output=True)
+    opened = []
+    metadata = []
+    expected_files = (('rgb.u16', np.uint16, (count, 3)),
+                      ('quality.f32', np.float32, (count,)),
+                      ('distance.f32', np.float32, (count,)),
+                      ('source.u16', np.uint16, (count,)))
+    try:
+        for shard in shards:
+            info = json.loads((shard / 'candidate.json').read_text(encoding='utf-8'))
+            if info.get('format') != 'elios-color-candidates-v1' or info.get('point_count') != count:
+                raise ColorizationError(f'Candidate shard does not match merged geometry: {shard}')
+            arrays = tuple(np.memmap(shard / name, mode='r', dtype=dtype, shape=shape)
+                           for name, dtype, shape in expected_files)
+            opened.append(arrays)
+            metadata.append(info)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        timings = StageTimings()
+        started = time.perf_counter()
+        with tempfile.TemporaryDirectory(prefix='.elios-reduce-', dir=destination.parent) as scratch:
+            temporary = Path(scratch) / 'result.las'
+            colored = 0
+            with laspy.open(source) as reader, laspy.open(temporary, mode='w', header=header) as writer:
+                offset = 0
+                for original_points in reader.chunk_iterator(chunk_size):
+                    _check_cancel(cancelled)
+                    length = len(original_points)
+                    best_colors = np.zeros((length, 3), dtype=np.uint16)
+                    best_quality = np.zeros(length, dtype=np.float32)
+                    best_sources = np.zeros(length, dtype=np.uint16)
+                    # Strict greater-than and source order reproduce the existing
+                    # chronological winner policy, including deterministic ties.
+                    for colors, quality, _distances, sources in opened:
+                        candidate_quality = np.asarray(quality[offset:offset + length])
+                        better = candidate_quality > best_quality
+                        if better.any():
+                            best_quality[better] = candidate_quality[better]
+                            best_colors[better] = colors[offset:offset + length][better]
+                            best_sources[better] = sources[offset:offset + length][better]
+                    points = laspy.PackedPointRecord.from_point_record(original_points, header.point_format)
+                    points.red, points.green, points.blue = best_colors.T
+                    observed = best_quality > 0
+                    points['Colorized'] = observed.astype(np.uint8)
+                    points['SourceFlight'] = best_sources
+                    writer.write_points(points)
+                    colored += int(np.count_nonzero(observed))
+                    offset += length
+                    _emit(progress, 'reducing_candidates', points_processed=offset,
+                          point_count=count, colored_point_count=colored)
+                if original_header.evlrs:
+                    writer.write_evlrs(original_header.evlrs)
+            _check_cancel(cancelled)
+            os.rename(temporary, destination)
+        timings.add('candidate_reduction', time.perf_counter() - started)
+        acceleration = {
+            'processing_backend': 'parallel_flight_map_reduce',
+            'cuda_acceleration_active': any(bool(item.get('acceleration', {}).get('cuda_acceleration_active'))
+                                            for item in metadata),
+            'candidate_shards': len(shards),
+            'summary': f'Reduced {len(shards)} independent flight candidate shards',
+        }
+        return ColorizationResult(
+            destination, count, colored,
+            sum(int(item['frames_received']) for item in metadata),
+            sum(int(item['frames_used']) for item in metadata),
+            sum(int(item['frames_rejected']) for item in metadata),
+            acceleration=acceleration, performance=timings.to_dict())
+    finally:
+        for arrays in opened:
+            for array in arrays:
+                array._mmap.close()

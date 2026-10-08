@@ -6,25 +6,62 @@ from elios_colorizer.service import (_projection_progress_detail, find_cloudcomp
 import laspy
 import numpy as np
 import pytest
+import threading
+import time
 from pathlib import Path
 
 
 def test_merged_processing_tuning_uses_safe_larger_batches():
     gib = 1024**3
     large = merged_processing_tuning(145_000_000, 20 * gib, 32)
-    assert large == {'worker_threads': 12, 'frame_batch_size': 24}
+    assert large == {'worker_threads': 30, 'frame_batch_size': 24}
     constrained = merged_processing_tuning(145_000_000, 4 * gib, 8)
-    assert constrained == {'worker_threads': 4, 'frame_batch_size': 4}
+    assert constrained == {'worker_threads': 6, 'frame_batch_size': 4}
     modest = merged_processing_tuning(20_000_000, 10 * gib, 12)
-    assert modest == {'worker_threads': 6, 'frame_batch_size': 12}
+    assert modest == {'worker_threads': 10, 'frame_batch_size': 12}
     assert processing_tuning(20_000_000, 10 * gib, 12) == modest
     cuda = processing_tuning(47_330_435, 24 * gib, 32, cuda_acceleration=True)
-    assert cuda == {'worker_threads': 12, 'frame_batch_size': 24}
+    assert cuda == {'worker_threads': 30, 'frame_batch_size': 24}
 
 
 def test_projection_progress_detail_is_compact():
     assert _projection_progress_detail(48, 1011, 66, 1112, 16_000_000, 47_330_435) == (
         '48/~1,011 views · 66/1,112 reviewed · 16.0M/47.3M points')
+
+
+def test_separate_flights_are_scheduled_concurrently(tmp_path, monkeypatch):
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+
+    def fake_inspect(*_args, **_kwargs):
+        return {'ready': True, 'flights': [
+            {'point_count': 10, 'estimated_views': 2},
+            {'point_count': 10, 'estimated_views': 2},
+        ]}
+
+    def fake_run(_folder, output, *_args, **_kwargs):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        time.sleep(.05)
+        with lock:
+            active -= 1
+        return {'output': output, 'total_points': 10, 'colored_points': 8,
+                'multi_frame_fusion': {'applied': False}}
+
+    monkeypatch.setattr('elios_colorizer.service.inspect_sources', fake_inspect)
+    monkeypatch.setattr('elios_colorizer.service.run_colorization', fake_run)
+    monkeypatch.setattr('elios_colorizer.colorize._available_memory_bytes', lambda: 64 * 1024**3)
+    monkeypatch.setattr('elios_colorizer.cuda_backend.cuda_checkpoint',
+                        lambda: type('Checkpoint', (), {'available': False, 'device_count': 0})())
+    result = run_workflow([
+        {'folder': 'first', 'name': 'First'},
+        {'folder': 'second', 'name': 'Second'},
+    ], str(tmp_path / 'outputs'), mode='separate')
+    assert maximum == 2
+    assert result['total_points'] == 20
 
 
 @pytest.mark.parametrize('balancing', [False, True])
@@ -77,11 +114,16 @@ def test_advanced_processing_settings_are_applied_and_reported(tmp_path, monkeyp
     monkeypatch.setenv('ELIOS_COLORIZER_CACHE', str(tmp_path / 'advanced-cache'))
     result = run_colorization(str(source), str(tmp_path / 'advanced.las'),
                               sample_interval_s=.5, image_border_fraction=.05,
-                              minimum_sharpness=0)
+                              minimum_sharpness=0, multi_frame_fusion=True)
     report = json.loads(Path(result['report']).read_text())
     assert report['summary']['frames']['sampling_frequency_hz'] == 2
     assert report['summary']['user_settings']['image_edge_exclusion_percent'] == 5
     assert report['summary']['user_settings']['blur_rejection'] == 'Off'
+    assert report['summary']['user_settings']['multi_frame_fusion_requested']
+    assert report['summary']['user_settings']['multi_frame_fusion_applied']
+    assert report['processing_configuration']['multi_frame_fusion']
+    assert report['result']['multi_frame_fusion']['requested']
+    assert report['result']['multi_frame_fusion']['points_fused'] == 3
     assert report['processing_configuration']['minimum_sharpness'] == 0
     with pytest.raises(ValueError, match='between 0.25 and 30'):
         run_colorization(str(source), str(tmp_path / 'too-fast.las'), sample_interval_s=.01)
@@ -144,7 +186,7 @@ def test_complete_two_flight_merged_workflow(tmp_path, monkeypatch, balancing, m
                           str(tmp_path / 'merged.las'), mode='merge',
                           alignment_method=method, merged_source=str(source_merged),
                           progress=lambda *args: updates.append(args), illumination_balancing=balancing,
-                          start_s=0, end_s=1.5)
+                          multi_frame_fusion=True, start_s=0, end_s=1.5)
     merged = laspy.read(result['output'])
     assert result['colored_points'] == 6
     assert result['total_points'] == 8
@@ -157,6 +199,7 @@ def test_complete_two_flight_merged_workflow(tmp_path, monkeypatch, balancing, m
     assert report['summary']['mode'] == 'merged'
     assert report['summary']['flight_count'] == 2
     assert report['result']['illumination_balancing']['requested'] == balancing
+    assert report['result']['multi_frame_fusion']['requested']
     assert report['summary']['user_settings']['time_range_relative_seconds'] == {
         'enabled': True, 'start': 0.0, 'end': 1.5}
     assert all(row['time_range_applied_seconds']['end'] == 1.5 for row in report['flights'])
@@ -186,6 +229,29 @@ def test_duplicate_names_are_rejected_and_source_notes_are_collapsed(monkeypatch
     assert warnings[0]['details'][0].startswith('Upper:')
 
 
+def test_merged_best_view_uses_parallel_flight_map_reduce(tmp_path, monkeypatch):
+    import json
+    first = create_fixture(tmp_path / 'parallel-first')
+    second = create_fixture(tmp_path / 'parallel-second')
+    metadata = json.loads((second / 'flight.json').read_text())
+    metadata['id'] = 'parallel-second-flight'
+    (second / 'flight.json').write_text(json.dumps(metadata))
+    monkeypatch.setenv('ELIOS_COLORIZER_CACHE', str(tmp_path / 'parallel-cache'))
+    from elios_colorizer.merged import merge_geometry
+    geometry = merge_geometry([first / 'test.las', second / 'test.las'],
+                              [np.eye(4), np.eye(4)], tmp_path / 'parallel-source.las')
+    result = run_workflow([
+        {'folder': str(first), 'name': 'First'},
+        {'folder': str(second), 'name': 'Second'},
+    ], str(tmp_path / 'parallel-output.las'), mode='merge', alignment_method='manual',
+       merged_source=str(geometry), multi_frame_fusion=False)
+    report = json.loads(Path(result['report']).read_text())
+    parallel = report['processing_configuration']['parallel_execution']
+    assert parallel['strategy'] == 'parallel_flight_map_reduce'
+    assert parallel['candidate_shards'] == 2
+    assert report['summary']['processing_strategy'] == 'parallel_flight_map_reduce'
+
+
 def test_cloudcompare_is_discovered_from_path(tmp_path, monkeypatch):
     executable = tmp_path / 'CloudCompare.exe'
     executable.touch()
@@ -203,10 +269,13 @@ def test_separate_outputs_use_flight_numbers_and_names(tmp_path, monkeypatch, ba
     (second / 'flight.json').write_text(json.dumps(metadata))
     monkeypatch.setenv('ELIOS_COLORIZER_CACHE', str(tmp_path / 'cache'))
     output = tmp_path / 'outputs'
+    updates = []
     result = run_workflow([
         {'folder': str(first), 'name': 'Upper Wall'},
         {'folder': str(second), 'name': 'Bottom Cap'},
-    ], str(output), mode='separate', illumination_balancing=balancing, start_s=0, end_s=1.5)
+    ], str(output), mode='separate', illumination_balancing=balancing,
+       multi_frame_fusion=True, start_s=0, end_s=1.5,
+       progress=lambda stage, fraction, message: updates.append((stage, fraction, message)))
     assert [Path(path).name for path in result['outputs']] == [
         'Flight 01 - Upper Wall - Colorized.las',
         'Flight 02 - Bottom Cap - Colorized.las',
@@ -215,8 +284,13 @@ def test_separate_outputs_use_flight_numbers_and_names(tmp_path, monkeypatch, ba
     assert next(iter(report)) == 'summary'
     assert report['summary']['mode'] == 'separate_outputs'
     assert report['summary']['flight_count'] == 2
+    assert report['summary']['user_settings']['multi_frame_fusion_requested']
     assert report['summary']['user_settings']['time_range_relative_seconds'] == {
         'enabled': True, 'start': 0.0, 'end': 1.5}
+    assert result['processing_strategy'] == 'parallel_separate_outputs'
+    assert [fraction for _, fraction, _ in updates] == sorted(fraction for _, fraction, _ in updates)
+    flight_updates = [item for item in updates if item[0].startswith(('Upper Wall:', 'Bottom Cap:'))]
+    assert flight_updates and all('· flight ' in message for _, _, message in flight_updates)
 
 
 @pytest.mark.parametrize('balancing', [False, True])

@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 
 
-ABI_VERSION = 2
+ABI_VERSION = 4
 
 
 class _NativeProbe(ctypes.Structure):
@@ -147,6 +147,7 @@ class _ProjectionConfig(ctypes.Structure):
     _pack_ = 1
     _fields_ = [
         ('abi_version', ctypes.c_uint32),
+        ('selected_device', ctypes.c_int32),
         ('image_width', ctypes.c_int32), ('image_height', ctypes.c_int32),
         ('depth_width', ctypes.c_int32), ('depth_height', ctypes.c_int32),
         ('distortion_model', ctypes.c_int32), ('coefficient_count', ctypes.c_int32),
@@ -214,6 +215,15 @@ def _bind_projection_api(library: Any) -> None:
         ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
         _ERROR_POINTER, ctypes.c_uint32]
     library.elios_cuda_assign.restype = ctypes.c_int
+    library.elios_cuda_fusion_assign.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_double), ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint16),
+        ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint16), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+        _ERROR_POINTER, ctypes.c_uint32]
+    library.elios_cuda_fusion_assign.restype = ctypes.c_int
     library.elios_cuda_batch_destroy.argtypes = [ctypes.c_void_p]
     library.elios_cuda_batch_destroy.restype = None
 
@@ -254,7 +264,7 @@ class CudaProjectionBatch:
         padded = coefficients + [0.] * (12 - len(coefficients))
         depth_height, depth_width = frames[0].depth.shape
         config = _ProjectionConfig(
-            ABI_VERSION, calibration.image_width, calibration.image_height,
+            ABI_VERSION, options.cuda_device_index, calibration.image_width, calibration.image_height,
             depth_width, depth_height, model, len(coefficients),
             calibration.fx, calibration.fy, calibration.cx, calibration.cy,
             (ctypes.c_double * 12)(*padded),
@@ -325,6 +335,35 @@ class CudaProjectionBatch:
             ctypes.byref(corrected), ctypes.byref(rejected))
         return int(corrected.value), int(rejected.value)
 
+    def assign_fusion(self, xyz: np.ndarray, colors: np.ndarray, quality: np.ndarray,
+                      distances: np.ndarray, sources: np.ndarray,
+                      fusion_colors: np.ndarray, fusion_weights: np.ndarray,
+                      fusion_distances: np.ndarray,
+                      fusion_sources: np.ndarray) -> tuple[int, int]:
+        points = self._xyz(xyz)
+        arrays = (colors, quality, distances, sources, fusion_colors,
+                  fusion_weights, fusion_distances, fusion_sources)
+        if not all(array.flags.c_contiguous for array in arrays):
+            raise CudaBackendError('CUDA fusion output slices must be contiguous')
+        slots = fusion_weights.shape[1]
+        if fusion_colors.shape != (len(points), slots, 3):
+            raise CudaBackendError('CUDA fusion candidate arrays have incompatible shapes')
+        corrected = ctypes.c_uint64()
+        rejected = ctypes.c_uint64()
+        _native_call(
+            self.library.elios_cuda_fusion_assign, self.context,
+            points.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), len(points),
+            colors.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            quality.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            sources.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            fusion_colors.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            fusion_weights.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            fusion_distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            fusion_sources.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)), slots,
+            ctypes.byref(corrected), ctypes.byref(rejected))
+        return int(corrected.value), int(rejected.value)
+
     def close(self) -> None:
         if self.context:
             self.library.elios_cuda_batch_destroy(self.context)
@@ -359,6 +398,11 @@ def cuda_checkpoint() -> CudaCheckpoint:
     """Run once per process for the current override/disable configuration."""
     return _probe_cached(os.environ.get('ELIOS_COLORIZER_DISABLE_CUDA'),
                          os.environ.get('ELIOS_COLORIZER_CUDA_PROBE'))
+
+
+def refresh_cuda_checkpoint() -> CudaCheckpoint:
+    _probe_cached.cache_clear()
+    return cuda_checkpoint()
 
 
 def write_cuda_checkpoint(directory: str | Path) -> Path:

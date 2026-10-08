@@ -124,6 +124,12 @@ def run(directory):
         np.testing.assert_array_equal(original[name], colored[name])
     assert list(colored.Colorized) == [1, 1, 1, 0], colored.Colorized
     assert np.all(colored.red[:3] > colored.blue[:3])
+    fusion_result = run_colorization(
+        str(source), str(directory / 'synthetic_fused.las'),
+        sample_interval_s=.25, multi_frame_fusion=True)
+    if not fusion_result['multi_frame_fusion']['requested']:
+        raise RuntimeError('Packaged multi-frame fusion path was not enabled.')
+    result['multi_frame_fusion_check'] = fusion_result['multi_frame_fusion']
     # Render the real Qt widget tree as a packaging/layout smoke test.
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     from PySide6.QtWidgets import QApplication

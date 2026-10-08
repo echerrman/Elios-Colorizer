@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml?query=branch%3Amain"><img alt="Tests" src="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.3.1"><img alt="Release v1.3.1" src="https://img.shields.io/badge/release-v1.3.1-2f6f89"></a>
+  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.4.0"><img alt="Release v1.4.0" src="https://img.shields.io/badge/release-v1.4.0-2f6f89"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2f6f89"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2f6f89">
   <img alt="Local processing" src="https://img.shields.io/badge/processing-local-187548">
@@ -34,8 +34,8 @@ native flight telemetry, and recorded 4K video. It preserves unobserved geometry
 marks every point with an explicit colorization status, and performs all work on
 the local computer. Flight data is not uploaded to a cloud service.
 
-> **Version 1.3.1:** reusable processing presets and optional elapsed-time ranges
-> complement the advanced RGB sampling, edge-exclusion, and blur controls.
+> **Version 1.4:** optional robust multi-frame fusion rejects color outliers and
+> combines overlapping RGB evidence while preserving the original mode as the default.
 
 ## Install
 
@@ -96,7 +96,15 @@ correction, and observation scoring in bounded batches. The application falls
 back automatically to the CPU implementation and independently chooses between
 an in-memory coordinate cache and a bounded-memory streaming path.
 
+Optional [multi-frame fusion](docs/MULTI_FRAME_FUSION.md) keeps CUDA-accelerated
+visibility when available, then performs deterministic robust fusion on the CPU.
+Ordinary multi-flight merged processing can colorize flights concurrently against
+the same immutable merged point indices, then deterministically reduce their
+candidates into one final LAS. CPU-only, single-GPU, and multi-GPU machines use
+the same selection rules; only the execution plan changes.
+
 [Read the synchronization design →](docs/TIME_SYNCHRONIZATION.md)
+[Read the parallel processing design →](docs/PARALLEL_PROCESSING.md)
 
 ## Output
 
@@ -175,6 +183,19 @@ Elios Colorizer is available under the [MIT License](LICENSE).
 Elios, Elios 3, Inspector, and Flyability are trademarks of their respective
 owners. This independent open-source project is not affiliated with, sponsored
 by, or endorsed by Flyability.
+
+### v1.4.0
+
+Version 1.4.0 adds optional robust multi-frame color fusion. It retains several
+strong observations per point, rejects luminance outliers such as glare, and
+selects an actual observed color supported by overlapping views. Fusion is Off
+by default, leaving the established best-observation process unchanged.
+The engine also adds resource-aware CPU scaling, CUDA fusion, bounded CPU/GPU
+prefetch, and concurrent multi-flight processing for separate and merged
+workflows. The refreshed responsive desktop interface includes per-flight
+progress, persistent adaptive or manual hardware budgets, improved drag and
+drop, refined light and dark themes, and a staged startup screen. See
+[Parallel processing](docs/PARALLEL_PROCESSING.md).
 
 ### v1.3.1
 

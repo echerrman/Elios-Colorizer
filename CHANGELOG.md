@@ -5,6 +5,52 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-08
+
+### Added
+
+- Added optional robust multi-frame color fusion, disabled by default, which
+  retains up to five strong observations per point, rejects luminance outliers,
+  and selects a weighted observed-color medoid.
+- Added fusion diagnostics, fallback counts, and outlier statistics to every
+  processing report.
+- Added CUDA fusion candidate collection with verified CPU fallback.
+- Added resource-aware CPU scaling, bounded CPU/GPU prefetch, concurrent flight
+  scheduling, resource plans, and per-stage performance timings.
+- Added deterministic per-flight map/reduce colorization for merged best-view
+  workflows, including adaptive CPU, single-GPU, and multi-GPU scheduling.
+- Added live GUI feedback for hardware planning, concurrent flight jobs, and
+  final cross-flight color selection.
+- Added an expandable per-flight progress panel with independently tracked
+  stages and percentages during parallel processing.
+- Added a responsive desktop layout: compact windows use the familiar vertical
+  workflow, while wide windows use a centered two-column workspace.
+- Added a persistent processing footer, processing focus mode, visible setting
+  chips, preflight workload/resource estimates, output filename previews, and a
+  concise post-run results card.
+- Added collapsible, reorderable, and duplicable flight cards; multi-folder and
+  drag-and-drop flight entry; clickable readiness fixes; and per-flight output
+  actions as parallel jobs complete.
+- Reorganized Advanced Processing Settings into clear Frame Selection, Color
+  Quality, and Time Range groups, and improved keyboard navigation, focus
+  indicators, accessible names, and shortcuts.
+- Added persistent hardware-resource settings with recommended adaptive mode,
+  manual CPU/RAM/GPU/VRAM/concurrency budgets, hardware refresh, and high-load
+  warnings.
+- Added a deliberate staged startup screen while the fully laid-out main window
+  remains hidden, preventing partially rendered interface flashes at launch.
+- Added targeted folder and merged-LAS drag-and-drop feedback, an Import Flights
+  action, compact reordering controls, and clearer processing-setting summaries.
+
+### Changed
+
+- Fusion mode retains views more frequently so useful overlapping color
+  evidence reaches the fusion stage. The existing best-observation mode keeps
+  its previous view-selection and colorization behavior unchanged.
+- Refined the light and dark themes across the main window and settings dialogs,
+  including higher contrast, responsive alignment, compact dialog layouts, and
+  consistent controls.
+
 ## [1.3.1] - 2026-10-05
 
 ### Added
@@ -102,7 +148,8 @@ project follows [Semantic Versioning](https://semver.org/).
   RGB-video ingestion.
 - Explicit `Colorized` output attribute and deterministic packaged self-test.
 
-[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/echerrman/Elios-Colorizer/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.1.0...v1.2.0

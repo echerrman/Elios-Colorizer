@@ -51,6 +51,11 @@ Open **Advanced processing settings** to adjust settings for the current session
 - **Image edge exclusion** ignores a 0–15% border around every frame; the
   default is 2%.
 - **Blur rejection** can be Off, Normal, or Strong; the default is Normal.
+- **Robust multi-frame color fusion** retains up to five strong RGB observations
+  per point, rejects brightness outliers, and chooses an actual observed color
+  supported by the available views. It requires at least three observations;
+  otherwise that point uses the normal best-observation result. Fusion is Off by
+  default and uses additional temporary disk space.
 - **Process only a time range** limits RGB observations to start/end times
   elapsed from each flight's first synchronized video frame. Leave **Through
   end of video** selected to adapt automatically to each flight's duration.
@@ -79,3 +84,30 @@ calibration identity, timing checks, processing configuration, warnings, and
 coverage statistics needed to reproduce or diagnose the result. A compact
 `summary` section appears first with the output, coverage, runtime, frame counts,
 and user-selected processing settings.
+
+During multi-flight processing, expand **Flight progress** to see the current
+stage and percentage for each flight while the main bar shows weighted overall
+progress. On wide windows, the application automatically places flight setup and
+readiness beside processing controls; narrower windows retain the vertical
+workflow. No setting is required when resizing the window.
+
+## Desktop workflow conveniences
+
+- Drag flight folders onto the window or use **Add several folders** to populate
+  a multi-flight job. Flight cards can be collapsed, reordered, or duplicated.
+- Missing readiness items provide **Go to input** actions that expand and focus
+  the related control.
+- The processing section shows the active advanced settings, estimated sampled
+  frames, point count, recommended free disk space, detected CPU/CUDA resources,
+  intended parallel strategy, and proposed output filenames before a run.
+- Existing output conflicts are identified before processing can start.
+- During processing, setup sections collapse into a focused view while the Run,
+  Cancel, overall progress, elapsed time, and ETA controls remain visible in the
+  bottom bar. In separate-output mode, an individual completed flight can be
+  opened while other flights continue.
+- On completion, the results card summarizes coverage, runtime, frame usage,
+  strategy, and warnings, with direct output and report actions.
+
+Keyboard shortcuts include `Ctrl+Shift+A` to add a flight, `Ctrl+R` to refresh
+checks, `Ctrl+,` for Advanced Processing Settings, and `Ctrl+Enter` to start an
+available run.

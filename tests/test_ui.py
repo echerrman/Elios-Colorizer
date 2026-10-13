@@ -17,7 +17,8 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QGroupBox
 
 import elios_colorizer.ui as ui_module
-from elios_colorizer.ui import MainWindow
+from elios_colorizer.inspector_discovery import InspectorAsset, InspectorFlight, InspectorInspection
+from elios_colorizer.ui import InspectorAssetDialog, MainWindow
 
 
 @pytest.fixture(scope="module")
@@ -152,7 +153,8 @@ def test_action_buttons_and_color_balance_placeholder(ui):
     assert second.remove_button.text() == "Remove"
     assert second.duplicate_button.text() == "Duplicate"
     assert second.up_button.width() == second.down_button.width() == 38
-    assert window.bulk_add_button.text() == "Import Flights…"
+    assert window.asset_import_button.text() == "Import Inspector Asset…"
+    assert window.bulk_add_button.text() == "Import Flight Folders…"
     assert not window.bulk_add_button.icon().isNull()
     assert "↻" in window.refresh_button.text()
     assert window.color_balance_check.isEnabled()
@@ -209,9 +211,13 @@ def test_startup_splash_has_visible_staged_progress(app):
 
 def test_flight_controls_remain_aligned_across_window_sizes(ui, app):
     window = ui(FakeBackend())
+    assert window.flight_rows[0].readiness_badge.text()=="NOT CHECKED"
+    assert "#7d8e9b" in window.flight_rows[0].readiness_badge.styleSheet()
     window._add_flight(trigger=False); window._add_flight(trigger=False)
     window.flight_rows[1].set_readiness({"ready": True, "point_count": 12, "video_duration_s": 8})
     window.flight_rows[2].set_readiness({"ready": False, "point_count": 12, "video_duration_s": 8})
+    assert "#2e9d61" in window.flight_rows[1].readiness_badge.styleSheet()
+    assert "#b45f36" in window.flight_rows[2].readiness_badge.styleSheet()
     for width in (820, 1100, 1600):
         window.resize(width, 820); window._apply_responsive_layout(width); window.show(); QApplication.processEvents()
         assert len({row.up_button.width() for row in window.flight_rows}) == 1
@@ -273,6 +279,49 @@ def test_flight_cards_support_bulk_add_collapse_duplicate_and_reorder(ui, tmp_pa
     assert duplicate.folder_edit.text() == str(first_folder)
     window._move_flight(duplicate, -1)
     assert window.flight_rows[1] is duplicate
+
+
+def test_inspector_asset_dialog_selects_human_readable_flights(app, tmp_path):
+    flight=InspectorFlight("flight-id","inspection-id","Flight 1",tmp_path/"flight-id",datetime_utc="2026-08-06T12:00:00Z",duration=91,flags={"thermal_available":True})
+    inspection=InspectorInspection("inspection-id","asset-id","Inspection 2026.08.06",tmp_path/"inspection-id",(flight,))
+    asset=InspectorAsset("asset-id","Bow Tank",tmp_path/"asset-id",tmp_path,(inspection,),())
+    dialog=InspectorAssetDialog(asset)
+    try:
+        assert dialog.tree.topLevelItem(0).text(0)=="Inspection 2026.08.06"
+        assert dialog.tree.topLevelItem(0).child(0).text(0)=="Flight 1"
+        assert "Thermal" in dialog.tree.topLevelItem(0).child(0).text(3)
+        assert not dialog.import_button.isEnabled()
+        dialog.select_all_button.click();QApplication.processEvents()
+        assert dialog.import_button.isEnabled()
+        assert dialog.selected_flights()==[(flight,"Inspection 2026.08.06")]
+        assert dialog.import_button.text()=="Continue"
+        dialog.import_button.click();QApplication.processEvents()
+        assert dialog.pages.currentIndex()==1
+        assert dialog.import_button.text()=="Import flights"
+        export=tmp_path/"flight-export";export.mkdir();dialog._export_edits[flight.id].path_dropped.emit(str(export))
+        assert dialog.import_selections()==[(flight,"Inspection 2026.08.06",str(export))]
+        dialog.back_button.click();QApplication.processEvents()
+        assert dialog.pages.currentIndex()==0
+    finally:dialog.close();dialog.deleteLater()
+
+
+def test_inspector_asset_dialog_formats_inspector_epoch_and_microseconds():
+    assert InspectorAssetDialog._date_text(1787250475)=="2026-08-20 18:27 UTC"
+    assert InspectorAssetDialog._date_text("2026-08-20T15:47:55Z")=="2026-08-20 15:47:55 UTC"
+    assert InspectorAssetDialog._duration_text(617_000_000)=="10:17"
+    assert InspectorAssetDialog._duration_text(1_066_000_000)=="17:46"
+    assert InspectorAssetDialog._duration_text(91)=="1:31"
+
+
+def test_discovered_flights_use_existing_rows_and_disambiguate_names(ui, tmp_path):
+    window=ui(FakeBackend());first=InspectorFlight("one","i1","Flight 1",tmp_path/"one");second=InspectorFlight("two","i2","Flight 1",tmp_path/"two")
+    export=tmp_path/"one-export";export.mkdir();window._add_discovered_flights([(first,"Inspection A",str(export)),(second,"Inspection B",None)])
+    assert [row.folder_edit.text() for row in window.flight_rows]==[str(tmp_path/"one"),str(tmp_path/"two")]
+    assert [row.name_edit.text() for row in window.flight_rows]==["Inspection A — Flight 1","Inspection B — Flight 1"]
+    assert window.flight_rows[0].las_edit.text()==str(export)
+    assert window.flight_rows[0].body.isHidden()
+    assert window.flight_rows[1].las_edit.text()==""
+    assert not window.flight_rows[1].body.isHidden()
 
 
 def test_sticky_focus_preflight_settings_and_output_preview(ui, tmp_path):

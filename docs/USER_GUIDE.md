@@ -10,6 +10,34 @@ Inspector.
 You also need one measured RGB camera profile compatible with the recorded video
 mode. The same profile is shared by every selected flight.
 
+## Find flights in Inspector 5
+
+Use **Import Inspector Asset** to select an asset folder under the Inspector
+workspace, for example:
+
+`...\Inspector\Workspaces\Main Workspace\assets\<asset UUID>`
+
+The application reads local Inspector metadata and shows the asset's named
+inspections and flights. Expand an inspection, select one or more flights, and
+choose **Import selected flights**. Dates, durations, and available-data hints
+are shown when Inspector records them. UUID folder names remain internal.
+
+After choosing flights, select **Continue** to optionally assign each flight's
+exported data folder. Browse for a folder or drag it into the matching field.
+You may fill every field, only some fields, or none of them. Flights completed
+in this step are collapsed when added to the main window; flights without an
+export stay expanded so their missing input is visible. All export folders must
+still be supplied before the readiness checks can pass.
+
+Discovery is local and read-only. A malformed unrelated inspection or flight is
+skipped and reported as a discovery note instead of stopping the whole browse
+operation. If an expected inspection or flight is missing, refresh Inspector's
+local workspace and try again.
+
+The original workflow remains available: use **Import Flight Folders**, add an
+individual flight row, or drag folders into the window. Both workflows use the
+same validation and colorization pipeline.
+
 ## Choose a workflow
 
 ### Single flight
@@ -93,7 +121,7 @@ workflow. No setting is required when resizing the window.
 
 ## Desktop workflow conveniences
 
-- Drag flight folders onto the window or use **Add several folders** to populate
+- Drag flight folders onto the window or use **Import Flight Folders** to populate
   a multi-flight job. Flight cards can be collapsed, reordered, or duplicated.
 - Missing readiness items provide **Go to input** actions that expand and focus
   the related control.

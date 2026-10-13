@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml?query=branch%3Amain"><img alt="Tests" src="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.4.0"><img alt="Release v1.4.0" src="https://img.shields.io/badge/release-v1.4.0-2f6f89"></a>
+  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.5.0"><img alt="Release v1.5.0" src="https://img.shields.io/badge/release-v1.5.0-2f6f89"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2f6f89"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2f6f89">
   <img alt="Local processing" src="https://img.shields.io/badge/processing-local-187548">
@@ -34,8 +34,8 @@ native flight telemetry, and recorded 4K video. It preserves unobserved geometry
 marks every point with an explicit colorization status, and performs all work on
 the local computer. Flight data is not uploaded to a cloud service.
 
-> **Version 1.4:** optional robust multi-frame fusion rejects color outliers and
-> combines overlapping RGB evidence while preserving the original mode as the default.
+> **Version 1.5:** browse Inspector 5 Assets by their named inspections and
+> flights, while retaining manual flight-folder import and the same processing pipeline.
 
 ## Install
 
@@ -62,6 +62,11 @@ profile marked as validated must be backed by measured calibration and independe
 reprojection checks. Read the [camera calibration guide](docs/CALIBRATION.md).
 
 ## Workflows
+
+Select **Import Inspector Asset** to browse a local Inspector 5 asset as a
+human-readable Asset → Inspection → Flight hierarchy. Select any combination of
+flights and add them to the existing workflow without finding their UUID folders
+manually. **Import Flight Folders** and drag-and-drop remain available.
 
 | Workflow | Result |
 | --- | --- |
@@ -183,6 +188,15 @@ Elios Colorizer is available under the [MIT License](LICENSE).
 Elios, Elios 3, Inspector, and Flyability are trademarks of their respective
 owners. This independent open-source project is not affiliated with, sponsored
 by, or endorsed by Flyability.
+
+### v1.5.0
+
+Version 1.5.0 adds a local Inspector 5 Asset browser that discovers named
+inspections and flights without exposing UUID folders. Selected flights can be
+imported across inspections, and their optional Inspector export folders can be
+assigned by browsing or drag-and-drop in the same guided workflow. Malformed or
+stale unrelated metadata is skipped with visible notes, while the established
+manual folder import and colorization pipeline remain unchanged.
 
 ### v1.4.0
 

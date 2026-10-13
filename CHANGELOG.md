@@ -5,6 +5,31 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-13
+
+### Added
+
+- Added **Import Inspector Asset**, which discovers an asset's inspections and
+  flights from Inspector 5 metadata and presents them as a named, selectable
+  hierarchy instead of exposing UUID folder names.
+- Added flight date, duration, and available-data hints to the Inspector Asset
+  browser, plus inspection-level and whole-asset selection controls.
+- Added an optional second Asset-import step for browsing or dropping each
+  selected flight's exported data folder before adding flights to the main
+  window; completed flight cards start collapsed while incomplete cards remain
+  open for input.
+- Added a reusable, ID-based Inspector discovery module that scans inspection
+  and flight metadata once and is structured for a future workspace browser.
+- Added tolerant handling and visible discovery notes for malformed, stale, or
+  missing Inspector metadata and folders.
+
+### Changed
+
+- Renamed the existing manual action to **Import Flight Folders** and retained
+  manual browsing, drag-and-drop, and individual flight entry unchanged.
+- Inspector Asset selections feed the same established flight validation and
+  colorization pipeline as manually selected flight folders.
+
 ## [1.4.0] - 2026-10-08
 
 ### Added
@@ -148,7 +173,8 @@ project follows [Semantic Versioning](https://semver.org/).
   RGB-video ingestion.
 - Explicit `Colorized` output attribute and deterministic packaged self-test.
 
-[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/echerrman/Elios-Colorizer/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.2.0...v1.3.0

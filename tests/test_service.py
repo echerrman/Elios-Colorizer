@@ -1,6 +1,5 @@
 from elios_colorizer.selftest import create_fixture
-from elios_colorizer.service import (_projection_progress_detail, find_cloudcompare_executable,
-                                     inspect_source, inspect_sources,
+from elios_colorizer.service import (_projection_progress_detail, inspect_source, inspect_sources,
                                      merged_processing_tuning, processing_tuning,
                                      run_colorization, run_workflow)
 import laspy
@@ -162,8 +161,7 @@ def test_header_timestamp_not_arrival_and_wrong_clock_offset_rejected(tmp_path):
 
 
 @pytest.mark.parametrize('balancing', [False, True])
-@pytest.mark.parametrize('method', ['manual', 'automatic'])
-def test_complete_two_flight_merged_workflow(tmp_path, monkeypatch, balancing, method):
+def test_complete_two_flight_merged_workflow(tmp_path, monkeypatch, balancing):
     import json
     first = create_fixture(tmp_path / 'first')
     second = create_fixture(tmp_path / 'second')
@@ -175,17 +173,10 @@ def test_complete_two_flight_merged_workflow(tmp_path, monkeypatch, balancing, m
     source_merged = merge_geometry([first / 'test.las', second / 'test.las'],
                                    [np.eye(4), np.eye(4)], tmp_path / 'source_merged.las')
     updates = []
-    executable = tmp_path / 'synthetic-cloudcompare.exe'
-    executable.touch()
-    if method == 'automatic':
-        monkeypatch.setattr('elios_colorizer.service.find_cloudcompare_executable', lambda *_: executable)
-        monkeypatch.setattr('elios_colorizer.service.cloudcompare_cli_available', lambda *_: True)
-        monkeypatch.setattr('elios_colorizer.merged.automatic_align',
-                            lambda *a, **kw: ([np.eye(4), np.eye(4)], {'synthetic': True}))
     result = run_workflow([{'folder': str(first), 'name': 'Upper Ring'},
                            {'folder': str(second), 'name': 'Lower Ring'}],
                           str(tmp_path / 'merged.las'), mode='merge',
-                          alignment_method=method, merged_source=str(source_merged),
+                          merged_source=str(source_merged),
                           progress=lambda *args: updates.append(args), illumination_balancing=balancing,
                           multi_frame_fusion=True, start_s=0, end_s=1.5)
     merged = laspy.read(result['output'])
@@ -241,24 +232,20 @@ def test_merged_best_view_uses_parallel_flight_map_reduce(tmp_path, monkeypatch)
     from elios_colorizer.merged import merge_geometry
     geometry = merge_geometry([first / 'test.las', second / 'test.las'],
                               [np.eye(4), np.eye(4)], tmp_path / 'parallel-source.las')
+    updates = []
     result = run_workflow([
         {'folder': str(first), 'name': 'First'},
         {'folder': str(second), 'name': 'Second'},
-    ], str(tmp_path / 'parallel-output.las'), mode='merge', alignment_method='manual',
-       merged_source=str(geometry), multi_frame_fusion=False)
+    ], str(tmp_path / 'parallel-output.las'), mode='merge',
+       merged_source=str(geometry), multi_frame_fusion=False,
+       progress=lambda stage, fraction, message: updates.append((stage, fraction, message)))
     report = json.loads(Path(result['report']).read_text())
     parallel = report['processing_configuration']['parallel_execution']
     assert parallel['strategy'] == 'parallel_flight_map_reduce'
     assert parallel['candidate_shards'] == 2
     assert report['summary']['processing_strategy'] == 'parallel_flight_map_reduce'
-
-
-def test_cloudcompare_is_discovered_from_path(tmp_path, monkeypatch):
-    executable = tmp_path / 'CloudCompare.exe'
-    executable.touch()
-    monkeypatch.setattr('elios_colorizer.service.shutil.which', lambda _: str(executable))
-    assert find_cloudcompare_executable() == executable.resolve()
-
+    assert any(stage.endswith(': Checking visibility') for stage, _, _ in updates)
+    assert any(stage.endswith(': Assigning RGB') for stage, _, _ in updates)
 
 @pytest.mark.parametrize('balancing', [False, True])
 def test_separate_outputs_use_flight_numbers_and_names(tmp_path, monkeypatch, balancing):

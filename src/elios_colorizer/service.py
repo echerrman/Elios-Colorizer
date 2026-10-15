@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from dataclasses import replace
-from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import hashlib
@@ -18,7 +17,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
@@ -36,13 +34,6 @@ def _duplicate_flight_names(selections: list[dict[str, str | None]]) -> set[str]
     names = _flight_names(selections)
     normalized = [' '.join(name.split()).casefold() for name in names]
     return {names[index] for index, value in enumerate(normalized) if normalized.count(value) > 1}
-
-
-def _name_flight_references(value: str, names: list[str]) -> str:
-    def replace(match):
-        index = int(match.group(1)) - 1
-        return names[index] if 0 <= index < len(names) else match.group(0)
-    return re.sub(r'\bFlight (\d+)\b', replace, value)
 
 
 def _compact_count(value: int) -> str:
@@ -79,36 +70,6 @@ def processing_tuning(point_count: int, available_memory_bytes: int | None = Non
 
 # Public compatibility for integrations which imported the original merged-only name.
 merged_processing_tuning = processing_tuning
-
-
-def find_cloudcompare_executable(selected: str | None = None) -> Path | None:
-    """Resolve CloudCompare without persisting a machine-specific path."""
-    if selected:
-        path = Path(selected).expanduser().resolve()
-        return path if path.is_file() else None
-    from_path = shutil.which('CloudCompare.exe') or shutil.which('CloudCompare')
-    if from_path:
-        return Path(from_path).resolve()
-    candidates: list[Path] = []
-    for variable in ('ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA'):
-        root = os.environ.get(variable)
-        if root:
-            candidates.extend((Path(root) / 'CloudCompare' / 'CloudCompare.exe',
-                               Path(root) / 'Programs' / 'CloudCompare' / 'CloudCompare.exe'))
-    candidates.append(Path(r'C:\Program Files\CloudCompare\CloudCompare.exe'))
-    return next((path.resolve() for path in candidates if path.is_file()), None)
-
-
-@lru_cache(maxsize=8)
-def cloudcompare_cli_available(executable: str) -> bool:
-    """Confirm the selected binary exposes the CLI operation required by the app."""
-    try:
-        completed = subprocess.run([executable, '-SILENT', '-HELP'], capture_output=True, text=True,
-                                   timeout=15, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        output = completed.stdout + completed.stderr
-        return completed.returncode == 0 and '-ICP' in output and '-MERGE_CLOUDS' in output
-    except (OSError, subprocess.TimeoutExpired):
-        return False
 
 
 def dependency_status() -> list[dict]:
@@ -237,8 +198,7 @@ def inspect_source(folder: str, las_override: str | None = None,
 
 def inspect_sources(flights: Iterable[dict[str, str | None]],
                     calibration_override: str | None = None, *, mode: str = 'separate',
-                    alignment_method: str = 'manual', merged_source: str | None = None,
-                    cloudcompare_executable: str | None = None) -> dict:
+                    merged_source: str | None = None) -> dict:
     """Inspect every flight and collapse the result into one readable checklist."""
     selections = list(flights)
     if not selections:
@@ -306,49 +266,25 @@ def inspect_sources(flights: Iterable[dict[str, str | None]],
                     'Flights resolved to different camera profiles. Select one shared profile explicitly.')))
         ready = ready and shared
     if mode == 'merge' and len(selections) >= 2:
-        if alignment_method == 'manual':
-            merged = Path(merged_source).resolve() if merged_source else None
-            good = bool(merged and merged.is_file() and merged.suffix.lower() in ('.las', '.laz'))
-            checklist.append(dict(label='Aligned merged point cloud', status='ok' if good else 'missing',
-                detail=str(merged) if good else 'Choose the LAS/LAZ merged in CloudCompare.'))
-            ready = ready and good
-            from .merged import selection_transform, MergedWorkflowError
-            errors = []
-            for index, item in enumerate(selections, 1):
-                try:
-                    selection_transform(item, index)
-                except (OSError, MergedWorkflowError) as exc:
-                    errors.append(f'Flight {index}: {exc}')
-            checklist.append(dict(label='Source-to-merged transforms', status='ok' if not errors else 'missing',
-                detail=('Blank entries use identity; supplied matrices are valid.' if not errors else '; '.join(errors))))
-            ready = ready and not errors
-        elif alignment_method == 'automatic':
-            executable = find_cloudcompare_executable(cloudcompare_executable)
-            good = bool(executable and cloudcompare_cli_available(str(executable)))
-            if good:
-                detail = f'CloudCompare CLI ready: {executable}'
-            elif executable:
-                detail = (f'Found {executable}, but it did not expose the required ICP and merge CLI commands. '
-                          'Install a current CloudCompare release from cloudcompare.org or choose another executable.')
-            elif cloudcompare_executable:
-                detail = ('The selected CloudCompare executable was not found. Install CloudCompare from '
-                          'cloudcompare.org or browse to CloudCompare.exe.')
-            else:
-                detail = ('CloudCompare CLI was not found on PATH or in a standard Windows install location. '
-                          'Install it from cloudcompare.org, then browse to CloudCompare.exe.')
-            checklist.append(dict(label='CloudCompare CLI', status='ok' if good else 'missing', detail=detail))
-            ready = ready and good
-        else:
-            checklist.append(dict(label='Alignment method', status='missing', detail='Choose manual or automatic alignment.'))
-            ready = False
+        merged = Path(merged_source).resolve() if merged_source else None
+        good = bool(merged and merged.is_file() and merged.suffix.lower() in ('.las', '.laz'))
+        checklist.append(dict(label='Aligned merged point cloud', status='ok' if good else 'missing',
+            detail=str(merged) if good else 'Choose an already aligned and merged LAS/LAZ.'))
+        ready = ready and good
+        from .merged import selection_transform, MergedWorkflowError
+        errors = []
+        for index, item in enumerate(selections, 1):
+            try:
+                selection_transform(item, index)
+            except (OSError, MergedWorkflowError) as exc:
+                errors.append(f'Flight {index}: {exc}')
+        checklist.append(dict(label='Source-to-merged transforms', status='ok' if not errors else 'missing',
+            detail=('Blank entries use identity; supplied matrices are valid.' if not errors else '; '.join(errors))))
+        ready = ready and not errors
     return dict(ready=ready, checklist=checklist, dependencies=reports[0]['dependencies'],
                 summary=(f"{len(reports)} flight{'s' if len(reports) != 1 else ''} checked. "
                          + ('All required inputs are ready.' if ready else 'Resolve the required items above.')),
-                flights=reports,
-                cloudcompare_executable=(str(find_cloudcompare_executable(cloudcompare_executable))
-                                         if mode == 'merge' and alignment_method == 'automatic'
-                                         and find_cloudcompare_executable(cloudcompare_executable)
-                                         and cloudcompare_cli_available(str(find_cloudcompare_executable(cloudcompare_executable))) else None))
+                flights=reports)
 
 
 def cache_directory() -> Path:
@@ -657,8 +593,7 @@ def _human_output_stem(value: str) -> str:
 
 
 def _run_merged_workflow(selections: list[dict[str, str | None]], destination: Path,
-                         calibration_override: str | None, *, alignment_method: str,
-                         merged_source: str | None, cloudcompare_executable: str | None,
+                         calibration_override: str | None, *, merged_source: str | None,
                          maximum_color_distance_m: float | None, progress, cancelled,
                          started: float, flight_checks: list[dict], illumination_balancing: bool = False,
                          multi_frame_fusion: bool = False,
@@ -672,7 +607,7 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
     from .colorize import (adaptively_select_observations, colorize_las, ColorizationOptions,
                            group_nearby_observations)
     from .flight import discover_source, load_telemetry, iter_observations, inspect_video_coverage
-    from .merged import (MergedWorkflowError, automatic_align, merge_geometry, selection_transform,
+    from .merged import (MergedWorkflowError, selection_transform,
                          spatially_index_geometry, transform_observations, validate_transforms)
 
     report_path = destination.with_suffix('.report.json')
@@ -697,34 +632,12 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
 
     with tempfile.TemporaryDirectory(prefix='.elios-merged-', dir=destination.parent) as scratch_name:
         scratch = Path(scratch_name)
-        if alignment_method == 'manual':
-            geometry = Path(merged_source or '').resolve()
-            matrices = [selection_transform(item, index) for index, item in enumerate(selections, 1)]
-            if progress:
-                progress('Validating alignment', .01, 'Checking every flight against the supplied merged geometry…')
-            alignment = validate_transforms(source_las, geometry, matrices)
-            preparation_share = .05
-        elif alignment_method == 'automatic':
-            resolved_cloudcompare = find_cloudcompare_executable(cloudcompare_executable)
-            if not resolved_cloudcompare or not cloudcompare_cli_available(str(resolved_cloudcompare)):
-                raise MergedWorkflowError('CloudCompare CLI is unavailable. Install CloudCompare or browse to CloudCompare.exe.')
-            if progress:
-                progress('Automatic alignment', .01, 'Discovering pairwise overlaps for a global registration network…')
-            def alignment_progress(stage, fraction, message):
-                if progress:
-                    progress(_name_flight_references(stage, flight_names), .01 + .14 * fraction,
-                             _name_flight_references(message, flight_names))
-            matrices, alignment = automatic_align(source_las, resolved_cloudcompare, scratch,
-                                                   progress=alignment_progress, cancelled=cancelled)
-            geometry = scratch / 'automatically_merged_geometry.las'
-            def merge_progress(stage, fraction, message):
-                if progress:
-                    progress(_name_flight_references(stage, flight_names), .15 + .10 * fraction,
-                             _name_flight_references(message, flight_names))
-            merge_geometry(source_las, matrices, geometry, progress=merge_progress, cancelled=cancelled)
-            preparation_share = .25
-        else:
-            raise ValueError('Merged alignment method must be manual or automatic.')
+        geometry = Path(merged_source or '').resolve()
+        matrices = [selection_transform(item, index) for index, item in enumerate(selections, 1)]
+        if progress:
+            progress('Validating alignment', .01, 'Checking every flight against the supplied merged geometry…')
+        alignment = validate_transforms(source_las, geometry, matrices)
+        preparation_share = .05
 
         indexed_geometry = scratch / 'spatially_indexed_geometry.las'
         index_base = preparation_share
@@ -936,8 +849,16 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                             hardware = (f'CUDA GPU {device + 1}' if resource_plan.cuda_available
                                         else f'{resource_plan.workers_per_flight} CPU workers')
                             unfinished = sum(value < 1 for value in job_progress)
-                            progress(f'{flight_names[index]}: Parallel flight colorization', progress_high_water,
-                                     f'{hardware} · {unfinished} flights unfinished · flight {local * 100:.1f}%')
+                            visible_stage = {'indexing': 'Preparing point cloud',
+                                             'visibility': 'Checking visibility',
+                                             'colorizing': 'Assigning RGB',
+                                             'candidate_complete': 'Candidate colors complete'}[stage]
+                            detail = f'{hardware} · {unfinished} flights unfinished'
+                            if stage in ('visibility', 'colorizing'):
+                                detail += (f" · {_compact_count(info['points_processed'])}/"
+                                           f"{_compact_count(info['point_count'])} points")
+                            progress(f'{flight_names[index]}: {visible_stage}', progress_high_water,
+                                     f'{detail} · flight {local * 100:.1f}%')
 
                 job_options = replace(
                     options, worker_threads=resource_plan.workers_per_flight,
@@ -1034,8 +955,8 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
             'processing_strategy': parallel_strategy,
         },
         'application_version': __version__, 'created_utc': datetime.now(timezone.utc).isoformat(),
-        'mode': 'merge', 'alignment_method': alignment_method,
-        'merged_geometry_source': str(merged_source) if alignment_method == 'manual' else 'generated locally',
+        'mode': 'merge', 'alignment_method': 'provided_merged_cloud',
+        'merged_geometry_source': str(merged_source),
         'alignment': alignment, 'flights': telemetry_rows, 'result': result.to_dict(),
         'maximum_color_distance_m': maximum_color_distance_m,
         'processing_configuration': {
@@ -1097,8 +1018,7 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
 
 def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
                  calibration_override: str | None = None, *, mode: str = 'separate',
-                 alignment_method: str = 'manual', merged_source: str | None = None,
-                 cloudcompare_executable: str | None = None,
+                 merged_source: str | None = None,
                  maximum_color_distance_m: float | None = None,
                  illumination_balancing: bool = False,
                  multi_frame_fusion: bool = False,
@@ -1134,8 +1054,7 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
     if mode == 'merge' and len(selections) < 2:
         raise ValueError('Merged mode requires at least two flights.')
     inspection = inspect_sources(selections, calibration_override, mode=mode,
-                                 alignment_method=alignment_method, merged_source=merged_source,
-                                 cloudcompare_executable=cloudcompare_executable)
+                                 merged_source=merged_source)
     if not inspection['ready']:
         raise ValueError('One or more flights are missing required data. Refresh the checklist for details.')
     destination = Path(output).resolve()
@@ -1276,8 +1195,7 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
                     cuda_devices_detected=scheduler.cuda_devices)
 
     return _run_merged_workflow(selections, destination, calibration_override,
-        alignment_method=alignment_method, merged_source=merged_source,
-        cloudcompare_executable=cloudcompare_executable,
+        merged_source=merged_source,
         maximum_color_distance_m=maximum_color_distance_m, progress=progress,
         cancelled=cancelled, started=started, flight_checks=flight_checks,
         illumination_balancing=illumination_balancing,sample_interval_s=sample_interval_s,

@@ -5,12 +5,12 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from PySide6.QtCore import QObject, QSettings, QThread, QTime, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, QSignalBlocker, QThread, QTime, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QAbstractSpinBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QInputDialog, QMenu, QScrollArea, QTimeEdit, QGroupBox,
-    QSizePolicy, QSystemTrayIcon, QVBoxLayout, QWidget, QAbstractItemView, QListView, QTreeView, QSlider, QSpinBox,
+    QSizePolicy, QSystemTrayIcon, QVBoxLayout, QWidget, QAbstractItemView, QSlider, QSpinBox,
     QTreeWidget, QTreeWidgetItem, QStackedWidget)
 from .runtime import ResourcePreferences, detect_hardware, plan_resources, process_priority
 from .inspector_discovery import InspectorAsset, discover_asset, flight_feature_available
@@ -113,7 +113,36 @@ class NoWheelComboBox(QComboBox):
     def wheelEvent(self,event):
         event.ignore()
 
-class FolderDropLineEdit(QLineEdit):
+class ElidedPathLineEdit(QLineEdit):
+    """Keep the full path as the value while showing a middle-ellipsis at rest."""
+    def __init__(self,parent=None):
+        super().__init__(parent);self._full_text="";self.textEdited.connect(self._remember_edit)
+    def text(self):
+        return self._full_text
+    def setText(self,value):
+        value=str(value or "");changed=value!=self._full_text;self._full_text=value;self._refresh_display()
+        if changed:self.textChanged.emit(value)
+    def clear(self):
+        self.setText("")
+    def _remember_edit(self,value):
+        self._full_text=value;self.setToolTip(value)
+    def _display_text(self):
+        available=max(40,self.width()-38)
+        return self.fontMetrics().elidedText(self._full_text,Qt.TextElideMode.ElideMiddle,available)
+    def _refresh_display(self):
+        shown=self._full_text if self.hasFocus() else self._display_text()
+        blocker=QSignalBlocker(self);QLineEdit.setText(self,shown);del blocker
+        self.setToolTip(self._full_text)
+    def focusInEvent(self,event):
+        blocker=QSignalBlocker(self);QLineEdit.setText(self,self._full_text);del blocker
+        super().focusInEvent(event)
+    def focusOutEvent(self,event):
+        self._full_text=QLineEdit.text(self);super().focusOutEvent(event);self._refresh_display()
+    def resizeEvent(self,event):
+        super().resizeEvent(event)
+        if not self.hasFocus():self._refresh_display()
+
+class FolderDropLineEdit(ElidedPathLineEdit):
     """Folder field that accepts a single directory without creating a flight."""
     path_dropped=Signal(str)
     def __init__(self,parent=None):
@@ -423,7 +452,7 @@ class FlightSelection:
 class WorkflowSelection:
     flights:tuple[FlightSelection,...]; calibration_override:str|None=None
     mode:str="separate"; maximum_color_distance_m:float|None=None
-    alignment_method:str="manual"; merged_source:str|None=None; cloudcompare_executable:str|None=None
+    merged_source:str|None=None
     illumination_balancing:bool=False
     advanced:AdvancedProcessingSettings=AdvancedProcessingSettings()
     resources:ResourcePreferences=ResourcePreferences()
@@ -443,7 +472,7 @@ class ServiceWorker(QObject):
                 flights=[x.to_dict() for x in self.selection.flights]
                 if self.kind=="inspect":
                     if len(flights)==1: result=self.backend.inspect_source(folder=flights[0]["folder"],las_override=flights[0]["las_override"],calibration_override=self.selection.calibration_override)
-                    else: result=self.backend.inspect_sources(flights,calibration_override=self.selection.calibration_override,mode=self.selection.mode,alignment_method=self.selection.alignment_method,merged_source=self.selection.merged_source,cloudcompare_executable=self.selection.cloudcompare_executable)
+                    else: result=self.backend.inspect_sources(flights,calibration_override=self.selection.calibration_override,mode=self.selection.mode,merged_source=self.selection.merged_source)
                 elif len(flights)==1 and self.selection.mode=="separate":
                     kw=dict(folder=flights[0]["folder"],las_override=flights[0]["las_override"],output=self.output,calibration_override=self.selection.calibration_override,progress=self.progress.emit,cancelled=self.cancellation.is_set,resource_settings=self.selection.resources.to_dict())
                     if self.selection.maximum_color_distance_m is not None: kw["maximum_color_distance_m"]=self.selection.maximum_color_distance_m
@@ -457,7 +486,7 @@ class ServiceWorker(QObject):
                     result=self.backend.run_colorization(**kw)
                 else:
                     result=self.backend.run_workflow(flights,self.output,calibration_override=self.selection.calibration_override,mode=self.selection.mode,
-                        alignment_method=self.selection.alignment_method,merged_source=self.selection.merged_source,cloudcompare_executable=self.selection.cloudcompare_executable,
+                        merged_source=self.selection.merged_source,
                         illumination_balancing=self.selection.illumination_balancing,maximum_color_distance_m=self.selection.maximum_color_distance_m,
                         sample_interval_s=1/self.selection.advanced.sample_frequency_hz,
                         image_border_fraction=self.selection.advanced.image_edge_exclusion_percent/100,
@@ -480,7 +509,7 @@ class Checklist(QWidget):
         while self.box.count():
             item=self.box.takeAt(0)
             if item.widget():item.widget().hide();item.widget().deleteLater()
-        for row in rows:
+        def add_row(row,target):
             status=row.get("status","warning"); word,color={"ok":("READY","#187548"),"missing":("NEEDED","#b34330")}.get(status,("CHECK","#926616"))
             panel=QWidget(); grid=QGridLayout(panel); grid.setContentsMargins(0,2,0,2); grid.setColumnStretch(1,1)
             state=_label(word); state.setStyleSheet(f"color:{color};font-size:8pt;font-weight:700"); state.setMinimumWidth(49)
@@ -497,16 +526,28 @@ class Checklist(QWidget):
                 def toggle_details(checked, *, target=expanded, button=toggle, count=len(details)):
                     target.setVisible(checked);button.setText("Hide warnings" if checked else f"Show warnings ({count})")
                 toggle.toggled.connect(toggle_details)
-            self.box.addWidget(panel)
+            target.addWidget(panel)
+        attention=[row for row in rows if row.get("status","warning")!="ok"]
+        completed=[row for row in rows if row.get("status","warning")=="ok"]
+        for row in attention:add_row(row,self.box)
+        if completed:
+            completed_body=QWidget();completed_box=QVBoxLayout(completed_body);completed_box.setContentsMargins(0,0,0,0);completed_box.setSpacing(2)
+            for row in completed:add_row(row,completed_box)
+            completed_body.hide()
+            toggle=QPushButton(f"Show completed checks ({len(completed)})",objectName="warningToggle");toggle.setCheckable(True);toggle.setMaximumWidth(230)
+            def toggle_completed(checked,*,target=completed_body,button=toggle,count=len(completed)):
+                target.setVisible(checked);button.setText(("Hide completed checks" if checked else f"Show completed checks ({count})"))
+            toggle.toggled.connect(toggle_completed);self.box.addWidget(toggle);self.box.addWidget(completed_body)
         self.box.addStretch(1)
 
 class FlightRow(QFrame):
     changed=Signal();remove_requested=Signal(object);move_requested=Signal(object,int);duplicate_requested=Signal(object)
     def __init__(self,number):
-        super().__init__(objectName="flightRow");outer=QVBoxLayout(self);outer.setContentsMargins(12,8,12,10);outer.setSpacing(7)
+        super().__init__(objectName="flightRow");outer=QVBoxLayout(self);outer.setContentsMargins(12,8,12,10);outer.setSpacing(7);self._outer=outer
         self._number=number;self._uses_default_name=True;self._setting_default_name=False
         header=QHBoxLayout();self.collapse_button=QPushButton("Hide",objectName="inlineButton");self.collapse_button.setFixedWidth(78);self.collapse_button.setCheckable(True);self.collapse_button.setChecked(True);self.collapse_button.setToolTip("Collapse or expand this flight");self.collapse_button.setAccessibleName("Collapse flight details");header.addWidget(self.collapse_button)
         self.name_edit=QLineEdit(f"Flight {number}");self.name_edit.setObjectName("flightTitleEdit");self.name_edit.setMaxLength(48);self.name_edit.setToolTip("Click to rename this flight (48 characters maximum).");self.name_edit.setMinimumWidth(120);self.name_edit.setMaximumWidth(420);header.addWidget(self.name_edit,1)
+        self.compact_summary=_label("Choose flight and export folders.",True);self.compact_summary.setWordWrap(False);self.compact_summary.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred);self.compact_summary.hide();header.addWidget(self.compact_summary,2)
         self.readiness_badge=_label("NOT CHECKED");self.readiness_badge.setObjectName("readyBadge");self.readiness_badge.setFixedWidth(112);self.readiness_badge.setAlignment(Qt.AlignmentFlag.AlignCenter);self.readiness_badge.setStyleSheet("color:#7d8e9b;font-size:8pt;font-weight:700");header.addWidget(self.readiness_badge)
         self.up_button=QPushButton("↑",objectName="inlineButton");self.down_button=QPushButton("↓",objectName="inlineButton");self.duplicate_button=QPushButton("Duplicate",objectName="inlineButton")
         for button in (self.up_button,self.down_button):button.setFixedWidth(38)
@@ -514,7 +555,6 @@ class FlightRow(QFrame):
         for button,text in ((self.up_button,"Move flight up"),(self.down_button,"Move flight down"),(self.duplicate_button,"Duplicate flight configuration")):button.setToolTip(text);button.setAccessibleName(text);header.addWidget(button)
         self.remove_button=QPushButton("Remove");self.remove_button.setObjectName("removeFlightButton");self.remove_button.setFixedWidth(86);header.addWidget(self.remove_button);outer.addLayout(header)
         self.heading=self.name_edit
-        self.compact_summary=_label("Choose flight and export folders.",True);self.compact_summary.hide();outer.addWidget(self.compact_summary)
         self.body=QWidget();grid=QGridLayout(self.body);grid.setContentsMargins(0,0,0,0);grid.setColumnMinimumWidth(0,145);grid.setColumnStretch(1,1);outer.addWidget(self.body)
         self.folder_edit,self.folder_button=self._path("Select or drop native Inspector flight folder…",True)
         self.las_edit,self.las_button=self._path("Select or drop matching Inspector export folder…",True)
@@ -532,7 +572,7 @@ class FlightRow(QFrame):
         self.folder_button.clicked.connect(self._browse_folder);self.las_button.clicked.connect(self._browse_las);self.transform_button.clicked.connect(self._browse_transform);self.transform_source.currentIndexChanged.connect(self._transform_source_changed)
         self.set_transform_visible(False)
     def set_expanded(self,value):
-        self.body.setVisible(value);self.compact_summary.setVisible(not value);self.collapse_button.setText("Hide" if value else "Show");self.collapse_button.setAccessibleName(("Collapse" if value else "Expand")+" flight details")
+        self.body.setVisible(value);self.compact_summary.setVisible(not value);self._outer.setContentsMargins(12,8 if value else 4,12,10 if value else 4);self._outer.setSpacing(7 if value else 0);self.collapse_button.setText("Hide" if value else "Show");self.collapse_button.setAccessibleName(("Collapse" if value else "Expand")+" flight details")
     def set_readiness(self,report):
         ready=bool(report and report.get("ready"));self.readiness_badge.setText("READY" if ready else ("NEEDS ATTENTION" if report else "NOT CHECKED"));color="#2e9d61" if ready else ("#b45f36" if report else "#7d8e9b");self.readiness_badge.setStyleSheet(f"color:{color};font-size:8pt;font-weight:700")
         if report:
@@ -550,7 +590,7 @@ class FlightRow(QFrame):
             self._setting_default_name=True; self.name_edit.setText(f"Flight {number}"); self._setting_default_name=False
     @staticmethod
     def _path(placeholder,folder_drop=False):
-        edit=FolderDropLineEdit() if folder_drop else QLineEdit(); edit.setPlaceholderText(placeholder); edit.setClearButtonEnabled(True); edit.setMinimumWidth(0)
+        edit=FolderDropLineEdit() if folder_drop else ElidedPathLineEdit(); edit.setPlaceholderText(placeholder); edit.setClearButtonEnabled(True); edit.setMinimumWidth(0)
         if folder_drop:edit.setToolTip("Drop one folder here to fill this field.")
         button=QPushButton("Browse…");button.setFixedWidth(100);return edit,button
     def _browse_folder(self):
@@ -738,8 +778,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Elios Colorizer");self.setAcceptDrops(True);self.resize(1080,920);self.setMinimumSize(820,680);self._build()
         self._debounce=QTimer(self); self._debounce.setSingleShot(True); self._debounce.setInterval(350); self._debounce.timeout.connect(self._start_pending_inspection)
         self.calibration_edit.textChanged.connect(self._calibration_changed);self.output_edit.textChanged.connect(self._update_actions);self.output_edit.textChanged.connect(self._update_processing_summaries)
-        self.mode_combo.currentIndexChanged.connect(self._mode_changed); self.alignment_combo.currentIndexChanged.connect(self._mode_changed); self.distance_check.toggled.connect(self._distance_changed)
-        self.merged_edit.textChanged.connect(self._inputs_changed); self.cloudcompare_edit.textChanged.connect(self._inputs_changed);self.color_balance_check.toggled.connect(self._update_processing_summaries);self.distance_spin.valueChanged.connect(self._update_processing_summaries)
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed); self.distance_check.toggled.connect(self._distance_changed)
+        self.merged_edit.textChanged.connect(self._inputs_changed);self.color_balance_check.toggled.connect(self._update_processing_summaries);self.distance_spin.valueChanged.connect(self._update_processing_summaries)
         if restore_settings:self._restore_settings()
         self.theme_button.setChecked(self._dark_mode);self._apply_theme()
         self._sync_aliases();self._show_empty();self._mode_changed();self._install_shortcuts();self._update_processing_summaries()
@@ -749,13 +789,14 @@ class MainWindow(QMainWindow):
         page=QWidget(objectName="page");page.setMaximumWidth(1900);root=QVBoxLayout(page); root.setContentsMargins(28,24,28,23); root.setSpacing(16)
         top=QHBoxLayout();title=_label("Elios Colorizer");title.setObjectName("title");top.addWidget(title);top.addStretch();self.theme_button=QPushButton();self.theme_button.setCheckable(True);self.theme_button.setChecked(self._dark_mode);self.theme_button.clicked.connect(self._toggle_theme);top.addWidget(self.theme_button);self.settings_button=QPushButton("⚙  Settings");self.settings_button.clicked.connect(self._show_application_settings);top.addWidget(self.settings_button);root.addLayout(top);root.addWidget(_label("Bring one or more flights' RGB imagery onto their recorded point clouds.",True))
         self.workflow_layout=QGridLayout();self.workflow_layout.setHorizontalSpacing(16);self.workflow_layout.setVerticalSpacing(16);root.addLayout(self.workflow_layout)
-        card,box=_card("Choose Flights"); box.addWidget(_label("For each flight, select its native Inspector folder and matching export folder. The export must contain the LAS/LAZ and *-trajectory.csv. One camera profile is shared by all flights.",True)); self.flights_layout=QVBoxLayout(); box.addLayout(self.flights_layout)
-        add_row=QHBoxLayout();self.asset_import_button=QPushButton("Import Inspector Asset…");self.asset_import_button.setObjectName("accentButton");self.asset_import_button.setIcon(QIcon(str(_asset_path("import-flights.svg"))));self.asset_import_button.clicked.connect(self._import_inspector_asset);add_row.addWidget(self.asset_import_button);self.bulk_add_button=QPushButton("Import Flight Folders…");self.bulk_add_button.setIcon(QIcon(str(_asset_path("import-flights.svg"))));self.bulk_add_button.clicked.connect(self._bulk_add_flights);add_row.addWidget(self.bulk_add_button);add_row.addStretch();box.addLayout(add_row)
-        manual_row=QHBoxLayout();self.add_flight_button=QPushButton("+  Add flight");self.add_flight_button.setObjectName("addFlightButton");self.add_flight_button.clicked.connect(self._add_flight);manual_row.addWidget(self.add_flight_button);manual_row.addWidget(_label("Choose an Asset to browse named flights, or keep using flight folders and drag-and-drop.",True),1);box.addLayout(manual_row)
-        self.calibration_edit,self.calibration_button=self._file_row(box,"Camera profile","Choose shared RGB calibration…",self._browse_calibration); self.flight_card=card;self.flight_card.setObjectName("flightsCard"); self._add_flight(trigger=False)
+        card,box=_card("Choose Flights");section_title=box.itemAt(0).widget();box.removeWidget(section_title);flight_header=QHBoxLayout();flight_header.addWidget(section_title,1);self.flights_toggle=QPushButton("Collapse flights",objectName="inlineButton");self.flights_toggle.setCheckable(True);self.flights_toggle.setChecked(True);self.flights_toggle.setAccessibleName("Collapse or expand the Flights section");flight_header.addWidget(self.flights_toggle);box.insertLayout(0,flight_header)
+        self.flights_body=QWidget();flights_box=QVBoxLayout(self.flights_body);flights_box.setContentsMargins(0,0,0,0);flights_box.setSpacing(10);flights_box.addWidget(_label("For each flight, select its native Inspector folder and matching export folder. The export must contain the LAS/LAZ and *-trajectory.csv. One camera profile is shared by all flights.",True)); self.flights_layout=QVBoxLayout(); flights_box.addLayout(self.flights_layout)
+        add_row=QHBoxLayout();self.asset_import_button=QPushButton("Import Inspector Asset…");self.asset_import_button.setObjectName("accentButton");self.asset_import_button.setIcon(QIcon(str(_asset_path("import-flights.svg"))));self.asset_import_button.clicked.connect(self._import_inspector_asset);add_row.addWidget(self.asset_import_button);add_row.addStretch();flights_box.addLayout(add_row)
+        manual_row=QHBoxLayout();self.add_flight_button=QPushButton("+  Add flight");self.add_flight_button.setObjectName("addFlightButton");self.add_flight_button.clicked.connect(self._add_flight);manual_row.addWidget(self.add_flight_button);manual_row.addWidget(_label("Choose an Asset to browse named flights, or add one flight manually.",True),1);flights_box.addLayout(manual_row)
+        self.calibration_edit,self.calibration_button=self._file_row(flights_box,"Camera profile","Choose shared RGB calibration…",self._browse_calibration);box.addWidget(self.flights_body);self.flights_toggle.toggled.connect(self._set_flights_expanded); self.flight_card=card;self.flight_card.setObjectName("flightsCard"); self._add_flight(trigger=False)
         card,box=_card("Check All Flight Data"); self.checklist=Checklist();self.checklist.activated.connect(self._navigate_to_check); box.addWidget(self.checklist); self.summary=_label("Choose flight folders.",True); box.addWidget(self.summary)
         row=QHBoxLayout(); self.refresh_button=QPushButton("↻  Refresh checks"); self.refresh_button.clicked.connect(self._inputs_changed); row.addWidget(self.refresh_button); row.addStretch(); self.tools_summary=_label("Local libraries are checked automatically.",True); row.addWidget(self.tools_summary); box.addLayout(row); self.dependencies=Checklist(); self.dependencies.hide(); box.addWidget(self.dependencies); self.check_card=card;self.check_card.setObjectName("validationCard")
-        card,box=_card("Choose Processing and Output"); card.setObjectName("processingCard");section_title=box.itemAt(0).widget();section_title.setWordWrap(False);section_title.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Fixed);box.removeWidget(section_title);section_header=QHBoxLayout();section_header.addWidget(section_title,1);self.advanced_button=QPushButton("Advanced processing settings…");self.advanced_button.setObjectName("accentButton");self.advanced_button.clicked.connect(self._show_advanced_settings);section_header.addWidget(self.advanced_button);box.insertLayout(0,section_header);self._update_advanced_summary(); row=QHBoxLayout(); self.mode_label=_label("Result"); row.addWidget(self.mode_label); self.mode_combo=NoWheelComboBox(); self.mode_combo.addItem("Separate colorized LAS files","separate"); self.mode_combo.addItem("Align and merge into one cloud","merge"); row.addWidget(self.mode_combo,1); box.addLayout(row)
+        card,box=_card("Choose Processing and Output"); card.setObjectName("processingCard");section_title=box.itemAt(0).widget();section_title.setWordWrap(False);section_title.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Fixed);box.removeWidget(section_title);section_header=QHBoxLayout();section_header.addWidget(section_title,1);self.advanced_button=QPushButton("Advanced processing settings…");self.advanced_button.setObjectName("accentButton");self.advanced_button.clicked.connect(self._show_advanced_settings);section_header.addWidget(self.advanced_button);box.insertLayout(0,section_header);self._update_advanced_summary(); row=QHBoxLayout(); self.mode_label=_label("Result"); row.addWidget(self.mode_label); self.mode_combo=NoWheelComboBox(); self.mode_combo.addItem("Separate outputs","separate"); self.mode_combo.addItem("One merged cloud","merge"); row.addWidget(self.mode_combo,1); box.addLayout(row)
         self.mode_help=_label("",True); box.addWidget(self.mode_help)
         self.processing_plan_label=_label("Hardware strategy will be selected automatically when processing starts.",True);self.processing_plan_label.setObjectName("callout");box.addWidget(self.processing_plan_label)
         chips=QHBoxLayout();self.settings_chips=[]
@@ -764,15 +805,11 @@ class MainWindow(QMainWindow):
         chips.addStretch();box.addLayout(chips)
         self.preflight_panel=QFrame(objectName="preflightPanel");preflight_box=QVBoxLayout(self.preflight_panel);preflight_box.setContentsMargins(10,8,10,8);preflight_box.addWidget(_label("Preflight workload",False));self.preflight_summary=_label("Select and check flight data to estimate the workload.",True);preflight_box.addWidget(self.preflight_summary);box.addWidget(self.preflight_panel)
         self.alignment_panel=QFrame(objectName="alignmentPanel"); align_box=QVBoxLayout(self.alignment_panel); align_box.setContentsMargins(12,10,12,10); align_box.setSpacing(8)
-        row=QHBoxLayout(); row.addWidget(_label("Alignment")); self.alignment_combo=NoWheelComboBox(); self.alignment_combo.addItem("Use a CloudCompare-aligned merged cloud (Recommended)","manual"); self.alignment_combo.addItem("Align automatically with CloudCompare","automatic"); row.addWidget(self.alignment_combo,1); align_box.addLayout(row)
-        self.alignment_help=_label(""); self.alignment_help.setObjectName("callout"); align_box.addWidget(self.alignment_help)
-        self.alignment_guide_button=QPushButton("CloudCompare instructions…",objectName="accentButton"); self.alignment_guide_button.clicked.connect(self._show_alignment_guide); align_box.addWidget(self.alignment_guide_button,alignment=Qt.AlignmentFlag.AlignLeft)
-        self.manual_panel=QWidget(); manual_box=QVBoxLayout(self.manual_panel); manual_box.setContentsMargins(0,0,0,0); self.merged_edit,self.merged_button=self._file_row(manual_box,"Merged cloud","Choose or drop the aligned, merged LAS/LAZ…",self._browse_merged,LasDropLineEdit); align_box.addWidget(self.manual_panel)
-        self.automatic_panel=QWidget(); automatic_box=QVBoxLayout(self.automatic_panel); automatic_box.setContentsMargins(0,0,0,0); self.cloudcompare_edit,self.cloudcompare_button=self._file_row(automatic_box,"CloudCompare","Detected automatically, or browse to CloudCompare.exe…",self._browse_cloudcompare); align_box.addWidget(self.automatic_panel)
+        self.merged_edit,self.merged_button=self._file_row(align_box,"Merged cloud","Choose or drop your already merged LAS/LAZ…",self._browse_merged,LasDropLineEdit)
         box.addWidget(self.alignment_panel)
         row=QHBoxLayout(); self.distance_check=QCheckBox("Limit colorization distance"); self.distance_check.setObjectName("distanceToggle"); self.distance_spin=QDoubleSpinBox(); self.distance_spin.setRange(.2,40); self.distance_spin.setValue(8); self.distance_spin.setSuffix(" m"); row.addWidget(self.distance_check); row.addWidget(self.distance_spin); row.addStretch(); box.addLayout(row)
         row=QHBoxLayout(); self.color_balance_check=QCheckBox("Illumination Balancing"); self.color_balance_check.setObjectName("distanceToggle"); self.color_balance_check.setToolTip("Use overlapping views to conservatively correct center-to-edge lighting. Leaves RGB unchanged when evidence is insufficient."); row.addWidget(self.color_balance_check); row.addStretch(); box.addLayout(row)
-        self.output_edit,self.output_button=self._file_row(box,"Output","Choose output…",self._browse_output);self.output_preview=_label("Choose an output location to preview generated files.",True);box.addWidget(self.output_preview)
+        self.output_edit,self.output_button=self._file_row(box,"Output","Choose output…",self._browse_output);self.output_preview=_label("",True);self.output_preview.hide();box.addWidget(self.output_preview)
         self.progress_detail=_label("",True); box.addWidget(self.progress_detail)
         self.flight_progress=FlightProgressPanel();box.addWidget(self.flight_progress)
         self.result_panel=QFrame(objectName="resultPanel");result_box=QVBoxLayout(self.result_panel);result_box.setContentsMargins(12,10,12,10);self.result_headline=_label("Processing complete");self.result_headline.setObjectName("resultHeadline");result_box.addWidget(self.result_headline);self.result_summary=_label("",True);result_box.addWidget(self.result_summary);row=QHBoxLayout();self.open_output_button=QPushButton("Open output");self.open_report_button=QPushButton("Open processing report");self.open_output_button.clicked.connect(self._open_output);self.open_report_button.clicked.connect(self._open_report);row.addWidget(self.open_output_button);row.addWidget(self.open_report_button);row.addStretch();result_box.addLayout(row);self.result_panel.hide();box.addWidget(self.result_panel)
@@ -808,10 +845,12 @@ class MainWindow(QMainWindow):
             self.workflow_layout.setColumnStretch(0,1);self.workflow_layout.setColumnStretch(1,0)
         self._wide_layout=wide;self._layout_state=state
     @staticmethod
-    def _file_row(box,title,placeholder,callback,edit_type=QLineEdit):
+    def _file_row(box,title,placeholder,callback,edit_type=ElidedPathLineEdit):
         row=QHBoxLayout(); label=_label(title); label.setMinimumWidth(95); row.addWidget(label); edit=edit_type(); edit.setPlaceholderText(placeholder); edit.setClearButtonEnabled(True); edit.setMinimumWidth(0); row.addWidget(edit,1); button=QPushButton("Browse…");button.setFixedWidth(100);button.clicked.connect(callback);row.addWidget(button);box.addLayout(row);return edit,button
     def _add_flight(self,checked=False,trigger=True):
+        first_multi=len(self.flight_rows)==1
         row=FlightRow(len(self.flight_rows)+1);row.changed.connect(self._inputs_changed);row.remove_requested.connect(self._remove_flight);row.move_requested.connect(self._move_flight);row.duplicate_requested.connect(self._duplicate_flight);self.flight_rows.append(row);self.flights_layout.addWidget(row);self._renumber();self._sync_aliases()
+        if first_multi:self.mode_combo.setCurrentIndex(self.mode_combo.findData("merge"))
         if trigger:self._inputs_changed();self._mode_changed()
         return row
     def _remove_flight(self,row):
@@ -826,10 +865,6 @@ class MainWindow(QMainWindow):
         self.flights_layout.removeWidget(row);self.flights_layout.insertWidget(target,row);self._renumber();self._sync_aliases();self._inputs_changed();self._mode_changed()
     def _duplicate_flight(self,source):
         row=self._add_flight(trigger=False);row.folder_edit.setText(source.folder_edit.text());row.las_edit.setText(source.las_edit.text());row.name_edit.setText(f"{source.name_edit.text().strip()} copy"[:48]);row.transform_source.setCurrentIndex(source.transform_source.currentIndex());row.transform_edit.setText(source.transform_edit.text());row.matrix_text.setPlainText(source.matrix_text.toPlainText());self._inputs_changed();self._mode_changed()
-    def _bulk_add_flights(self):
-        dialog=QFileDialog(self,"Select one or more native Inspector flight folders");dialog.setFileMode(QFileDialog.FileMode.Directory);dialog.setOption(QFileDialog.Option.DontUseNativeDialog,True);dialog.setOption(QFileDialog.Option.ShowDirsOnly,True)
-        for view in [*dialog.findChildren(QListView),*dialog.findChildren(QTreeView)]:view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        if dialog.exec():self._add_flight_folders([Path(value) for value in dialog.selectedFiles()])
     def _import_inspector_asset(self):
         start=str(self.settings.value("lastInspectorAssetFolder",""))
         path=QFileDialog.getExistingDirectory(self,"Choose an Inspector Asset folder",start)
@@ -884,13 +919,14 @@ class MainWindow(QMainWindow):
         else:self.drop_overlay.hide()
     def _renumber(self):
         for i,row in enumerate(self.flight_rows,1):row.set_default_number(i);row.remove_button.setVisible(len(self.flight_rows)>1);row.up_button.setEnabled(i>1 and self._job_kind!="run");row.down_button.setEnabled(i<len(self.flight_rows) and self._job_kind!="run")
+        if hasattr(self,"flights_toggle") and not self.flights_toggle.isChecked():self.flights_toggle.setText(f"Show flights ({len(self.flight_rows)})")
     def _sync_aliases(self):
         self.source_edit=self.flight_rows[0].folder_edit; self.las_edit=self.flight_rows[0].las_edit; self.source_button=self.flight_rows[0].folder_button; self.las_button=self.flight_rows[0].las_button
     def _install_shortcuts(self):
         self._shortcuts=[]
         for keys,callback in (("Ctrl+Shift+A",self._add_flight),("Ctrl+R",self._inputs_changed),("Ctrl+Return",self._start_colorization),("Ctrl+,",self._show_advanced_settings),("Ctrl+Shift+,",self._show_application_settings)):
             shortcut=QShortcut(QKeySequence(keys),self);shortcut.activated.connect(callback);self._shortcuts.append(shortcut)
-        self.add_flight_button.setAccessibleName("Add one flight");self.asset_import_button.setAccessibleName("Browse an Inspector Asset by inspection and flight name");self.bulk_add_button.setAccessibleName("Import multiple flight folders manually");self.run_button.setAccessibleName("Start colorization");self.progress_bar.setAccessibleName("Overall processing progress");self.advanced_button.setAccessibleName("Open advanced processing settings");self.settings_button.setAccessibleName("Open application settings")
+        self.add_flight_button.setAccessibleName("Add one flight");self.asset_import_button.setAccessibleName("Browse an Inspector Asset by inspection and flight name");self.run_button.setAccessibleName("Start colorization");self.progress_bar.setAccessibleName("Overall processing progress");self.advanced_button.setAccessibleName("Open advanced processing settings");self.settings_button.setAccessibleName("Open application settings")
         self.setTabOrder(self.source_edit,self.las_edit);self.setTabOrder(self.las_edit,self.calibration_edit);self.setTabOrder(self.calibration_edit,self.mode_combo);self.setTabOrder(self.mode_combo,self.output_edit);self.setTabOrder(self.output_edit,self.run_button)
     def _navigate_to_check(self,item):
         text=f"{item.get('label','')} {item.get('detail','')}";target=None
@@ -899,11 +935,10 @@ class MainWindow(QMainWindow):
         lower=text.casefold()
         if "calibration" in lower:widget=self.calibration_edit
         elif "merged point" in lower:widget=self.merged_edit
-        elif "cloudcompare" in lower:widget=self.cloudcompare_edit
         elif "transform" in lower and target:widget=target.transform_edit if target.transform_source.currentData()=="file" else target.matrix_text
         elif "point cloud" in lower and target:widget=target.las_edit
         else:widget=(target or self.flight_rows[0]).folder_edit
-        if target:target.collapse_button.setChecked(True)
+        if target:self.flights_toggle.setChecked(True);target.collapse_button.setChecked(True)
         self._set_processing_focus(False);self.scroll_area.ensureWidgetVisible(widget,30,80);widget.setFocus(Qt.FocusReason.ShortcutFocusReason)
     @staticmethod
     def _output_stem(value):
@@ -930,9 +965,9 @@ class MainWindow(QMainWindow):
         selection=self._selection();planned=self._planned_outputs(selection)
         conflicts=[path.name for path in planned.values() if path.exists()]
         if selection.mode=="separate" and len(selection.flights)>1 and self.output_edit.text().strip() and (Path(self.output_edit.text().strip())/"multi_flight_report.json").exists():conflicts.append("multi_flight_report.json")
-        if not planned:self.output_preview.setText("Choose an output location to preview generated files.")
-        else:
-            names=[path.name for path in planned.values()];shown=", ".join(names[:3])+(f" and {len(names)-3} more" if len(names)>3 else "");self.output_preview.setText(("Conflict: " if conflicts else "Will create: ")+shown+(f". Existing: {', '.join(conflicts[:3])}" if conflicts else ""));self.output_preview.setStyleSheet("color:#b34330;font-weight:600" if conflicts else "")
+        if conflicts:
+            self.output_preview.setText(f"Conflict: existing output {', '.join(conflicts[:3])}");self.output_preview.setStyleSheet("color:#b34330;font-weight:600");self.output_preview.show()
+        else:self.output_preview.clear();self.output_preview.hide()
         report=self._last_inspection_result or {};reports=report.get("flights") or ([report] if report else []);points=[int(item.get("point_count") or 0) for item in reports];durations=[float(item.get("video_duration_s") or 0) for item in reports]
         frames=0
         for duration in durations:
@@ -964,8 +999,7 @@ class MainWindow(QMainWindow):
             calibration_override=self.calibration_edit.text().strip() or None,
             mode=str(self.mode_combo.currentData()),
             maximum_color_distance_m=self.distance_spin.value() if self.distance_check.isChecked() else None,
-            alignment_method=str(self.alignment_combo.currentData()),merged_source=self.merged_edit.text().strip() or None,
-            cloudcompare_executable=self.cloudcompare_edit.text().strip() or None,
+            merged_source=self.merged_edit.text().strip() or None,
             illumination_balancing=self.color_balance_check.isChecked(),advanced=self.advanced_settings,resources=self.resource_preferences)
     def _inspection_selection(self):
         return replace(self._selection(),illumination_balancing=False,advanced=AdvancedProcessingSettings(),resources=ResourcePreferences())
@@ -1037,29 +1071,17 @@ class MainWindow(QMainWindow):
     def _browse_merged(self):
         path,_=QFileDialog.getOpenFileName(self,"Choose aligned merged point cloud",self.merged_edit.text(),"Point cloud (*.las *.laz)")
         if path:self.merged_edit.setText(path)
-    def _browse_cloudcompare(self):
-        path,_=QFileDialog.getOpenFileName(self,"Choose CloudCompare executable",self.cloudcompare_edit.text(),"CloudCompare (CloudCompare.exe);;Executable (*.exe)")
-        if path:self.cloudcompare_edit.setText(path)
-    def _show_alignment_guide(self):
-        QMessageBox.information(self,"CloudCompare alignment workflow",
-            "1. Load every original flight LAS/LAZ into CloudCompare.\n"
-            "2. Keep one cloud fixed. Roughly align and run ICP between clouds with strong overlap; use overlapping chains when a flight does not overlap the fixed cloud.\n"
-            "3. Add redundant overlap links where possible and inspect loop closure. Do not accept a pair that improves locally but breaks another aligned overlap.\n"
-            "4. Record each flight's final cumulative 4 x 4 source-to-merged transform. The direction must be original source → merged coordinates.\n"
-            "5. Apply the final transforms, remove noise if desired, merge the aligned clouds, and save one LAS/LAZ.\n"
-            "6. Select that merged cloud here and assign each final matrix to its matching flight. Leave a matrix blank only when that flight remained in the final coordinate frame.")
+    def _set_flights_expanded(self,expanded):
+        self.flights_body.setVisible(expanded);self.flights_toggle.setText("Collapse flights" if expanded else f"Show flights ({len(self.flight_rows)})")
     def _mode_changed(self,*_):
         multiple=len(self.flight_rows)>1
         if not multiple and self.mode_combo.currentData()!="separate":self.mode_combo.setCurrentIndex(0);return
         self.mode_label.setVisible(multiple);self.mode_combo.setVisible(multiple);self.mode_help.setVisible(multiple)
         merge=self.mode_combo.currentData()=="merge"
-        manual=self.alignment_combo.currentData()=="manual"
-        self.alignment_panel.setVisible(multiple and merge);self.manual_panel.setVisible(manual);self.automatic_panel.setVisible(not manual)
-        for row in self.flight_rows:row.set_transform_visible(multiple and merge and manual)
+        self.alignment_panel.setVisible(multiple and merge)
+        for row in self.flight_rows:row.set_transform_visible(multiple and merge)
         if merge:
-            self.mode_help.setText("Merged processing colorizes one final geometry with all flights. Point clouds should already be closely aligned in Inspector's coordinate system.");self.run_button.setText("Colorize merged point cloud")
-            if manual:self.alignment_help.setText("In CloudCompare, build alignment links between strongly overlapping clouds, verify loops, apply each final cumulative transform, then merge and save one LAS/LAZ. Supply each source-to-merged 4 x 4 matrix below.")
-            else:self.alignment_help.setText("The tool finds overlapping flight pairs, validates pairwise CloudCompare ICP, and globally optimizes the connected network with Flight 1 fixed. Disconnected or inconsistent networks stop for manual alignment.")
+            self.mode_help.setText("Colorize the already merged cloud you provide using observations from every flight.");self.run_button.setText("Colorize merged point cloud")
         elif multiple:self.mode_help.setText("Colorize each flight independently and save one LAS per flight; alignment is skipped.");self.run_button.setText("Colorize all flights separately")
         else:self.run_button.setText("Colorize point cloud")
         if not merge:
@@ -1081,9 +1103,6 @@ class MainWindow(QMainWindow):
     def _on_result(self,result):
         if self._job_kind=="inspect":
             if self._job_revision!=self._revision or self._job_selection!=self._inspection_selection():return
-            detected=result.get("cloudcompare_executable")
-            self.cloudcompare_edit.setPlaceholderText(f"Automatically detected: {detected}" if detected else "Not detected; install CloudCompare or browse to CloudCompare.exe…")
-            self.cloudcompare_edit.setToolTip(str(detected or "CloudCompare CLI is required only for automatic alignment."))
             self._ready=bool(result.get("ready"));self._last_inspection_result=result;self._inspected_selection=self._job_selection;self.checklist.set_rows(result.get("checklist",[]));missing=[x for x in result.get("dependencies",[]) if x.get("status")=="missing"];self.dependencies.setVisible(bool(missing));self.dependencies.set_rows(missing);self.tools_summary.setText("All required local tools are ready." if not missing else "Some local tools need attention.");self.summary.setText(str(result.get("summary","")));self.state_label.setText("Ready to colorize." if self._ready else "Resolve required items above.")
             reports=result.get("flights") or ([result] if len(self.flight_rows)==1 else [])
             for index,row in enumerate(self.flight_rows):row.set_readiness(reports[index] if index<len(reports) else None)
@@ -1180,7 +1199,7 @@ class MainWindow(QMainWindow):
         report=self._last_inspection_result or {};flights=report.get("flights") or [report]
         counts=[max(0,int(item.get("point_count") or 0)) for item in flights]
         if selection.mode=="merge":
-            base=(30 if selection.alignment_method=="automatic" else 25)*gib
+            base=25*gib
             merged_estimate=max(counts,default=0)
             candidates=0 if selection.advanced.multi_frame_fusion else merged_estimate*16*len(counts)
             return base+candidates+(sum(counts)*65 if selection.advanced.multi_frame_fusion else 0)
@@ -1214,7 +1233,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self,"run_button"):return
         running=self._job_kind=="run";idle=self._thread is None;names_valid=not self._duplicate_name_rows()
         for row in self.flight_rows:row.set_enabled(not running)
-        for x in (self.add_flight_button,self.asset_import_button,self.bulk_add_button,self.calibration_edit,self.calibration_button,self.mode_combo,self.alignment_combo,self.alignment_guide_button,self.merged_edit,self.merged_button,self.cloudcompare_edit,self.cloudcompare_button,self.distance_check,self.color_balance_check,self.advanced_button,self.settings_button,self.output_edit,self.output_button,self.refresh_button):x.setEnabled(not running)
+        for x in (self.add_flight_button,self.asset_import_button,self.calibration_edit,self.calibration_button,self.mode_combo,self.merged_edit,self.merged_button,self.distance_check,self.color_balance_check,self.advanced_button,self.settings_button,self.output_edit,self.output_button,self.refresh_button,self.flights_toggle):x.setEnabled(not running)
         self._renumber()
         self.distance_spin.setEnabled(not running and self.distance_check.isChecked());self.cancel_button.setVisible(running);self.cancel_button.setEnabled(running and not self._cancellation.is_set());merge_valid=self.mode_combo.currentData()!="merge" or len(self.flight_rows)>1;can=idle and names_valid and self._ready and self._inspected_selection==self._inspection_selection() and self._output_valid() and merge_valid and not self._inspection_pending and not self._output_conflicts();self.run_button.setEnabled(can)
     def _start_colorization(self):

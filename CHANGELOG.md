@@ -5,6 +5,31 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-15
+
+### Changed
+
+- Compacted collapsed flight rows into a single control-and-summary line and
+  added a control to collapse the complete Flights section.
+- Elided long selected paths in the middle while retaining their complete value
+  and tooltip.
+- Hid successful readiness checks by default behind an expandable completed
+  checks control so warnings and missing requirements remain prominent.
+- Made **One merged cloud** the default multi-flight workflow and clarified that
+  it uses an already aligned, user-supplied merged LAS/LAZ.
+- Restored detailed per-flight projection stages, including visibility and RGB
+  assignment, to the live processing log during parallel merged processing.
+
+### Removed
+
+- Removed the redundant **Import Flight Folders** button; Asset import,
+  individual flight entry, and drag-and-drop remain available.
+- Removed automatic CloudCompare alignment and its executable selection,
+  instructions, and processing path. Multi-flight processing now offers only
+  separate outputs or colorization of a supplied merged cloud.
+- Removed the proposed-output filename line; existing-output conflicts remain
+  visible and continue to block processing.
+
 ## [1.5.1] - 2026-10-15
 
 ### Fixed

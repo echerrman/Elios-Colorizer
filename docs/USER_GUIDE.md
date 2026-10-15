@@ -34,9 +34,8 @@ skipped and reported as a discovery note instead of stopping the whole browse
 operation. If an expected inspection or flight is missing, refresh Inspector's
 local workspace and try again.
 
-The original workflow remains available: use **Import Flight Folders**, add an
-individual flight row, or drag folders into the window. Both workflows use the
-same validation and colorization pipeline.
+You can also add an individual flight row or drag flight folders into the main
+window. Both approaches use the same validation and colorization pipeline.
 
 ## Choose a workflow
 
@@ -48,16 +47,17 @@ workflow.
 
 ### Multiple separate outputs
 
-Add a row for each flight and choose **Separate colorized LAS files**. Select an
+Add a row for each flight and choose **Separate outputs**. Select an
 output directory. Every flight is processed independently and retains its own
 geometry.
 
-### Align and merge
+### One merged cloud
 
-Add two or more flights and choose **Align and merge into one cloud**. Select a
-new `.las` output. The first cloud is the coordinate reference. A bounded rigid
-correction is accepted only when held-out overlap improves within conservative
-movement limits; otherwise the original Inspector coordinates are retained.
+Add two or more flights and leave the default **One merged cloud** selection.
+Provide the LAS/LAZ that you have already aligned and merged, along with each
+flight's source-to-merged transform when it is not identity, then select a new
+`.las` output. The application validates the supplied geometry and transforms;
+it does not perform automatic alignment.
 
 Overlapping observations are reconciled spatially. The highest-confidence color
 wins rather than averaging visibly different colors.
@@ -98,7 +98,8 @@ values are recorded in the report.
 
 The run button becomes available only after all selected flights contain usable
 metadata, video, pose, camera-state timing, point-cloud geometry, and compatible
-calibration. Resolve every required checklist item before processing.
+calibration. Missing requirements and warnings remain visible. Successful checks
+are summarized behind **Show completed checks** and can be expanded when needed.
 
 ## Reviewing output
 
@@ -121,13 +122,14 @@ workflow. No setting is required when resizing the window.
 
 ## Desktop workflow conveniences
 
-- Drag flight folders onto the window or use **Import Flight Folders** to populate
-  a multi-flight job. Flight cards can be collapsed, reordered, or duplicated.
+- Drag flight folders onto the window or add flights individually. Flight cards
+  can be collapsed, reordered, or duplicated, and the complete Flights section
+  can be collapsed once setup is finished.
 - Missing readiness items provide **Go to input** actions that expand and focus
   the related control.
 - The processing section shows the active advanced settings, estimated sampled
   frames, point count, recommended free disk space, detected CPU/CUDA resources,
-  intended parallel strategy, and proposed output filenames before a run.
+  and intended parallel strategy before a run.
 - Existing output conflicts are identified before processing can start.
 - During processing, setup sections collapse into a focused view while the Run,
   Cancel, overall progress, elapsed time, and ETA controls remain visible in the

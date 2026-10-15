@@ -154,8 +154,7 @@ def test_action_buttons_and_color_balance_placeholder(ui):
     assert second.duplicate_button.text() == "Duplicate"
     assert second.up_button.width() == second.down_button.width() == 38
     assert window.asset_import_button.text() == "Import Inspector Asset…"
-    assert window.bulk_add_button.text() == "Import Flight Folders…"
-    assert not window.bulk_add_button.icon().isNull()
+    assert not hasattr(window, "bulk_add_button")
     assert "↻" in window.refresh_button.text()
     assert window.color_balance_check.isEnabled()
     assert window.color_balance_check.text() == "Illumination Balancing"
@@ -274,6 +273,12 @@ def test_flight_cards_support_bulk_add_collapse_duplicate_and_reorder(ui, tmp_pa
     first = window.flight_rows[0]
     first.collapse_button.setChecked(False)
     assert first.body.isHidden() and not first.compact_summary.isHidden()
+    assert first.compact_summary.parent() is first
+    collapsed_height=first.sizeHint().height();first.collapse_button.setChecked(True)
+    assert collapsed_height < first.sizeHint().height()
+    window.flights_toggle.setChecked(False)
+    assert window.flights_body.isHidden()
+    window.flights_toggle.setChecked(True)
     window._duplicate_flight(first)
     duplicate = window.flight_rows[-1]
     assert duplicate.folder_edit.text() == str(first_folder)
@@ -333,7 +338,7 @@ def test_sticky_focus_preflight_settings_and_output_preview(ui, tmp_path):
     window.output_edit.setText(str(output));window._update_processing_summaries()
     assert [chip.text() for chip in window.settings_chips] == ["5 fps", "Exclude outer 4%", "Strong blur", "Fusion On", "00:00:10–00:00:30"]
     assert "approximately 100 sampled frames" in window.preflight_summary.text()
-    assert "Will create: result.las" in window.output_preview.text()
+    assert window.output_preview.isHidden() and window.output_preview.text() == ""
     assert window.sticky_bar.parent() is window.centralWidget()
     window._apply_responsive_layout(1600)
     before = window.workflow_layout.getItemPosition(window.workflow_layout.indexOf(window.processing_card))
@@ -508,6 +513,21 @@ def test_warning_details_are_collapsed_and_expandable(ui):
     assert not details.isHidden()
 
 
+def test_successful_checks_are_hidden_until_requested(ui):
+    window = ui(FakeBackend())
+    window.checklist.set_rows([
+        {"label":"Video","status":"ok","detail":"Ready"},
+        {"label":"Timing","status":"warning","detail":"Review timing"},
+    ])
+    toggle = next(item for item in window.checklist.findChildren(QPushButton)
+                  if item.text() == "Show completed checks (1)")
+    ready = next(label for label in window.checklist.findChildren(QLabel)
+                 if label.text() == "READY")
+    assert not ready.isVisible()
+    toggle.click();QApplication.processEvents()
+    assert "Hide completed checks" == toggle.text()
+
+
 def test_cancel_stays_responsive_and_waits_for_worker(ui, tmp_path):
     backend = FakeBackend()
     backend.block_run = True
@@ -547,16 +567,13 @@ def test_disk_space_recommendation_is_workflow_aware_and_can_block_start(ui, tmp
     selection = window._selection()
     gib = 1024**3
     window.mode_combo.setCurrentIndex(1)
-    window.alignment_combo.setCurrentIndex(0)
     assert window._recommended_free_space_bytes(window._selection()) == 25*gib
-    window.alignment_combo.setCurrentIndex(1)
-    assert window._recommended_free_space_bytes(window._selection()) == 30*gib
 
     seen = []
     monkeypatch.setattr(ui_module.shutil, "disk_usage", lambda _path: type("Usage", (), {"free": 10*gib})())
     window._show_low_disk_warning = lambda free, recommended, location: seen.append((free,recommended,location)) or True
     assert window._disk_space_allows_start(window._selection(), tmp_path / "merged.las")
-    assert seen[0][0:2] == (10*gib,30*gib)
+    assert seen[0][0:2] == (10*gib,25*gib)
 
 
 def test_long_paths_stay_inside_panels(ui):
@@ -576,6 +593,9 @@ def test_long_paths_stay_inside_panels(ui):
 
     scroll = window.scroll_area
     assert scroll.horizontalScrollBar().maximum() == 0
+    assert window.source_edit.text() == long_path
+    assert "…" in window.source_edit._display_text()
+    assert window.source_edit.toolTip() == long_path
     assert any('\u200b' in label.text() for label in window.checklist.findChildren(QLabel))
 
 
@@ -594,6 +614,9 @@ def test_multi_flight_modes_and_optional_distance(ui, tmp_path):
     assert second.name_edit.text() == "Flight 2"
     assert second.name_edit.maxLength() == 48
     assert window.mode_combo.isVisible()
+    assert window.mode_combo.currentData() == "merge"
+    assert window.mode_combo.currentText() == "One merged cloud"
+    window.mode_combo.setCurrentIndex(window.mode_combo.findData("separate"))
     window.source_edit.setText("flight-one")
     window.las_edit.setText("one.las")
     second.folder_edit.setText("flight-two")
@@ -611,10 +634,9 @@ def test_multi_flight_modes_and_optional_distance(ui, tmp_path):
     flights, saved, calibration, mode, distance = backend.last_run
     assert [item["folder"] for item in flights] == ["flight-one", "flight-two"]
     assert (saved, calibration, mode, distance) == (str(output), "shared.json", "separate", 6.5)
-    window.mode_combo.setCurrentIndex(1)
-    assert "closely aligned" in window.mode_help.text()
+    window.mode_combo.setCurrentIndex(window.mode_combo.findData("merge"))
+    assert "already merged cloud" in window.mode_help.text()
     assert window.alignment_panel.isVisible()
-    assert window.manual_panel.isVisible()
     assert window.flight_rows[0].transform_edit.isVisible()
     window.flight_rows[0].name_edit.setText("Bottom Cap")
     window._renumber()
@@ -624,9 +646,6 @@ def test_multi_flight_modes_and_optional_distance(ui, tmp_path):
     assert window.flight_rows[0].matrix_text.isVisible()
     assert window.flight_rows[0].selection().name == "Bottom Cap"
     assert window.flight_rows[0].selection().transform_values.startswith("1 0 0 0")
-    window.alignment_combo.setCurrentIndex(1)
-    assert window.automatic_panel.isVisible()
-    assert not window.flight_rows[0].transform_edit.isVisible()
     assert not window.run_button.isEnabled()  # merged mode needs a .las output
     window._remove_flight(second)
     QApplication.processEvents()

@@ -66,7 +66,7 @@ reprojection checks. Read the [camera calibration guide](docs/CALIBRATION.md).
 Select **Import Inspector Asset** to browse a local Inspector 5 asset as a
 human-readable Asset → Inspection → Flight hierarchy. Select any combination of
 flights and add them to the existing workflow without finding their UUID folders
-manually. **Import Flight Folders** and drag-and-drop remain available.
+manually. Individual flight entry and drag-and-drop remain available.
 
 | Workflow | Result |
 | --- | --- |
@@ -74,11 +74,9 @@ manually. **Import Flight Folders** and drag-and-drop remain available.
 | Multiple flights, separate | One independent colorized LAS per flight |
 | Multiple flights, merged | Confidence-aware colorization of one aligned merged LAS |
 
-Merged output supports a user-aligned cloud with per-flight transforms or an
-automatic alignment workflow. Automatic alignment accepts corrections only when
-overlap improves within strict movement and quality limits; a failed alignment
-stops the run and directs the user to align manually. Merging works best when
-Inspector has already placed every cloud in a common coordinate system.
+Merged output requires an already aligned, user-supplied merged LAS/LAZ plus any
+needed per-flight source-to-merged transforms. The application validates those
+inputs but does not modify their alignment.
 
 An optional distance limit prevents distant background points from receiving
 low-confidence RGB. Uncolored points are retained in every workflow so the user

@@ -23,6 +23,8 @@ The application:
 - Checks metadata and StarNet video origins for agreement.
 - Rejects unfamiliar clock offsets instead of guessing their sign.
 - Preserves the recorded frame-counter mapping across video segments.
+- Excludes only short timestamp disturbances that demonstrably return to the
+  established frame cadence; affected video indices are never renumbered.
 - Accepts only small trailing counter/video mismatches consistent with normal
   recording finalization.
 - Rejects a large overrun as a possible missing or truncated video segment.

@@ -5,6 +5,15 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-10-15
+
+### Fixed
+
+- Conservatively handles short, fully recovered StarNet `VideoFrameSync`
+  timestamp glitches by excluding only the affected frame timestamps without
+  renumbering or shifting video frames. Persistent clock changes, counter
+  resets, and unbounded timestamp reversals continue to fail closed.
+
 ## [1.5.0] - 2026-10-13
 
 ### Added
@@ -173,7 +182,8 @@ project follows [Semantic Versioning](https://semver.org/).
   RGB-video ingestion.
 - Explicit `Colorized` output attribute and deterministic packaged self-test.
 
-[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/echerrman/Elios-Colorizer/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/echerrman/Elios-Colorizer/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/echerrman/Elios-Colorizer/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/echerrman/Elios-Colorizer/compare/v1.3.0...v1.3.1

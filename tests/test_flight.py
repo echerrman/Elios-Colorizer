@@ -154,6 +154,50 @@ def test_starnet_rejects_inconsistent_video_offset(tmp_path):
         parse_starnet(path)
 
 
+def _starnet_with_frame_times(frame_times_us):
+    schema = record(b'\x00\xff\xff' + json.dumps(dict(id=14, name='Camera', version=4)).encode())
+    envelope = b'\x02' + (1_000_000).to_bytes(5, 'little')
+    data = schema + record(envelope + bytes([14, 4]) + bytes(31))
+    for frame, timestamp in enumerate(frame_times_us, 1):
+        data += record(envelope + bytes([14, 2]) + struct.pack('<IQ', frame, timestamp))
+    return data
+
+
+def test_starnet_excludes_short_fully_recovered_timestamp_glitch(tmp_path):
+    interval_us = 33_365
+    times = np.arange(100, dtype=np.int64) * interval_us + 1_000_000
+    times[30:60] -= 2 * interval_us
+    path = tmp_path / 'bounded-clock-glitch.stn'
+    path.write_bytes(_starnet_with_frame_times(times))
+
+    camera = parse_starnet(path)
+
+    np.testing.assert_array_equal(camera.frame_indices[:30], np.arange(30))
+    np.testing.assert_array_equal(camera.frame_indices[30:], np.arange(60, 100))
+    assert np.all(np.diff(camera.frame_times_s) > 0)
+    assert camera.timing_diagnostics['frame_sync_timestamp_records_excluded'] == 30
+    assert camera.timing_diagnostics['frame_sync_timestamp_glitches'] == [{
+        'anchor_counter': 30,
+        'first_excluded_counter': 31,
+        'last_excluded_counter': 60,
+        'recovery_counter': 61,
+        'excluded_records': 30,
+        'recovery_span_s': pytest.approx(31 * interval_us / 1e6),
+    }]
+    assert any('video frame indices were not shifted' in warning for warning in camera.warnings)
+
+
+def test_starnet_rejects_timestamp_reversal_without_prompt_recovery(tmp_path):
+    interval_us = 33_365
+    times = np.arange(120, dtype=np.int64) * interval_us + 1_000_000
+    times[30:] -= 2 * interval_us
+    path = tmp_path / 'unbounded-clock-glitch.stn'
+    path.write_bytes(_starnet_with_frame_times(times))
+
+    with pytest.raises(FlightError, match='without returning promptly'):
+        parse_starnet(path)
+
+
 class FakeVideoCapture:
     def __init__(self, path, frame_count=3, fps=30.0):
         self.frame_count = frame_count

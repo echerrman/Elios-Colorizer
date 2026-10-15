@@ -21,7 +21,7 @@ from typing import Callable, Iterator
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 POSE_TOPIC = "/kalman_scan2map_node/odometry"
 SERVO_TOPIC = "/sensors/servo_angle"
 ESCAPES = {0xAB: 0xAA, 0xAC: 0x55, 0xAD: 0xF0, 0xAF: 0xA5}
@@ -265,6 +265,95 @@ def _unescape(data):
     return bytes(out)
 
 
+def _exclude_bounded_frame_sync_glitches(frames: np.ndarray) -> tuple[np.ndarray, list[dict]]:
+    """Drop only short timestamp disturbances that return to the prior cadence.
+
+    Frame counters remain authoritative and are never renumbered. A recovery is
+    accepted only when a later timestamp lands back on the cadence projected
+    from the last good record and subsequent intervals are normal. This keeps
+    an isolated camera-clock disturbance from shifting any decoded video frame.
+    """
+    if len(frames) < 2 or np.all(np.diff(frames[:, 1]) > 0):
+        return frames, []
+
+    counter_steps = np.diff(frames[:, 0])
+    time_steps = np.diff(frames[:, 1])
+    positive = time_steps > 0
+    per_frame_steps = time_steps[positive] / counter_steps[positive]
+    nominal = float(np.median(per_frame_steps)) if len(per_frame_steps) else math.nan
+    if not np.isfinite(nominal) or not 1 / 240 <= nominal <= 1:
+        raise FlightError(
+            "Video frame timestamps reverse and no plausible stable frame cadence can be established."
+        )
+
+    maximum_span_frames = max(2, int(math.ceil(2.0 / nominal)))
+    endpoint_tolerance_s = max(.005, nominal * .25)
+    local_tolerance_s = max(.001, nominal * .05)
+    keep = np.ones(len(frames), dtype=bool)
+    glitches = []
+    index = 0
+    while index < len(frames) - 1:
+        if frames[index + 1, 1] > frames[index, 1]:
+            index += 1
+            continue
+        if len(glitches) >= 4:
+            raise FlightError("Video frame timestamps contain too many separate reversals to repair safely.")
+        anchor = index
+        preceding = max(0, anchor - 5)
+        prior_counter_steps = np.diff(frames[preceding:anchor + 1, 0])
+        prior_time_steps = np.diff(frames[preceding:anchor + 1, 1])
+        prior_per_frame = prior_time_steps / prior_counter_steps
+        if anchor - preceding < 5 or not (
+                np.all(prior_time_steps > 0)
+                and np.all(np.abs(prior_per_frame - nominal) <= local_tolerance_s)):
+            raise FlightError(
+                "Video frame timestamps reverse before a stable preceding cadence can be established."
+            )
+        recovery = None
+        for candidate in range(anchor + 2, len(frames)):
+            frame_span = frames[candidate, 0] - frames[anchor, 0]
+            if frame_span > maximum_span_frames:
+                break
+            projected = frames[anchor, 1] + frame_span * nominal
+            if abs(frames[candidate, 1] - projected) > endpoint_tolerance_s:
+                continue
+            following = min(len(frames) - 1, candidate + 5)
+            if following == candidate:
+                continue
+            next_counter_steps = np.diff(frames[candidate:following + 1, 0])
+            next_time_steps = np.diff(frames[candidate:following + 1, 1])
+            next_per_frame = next_time_steps / next_counter_steps
+            if np.all(next_time_steps > 0) and np.all(np.abs(next_per_frame - nominal) <= local_tolerance_s):
+                recovery = candidate
+                break
+        if recovery is None:
+            raise FlightError(
+                "Video frame timestamps reverse without returning promptly to the established cadence; "
+                "the clock mapping is unsafe."
+            )
+        keep[anchor + 1:recovery] = False
+        glitches.append({
+            "anchor_counter": int(frames[anchor, 0]),
+            "first_excluded_counter": int(frames[anchor + 1, 0]),
+            "last_excluded_counter": int(frames[recovery - 1, 0]),
+            "recovery_counter": int(frames[recovery, 0]),
+            "excluded_records": int(recovery - anchor - 1),
+            "recovery_span_s": float(frames[recovery, 1] - frames[anchor, 1]),
+        })
+        index = recovery
+
+    excluded = int((~keep).sum())
+    maximum_excluded = max(60, int(math.ceil(len(frames) * .005)))
+    if excluded > maximum_excluded:
+        raise FlightError(
+            f"Video frame timestamps require excluding {excluded:,} records, which exceeds the conservative repair limit."
+        )
+    repaired = frames[keep]
+    if np.any(np.diff(repaired[:, 1]) <= 0):
+        raise FlightError("Video frame timestamps remain non-monotonic after bounded-glitch exclusion.")
+    return repaired, glitches
+
+
 def parse_starnet(path, cancelled=None) -> StarNetData:
     """Parse schema-v4 camera messages; corrupt/opaque envelopes are excluded."""
     data = Path(path).read_bytes()
@@ -325,12 +414,27 @@ def parse_starnet(path, cancelled=None) -> StarNetData:
     p = np.asarray(pitch, dtype=np.float64)
     f = np.asarray(sync, dtype=np.float64)
     c = np.asarray(commands, dtype=np.float64).reshape(-1, 2)
-    if f[0, 0] != 1 or np.any(np.diff(f[:, 0]) <= 0) or np.any(np.diff(f[:, 1]) <= 0):
+    if f[0, 0] != 1 or np.any(np.diff(f[:, 0]) <= 0):
         raise FlightError("Video frame counters do not form one monotonic recording starting at 1. Multiple recordings/resets require explicit mapping.")
+    f, timestamp_glitches = _exclude_bounded_frame_sync_glitches(f)
     warnings = ["FrameSync counter 1 is mapped to decoded global frame 0; validate this convention in the calibration overlay."]
     origin = float(f[0, 1])
     clock_checks = dict(video_origin_flight_clock_s=origin, frame_sync_first_counter=int(f[0, 0]),
                         frame_sync_last_counter=int(f[-1, 0]), frame_sync_last_time_s=float(f[-1, 1]))
+    if timestamp_glitches:
+        excluded_sync = sum(item["excluded_records"] for item in timestamp_glitches)
+        clock_checks["frame_sync_timestamp_glitches"] = timestamp_glitches
+        clock_checks["frame_sync_timestamp_records_excluded"] = excluded_sync
+        ranges = ", ".join(
+            f'{item["first_excluded_counter"]:,}\N{EN DASH}{item["last_excluded_counter"]:,}'
+            for item in timestamp_glitches
+        )
+        warnings.append(
+            f"Excluded {excluded_sync:,} FrameSync timestamp records across "
+            f"{len(timestamp_glitches)} short, fully recovered clock "
+            f"{'glitch' if len(timestamp_glitches) == 1 else 'glitches'} "
+            f"(counters {ranges}); video frame indices were not shifted."
+        )
     if offsets:
         if np.max(np.abs(np.asarray(offsets) - origin)) > .01:
             raise FlightError('Camera VideoOffset disagrees with first FrameSync timestamp by more than 10 ms. Clock mapping must be investigated.')
@@ -351,7 +455,8 @@ def parse_starnet(path, cancelled=None) -> StarNetData:
     if np.any(np.diff(f[:, 0]) > 1):
         warnings.append("Frame synchronization has missing counters; frames without an exact timestamp are skipped.")
     return StarNetData(p[:, 0], p[:, 1], f[:, 0].astype(np.int64) - 1, f[:, 1],
-                       c[:, 0], c[:, 1], p[:, 2].astype(np.int8), warnings, valid, bad + opaque, clock_checks)
+                       c[:, 0], c[:, 1], p[:, 2].astype(np.int8), warnings, valid,
+                       bad + opaque + sum(item["excluded_records"] for item in timestamp_glitches), clock_checks)
 
 
 @dataclass

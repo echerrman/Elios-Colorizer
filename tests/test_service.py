@@ -59,7 +59,8 @@ def test_separate_flights_are_scheduled_concurrently(tmp_path, monkeypatch):
     result = run_workflow([
         {'folder': 'first', 'name': 'First'},
         {'folder': 'second', 'name': 'Second'},
-    ], str(tmp_path / 'outputs'), mode='separate')
+    ], str(tmp_path / 'outputs'), mode='separate',
+        resource_settings={'use_recommended': False, 'concurrent_flights': 2})
     assert maximum == 2
     assert result['total_points'] == 20
 

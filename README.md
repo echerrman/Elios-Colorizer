@@ -1,12 +1,5 @@
 <p align="center">
-  <img src="assets/elios_colorizer.svg" width="96" alt="Elios Colorizer logo">
-</p>
-
-<h1 align="center">Elios Colorizer</h1>
-
-<p align="center">
-  Local Windows software for projecting synchronized Elios 3 RGB video onto
-  Inspector LAS point clouds.
+  <img src="assets/social-preview.png" width="100%" alt="Elios Colorizer — Local RGB Colorization for Elios 3 LAS Point Clouds">
 </p>
 
 <p align="center">
@@ -63,9 +56,12 @@ reprojection checks. Read the [camera calibration guide](docs/CALIBRATION.md).
 
 The desktop calibration workbench starts from that selected profile and uses
 either automatic reference views or user-selected flight timestamps. Its
-interactive EDL-shaded point-cloud viewport provides video opacity, adjustable
-point size and temporary density, synchronized zoom and pan, and a resettable
-3D Inspector view. It saves corrections as a separate schema-v2 file, never
+GPU-rendered, EDL-shaded point-cloud viewport retains full detail inside each
+buffered reference view and provides video opacity, precise point size,
+synchronized zoom and pan, and automatic progressive rendering. Users can
+either refine values manually or match video pixels to cloud points and fit a
+bounded pinhole, radial/tangential, or fisheye projection with measurable
+reprojection error. It saves corrections as a separate schema-v2 file, never
 overwrites the starting profile, and embeds that complete schema-v1 profile as
 its fallback.
 

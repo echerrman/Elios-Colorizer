@@ -596,7 +596,7 @@ def test_calibration_load_uses_blocking_overlay_without_freezing_ui(ui, monkeypa
                          "synthetic calibration failure")]
 
 
-def test_calibration_controls_reset_individually_and_inspector_resets(app, tmp_path):
+def test_calibration_controls_reset_individually_and_views_are_focused(app, tmp_path):
     camera = Calibration(160, 120, 90, 90, 80, 60, (0, 0, 0, 1), (0, 0, 0),
                          (0, 1, 0), (0, 0, 0), 1, 0,
                          profile_name="Synthetic", validated=True)
@@ -624,13 +624,36 @@ def test_calibration_controls_reset_individually_and_inspector_resets(app, tmp_p
 
         assert [dialog.display_mode.itemText(index)
                 for index in range(dialog.display_mode.count())] == [
-                    "Composite", "3D Inspector", "Edge Diagnostic"]
-        dialog.display_mode.setCurrentIndex(1)
-        dialog.preview.context_angles[:] = (12, 24)
-        dialog.display_mode.setCurrentIndex(0)
-        dialog.display_mode.setCurrentIndex(1)
-        np.testing.assert_allclose(dialog.preview.context_angles, 0)
-        assert dialog.density.itemData(dialog.density.count() - 1) == 1_000_000
+                    "Composite", "Edge Diagnostic"]
+        assert not hasattr(dialog, "density")
+        assert dialog.point_size.minimum() == 1
+        assert dialog.point_size.maximum() == 8
+        assert dialog._controls["distortion_k1"].minimum() == -2
+        assert dialog._controls["distortion_k1"].maximum() == 2
+        assert dialog._controls["distortion_p1"].singleStep() == pytest.approx(.0005)
+        dialog.projection_model.setCurrentIndex(
+            dialog.projection_model.findData("fisheye"))
+        assert dialog.distortion_group.isEnabled()
+        assert dialog._distortion_labels[2].text() == "K3 · fisheye"
+        dialog._controls["distortion_k1"].setValue(.02)
+        assert dialog._current_calibration().distortion_model == "fisheye"
+        assert dialog._current_calibration().distortion_coefficients[0] == pytest.approx(.02)
+        dialog.projection_model.setCurrentIndex(
+            dialog.projection_model.findData("opencv"))
+        assert dialog._distortion_labels[2].text() == "P1 · tangential"
+        assert dialog._controls["distortion_p1"].maximum() == pytest.approx(.25)
+        dialog.preview.resize(800, 600)
+        dialog.preview.zoom = .55
+        outside_position = QPoint(10, 300)
+        dialog.preview.set_pick_mode("video")
+        assert dialog.preview._widget_to_image(outside_position) is None
+        dialog.preview.set_pick_mode("cloud")
+        overscan_pixel = dialog.preview._widget_to_image(outside_position)
+        assert overscan_pixel is not None
+        assert overscan_pixel[0] < 0
+        dialog.preview.set_pick_mode(None)
+        assert all(not button.autoDefault()
+                   for button in dialog.findChildren(QPushButton))
     finally:
         dialog.close()
         dialog.deleteLater()

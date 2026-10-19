@@ -4,11 +4,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
 from scipy.spatial import Delaunay, QhullError
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 from .camera import Calibration, CalibrationError
@@ -19,9 +20,14 @@ from .colorize import FrameObservation
 class CalibrationAdjustments:
     """Small, bounded corrections relative to an existing camera profile."""
 
-    focal_scale: float = 1.0
+    focal_scale_x: float = 1.0
+    focal_scale_y: float = 1.0
     principal_x_px: float = 0.0
     principal_y_px: float = 0.0
+    distortion_k1: float = 0.0
+    distortion_k2: float = 0.0
+    distortion_p1: float = 0.0
+    distortion_p2: float = 0.0
     mount_roll_degrees: float = 0.0
     mount_pitch_degrees: float = 0.0
     mount_yaw_degrees: float = 0.0
@@ -35,10 +41,16 @@ class CalibrationAdjustments:
         values = np.asarray(list(asdict(self).values()), dtype=np.float64)
         if not np.isfinite(values).all():
             raise CalibrationError("Calibration adjustments must be finite")
-        if not 0.8 <= self.focal_scale <= 1.2:
-            raise CalibrationError("Focal scale must be between 0.8 and 1.2")
+        if not 0.8 <= self.focal_scale_x <= 1.2:
+            raise CalibrationError("Focal scale X must be between 0.8 and 1.2")
+        if not 0.8 <= self.focal_scale_y <= 1.2:
+            raise CalibrationError("Focal scale Y must be between 0.8 and 1.2")
         if max(abs(self.principal_x_px), abs(self.principal_y_px)) > 500:
             raise CalibrationError("Principal-point corrections must be within ±500 pixels")
+        if max(abs(self.distortion_k1), abs(self.distortion_k2)) > 2:
+            raise CalibrationError("Radial-distortion corrections must be within ±2.0")
+        if max(abs(self.distortion_p1), abs(self.distortion_p2)) > .25:
+            raise CalibrationError("Tangential-distortion corrections must be within ±0.25")
         if max(abs(self.mount_roll_degrees), abs(self.mount_pitch_degrees),
                abs(self.mount_yaw_degrees), abs(self.tilt_zero_degrees)) > 15:
             raise CalibrationError("Angular corrections must be within ±15 degrees")
@@ -67,14 +79,36 @@ class CalibrationAdjustments:
             "adjustments": asdict(self),
             "reviewed_reference_frames": int(reviewed_frames),
         }
+        if base.refinement:
+            refinement["starting_refinement"] = base.refinement
         if alignment_score is not None and np.isfinite(alignment_score):
             refinement["alignment_score"] = float(alignment_score)
+        distortion_adjustments = np.array([
+            self.distortion_k1, self.distortion_k2,
+            self.distortion_p1, self.distortion_p2,
+        ], dtype=np.float64)
+        distortion_model = base.distortion_model
+        distortion_coefficients = tuple(base.distortion_coefficients)
+        if np.any(np.abs(distortion_adjustments) > 1e-12):
+            if distortion_model == "fisheye":
+                raise CalibrationError(
+                    "K1/K2/P1/P2 workbench corrections use the OpenCV lens model and "
+                    "cannot be added to a fisheye base profile")
+            if distortion_model == "pinhole":
+                distortion_model = "opencv"
+                coefficients = np.zeros(4, dtype=np.float64)
+            else:
+                coefficients = np.asarray(distortion_coefficients, dtype=np.float64).copy()
+            coefficients[:4] += distortion_adjustments
+            distortion_coefficients = tuple(float(value) for value in coefficients)
         return replace(
             base,
-            fx=base.fx * self.focal_scale,
-            fy=base.fy * self.focal_scale,
+            fx=base.fx * self.focal_scale_x,
+            fy=base.fy * self.focal_scale_y,
             cx=base.cx + self.principal_x_px,
             cy=base.cy + self.principal_y_px,
+            distortion_model=distortion_model,
+            distortion_coefficients=distortion_coefficients,
             rotation_xyzw=rotation,
             translation_m=translation,
             tilt_zero_degrees=base.tilt_zero_degrees + self.tilt_zero_degrees,
@@ -118,6 +152,344 @@ class CalibrationReferenceRequest:
     source_to_geometry: np.ndarray | None = None
 
 
+@dataclass(frozen=True)
+class CalibrationCorrespondence:
+    """One user-confirmed 2D video pixel to 3D cloud-point match."""
+
+    reference_index: int
+    image_xy: tuple[float, float]
+    world_xyz: tuple[float, float, float]
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if self.reference_index < 0:
+            raise CalibrationError("Correspondence reference index cannot be negative")
+        if not np.isfinite((*self.image_xy, *self.world_xyz)).all():
+            raise CalibrationError("Correspondence coordinates must be finite")
+
+
+@dataclass(frozen=True)
+class CalibrationFitResult:
+    """A proposed calibration and measurable reprojection diagnostics."""
+
+    calibration: Calibration
+    model: str
+    rms_error_px: float
+    median_error_px: float
+    initial_rms_error_px: float
+    per_match_error_px: tuple[float, ...]
+    information_score: float
+
+
+def correspondence_errors(
+        session: "CalibrationSession", correspondences: list[CalibrationCorrespondence],
+        calibration: Calibration) -> np.ndarray:
+    """Return one Euclidean pixel error for each enabled correspondence."""
+    values: list[float] = []
+    frames: dict[int, FrameObservation] = {}
+    for match in correspondences:
+        if not match.enabled:
+            continue
+        if match.reference_index >= len(session.references):
+            raise CalibrationError("A correspondence refers to a missing reference view")
+        frame = frames.setdefault(
+            match.reference_index, session.frame_for(match.reference_index, calibration))
+        center, camera_to_world = calibration.camera_pose(
+            frame.position_world_m, frame.orientation_xyzw, frame.camera_pitch_degrees)
+        camera = (np.asarray(match.world_xyz, dtype=np.float64) - center) @ camera_to_world
+        if camera[2] <= .01:
+            values.append(10_000.0)
+            continue
+        projected = calibration.project_camera_points(camera.reshape(1, 3))[0]
+        values.append(float(np.linalg.norm(projected - np.asarray(match.image_xy))))
+    return np.asarray(values, dtype=np.float64)
+
+
+def _projection_shape_metrics(calibration: Calibration) -> tuple[np.ndarray, np.ndarray]:
+    """Return radial mapping scale and derivative across the buffered frame."""
+    if calibration.distortion_model == "pinhole":
+        return np.ones(32), np.ones(32)
+    extent_x = max(calibration.cx, calibration.image_width-calibration.cx) / calibration.fx
+    extent_y = max(calibration.cy, calibration.image_height-calibration.cy) / calibration.fy
+    radius_max = max(.01, float(np.hypot(extent_x, extent_y))*1.35)
+    coefficients = np.zeros(4, dtype=np.float64)
+    supplied = np.asarray(calibration.distortion_coefficients, dtype=np.float64)
+    coefficients[:min(4, len(supplied))] = supplied[:4]
+    if calibration.distortion_model == "fisheye":
+        theta = np.linspace(0., np.arctan(radius_max), 32)
+        theta2 = theta*theta
+        scale = (1. + coefficients[0]*theta2 + coefficients[1]*theta2**2
+                 + coefficients[2]*theta2**3 + coefficients[3]*theta2**4)
+        derivative = (1. + 3.*coefficients[0]*theta2 + 5.*coefficients[1]*theta2**2
+                      + 7.*coefficients[2]*theta2**3 + 9.*coefficients[3]*theta2**4)
+        return scale, derivative
+    radius = np.linspace(0., radius_max, 32)
+    radius2 = radius*radius
+    scale = 1. + coefficients[0]*radius2 + coefficients[1]*radius2**2
+    derivative = 1. + 3.*coefficients[0]*radius2 + 5.*coefficients[1]*radius2**2
+    return scale, derivative
+
+
+def validate_projection_shape(calibration: Calibration) -> None:
+    """Reject distortion functions that fold or invert camera viewing rays."""
+    scale, derivative = _projection_shape_metrics(calibration)
+    if (not np.isfinite(scale).all() or not np.isfinite(derivative).all()
+            or float(np.min(scale)) <= .08 or float(np.min(derivative)) <= .08):
+        raise CalibrationError(
+            f"The calculated {calibration.distortion_model} projection folds or reverses viewing rays. "
+            "Add more well-distributed matches or use a simpler projection model.")
+    if float(np.max(scale)) > 3.0 or float(np.max(derivative)) > 5.0:
+        raise CalibrationError(
+            f"The calculated {calibration.distortion_model} projection expands the frame unrealistically. "
+            "Add matches near multiple edges or use a simpler projection model.")
+
+
+def _fit_candidate(
+        session: "CalibrationSession", matches: list[CalibrationCorrespondence],
+        initial: Calibration, model: str) -> CalibrationFitResult:
+    """Fit one supported projection family with bounded robust least squares."""
+    if model not in {"pinhole", "opencv", "fisheye"}:
+        raise CalibrationError(f"Unsupported fit model: {model}")
+    root_fallback = initial.fallback().to_dict()
+    base_rotation = Rotation.from_quat(initial.rotation_xyzw)
+    base_translation = np.asarray(initial.translation_m, dtype=np.float64)
+    coefficient_count = 0 if model == "pinhole" else 4
+    if initial.distortion_model == model:
+        start_coefficients = np.zeros(coefficient_count, dtype=np.float64)
+        supplied = np.asarray(initial.distortion_coefficients, dtype=np.float64)
+        start_coefficients[:min(coefficient_count, len(supplied))] = supplied[:coefficient_count]
+    else:
+        start_coefficients = np.zeros(coefficient_count, dtype=np.float64)
+
+    # log focal scales, principal offsets, optical roll/pitch/yaw corrections,
+    # camera translation, then model-specific coefficients.
+    principal_x_low = max(-initial.image_width*.20, -initial.cx+1.)
+    principal_x_high = min(initial.image_width*.20, initial.image_width-initial.cx-1.)
+    principal_y_low = max(-initial.image_height*.20, -initial.cy+1.)
+    principal_y_high = min(initial.image_height*.20, initial.image_height-initial.cy-1.)
+    enabled = [item for item in matches if item.enabled]
+    depths: list[float] = []
+    for match in enabled:
+        frame = session.frame_for(match.reference_index, initial)
+        center, camera_to_world = initial.camera_pose(
+            frame.position_world_m, frame.orientation_xyzw, frame.camera_pitch_degrees)
+        depths.append(float(((np.asarray(match.world_xyz)-center) @ camera_to_world)[2]))
+    positive_depths = np.asarray([value for value in depths if value > .05])
+    relative_depth_span = (float(np.ptp(positive_depths)/np.median(positive_depths))
+                           if len(positive_depths) > 1 else 0.)
+    fit_translation = len(enabled) >= 10 and relative_depth_span >= .20
+    translation_limit = .30 if fit_translation else 1e-7
+    observed_tilts = np.asarray([
+        session.frame_for(index, initial).camera_pitch_degrees
+        for index in sorted({item.reference_index for item in enabled})], dtype=float)
+    fit_tilt_zero = (len(enabled) >= 12 and len(observed_tilts) >= 2
+                     and float(np.ptp(observed_tilts)) >= 8.)
+    tilt_limit = 10. if fit_tilt_zero else 1e-7
+    lower = np.r_[np.log(.70), np.log(.70),
+                  principal_x_low, principal_y_low,
+                  -15., -15., -15.,
+                  -translation_limit, -translation_limit, -translation_limit,
+                  -tilt_limit]
+    upper = np.r_[np.log(1.40), np.log(1.40),
+                  principal_x_high, principal_y_high,
+                  15., 15., 15.,
+                  translation_limit, translation_limit, translation_limit,
+                  tilt_limit]
+    x0 = np.r_[np.zeros(11, dtype=np.float64), start_coefficients]
+    if model == "opencv":
+        lower = np.r_[lower, -.8, -.5, -.05, -.05]
+        upper = np.r_[upper, .8, .5, .05, .05]
+    elif model == "fisheye":
+        lower = np.r_[lower, -.8, -.5, -.25, -.10]
+        upper = np.r_[upper, .8, .5, .25, .10]
+    x0 = np.clip(x0, lower+1e-9, upper-1e-9)
+
+    def candidate(values: np.ndarray) -> Calibration:
+        local = Rotation.from_euler("zxy", values[4:7], degrees=True)
+        coefficients = tuple(float(value) for value in values[11:])
+        return replace(
+            initial,
+            fx=float(initial.fx*np.exp(values[0])),
+            fy=float(initial.fy*np.exp(values[1])),
+            cx=float(initial.cx+values[2]), cy=float(initial.cy+values[3]),
+            rotation_xyzw=tuple((base_rotation*local).as_quat()),
+            translation_m=tuple(base_translation+values[7:10]),
+            tilt_zero_degrees=float(initial.tilt_zero_degrees+values[10]),
+            distortion_model=model, distortion_coefficients=coefficients,
+            schema_version=2, fallback_calibration=root_fallback,
+            refinement={"method": "point_correspondence_fit", "projection_model": model})
+
+    enabled = [item for item in matches if item.enabled]
+    observed = np.asarray([item.image_xy for item in enabled], dtype=np.float64)
+
+    def pixel_residuals(values: np.ndarray) -> np.ndarray:
+        calibration = candidate(values)
+        result = np.empty_like(observed)
+        frames: dict[int, FrameObservation] = {}
+        for index, match in enumerate(enabled):
+            frame = frames.setdefault(
+                match.reference_index,
+                session.frame_for(match.reference_index, calibration))
+            center, camera_to_world = calibration.camera_pose(
+                frame.position_world_m, frame.orientation_xyzw,
+                frame.camera_pitch_degrees)
+            camera = (np.asarray(match.world_xyz) - center) @ camera_to_world
+            if camera[2] <= .01:
+                result[index] = (5_000., 5_000.)
+            else:
+                projected = calibration.project_camera_points(camera.reshape(1, 3))[0]
+                result[index] = np.nan_to_num(
+                    projected-observed[index], nan=5_000., posinf=5_000., neginf=-5_000.)
+        priors = np.r_[
+            values[0:2]/.10,
+            values[2]/(initial.image_width*.10),
+            values[3]/(initial.image_height*.10),
+            values[4:7]/10., values[7:10]/.18,
+            values[10]/6., (values[11:]-start_coefficients)/.18,
+        ]
+        projection = candidate(values)
+        scale, derivative = _projection_shape_metrics(projection)
+        shape_penalty = np.r_[np.maximum(0., .10-scale),
+                              np.maximum(0., .10-derivative)]*100.
+        # A weak baseline prior prevents poorly distributed matches from
+        # producing an extreme but numerically low-error camera.
+        weights = np.r_[np.full(4, 3.0), np.full(7, 1.5),
+                        np.full(len(values)-11, 3.0)]
+        return np.r_[result.ravel(), priors*weights, shape_penalty]
+
+    # First explain displacement through the physical camera mount/location
+    # while optics remain unchanged. Then permit small intrinsic changes, and
+    # only in the final stage expose model-specific distortion coefficients.
+    common = 11
+    pose_indices = np.arange(4, common)
+
+    def subset_residual(values: np.ndarray, seed: np.ndarray,
+                        indices: np.ndarray) -> np.ndarray:
+        full = seed.copy(); full[indices] = values
+        return pixel_residuals(full)
+
+    pose = least_squares(
+        lambda values: subset_residual(values, x0, pose_indices),
+        x0[pose_indices], bounds=(lower[pose_indices], upper[pose_indices]),
+        loss="soft_l1", f_scale=4.0, x_scale="jac", max_nfev=350)
+    pose_seed = x0.copy(); pose_seed[pose_indices] = pose.x
+    intrinsic = least_squares(
+        lambda values: pixel_residuals(np.r_[values, pose_seed[common:]]),
+        pose_seed[:common], bounds=(lower[:common], upper[:common]),
+        loss="soft_l1", f_scale=4.0, x_scale="jac", max_nfev=450)
+    seeded = np.r_[intrinsic.x, x0[common:]]
+    solved = least_squares(
+        pixel_residuals, seeded, bounds=(lower, upper), loss="soft_l1",
+        f_scale=3.0, x_scale="jac", max_nfev=700)
+    fitted = candidate(solved.x)
+    validate_projection_shape(fitted)
+    errors = correspondence_errors(session, enabled, fitted)
+    initial_errors = correspondence_errors(session, enabled, initial)
+    rms = float(np.sqrt(np.mean(errors**2)))
+    initial_rms = float(np.sqrt(np.mean(initial_errors**2)))
+    # Bayesian-information-style score discourages selecting a needlessly
+    # flexible distortion family solely because its training error is lower.
+    residual_count = max(1, errors.size*2)
+    sse = max(float(np.sum(errors**2)), 1e-9)
+    effective_parameters = (7 + (3 if fit_translation else 0)
+                            + (1 if fit_tilt_zero else 0) + coefficient_count)
+    information = (residual_count*np.log(sse/residual_count)
+                   + effective_parameters*np.log(residual_count))
+    fitted = replace(fitted, refinement={
+        "method": "point_correspondence_fit", "projection_model": model,
+        "match_count": len(enabled), "rms_error_px": rms,
+        "median_error_px": float(np.median(errors)),
+        "fit_translation": fit_translation,
+        "fit_tilt_zero": fit_tilt_zero,
+    })
+    return CalibrationFitResult(
+        fitted, model, rms, float(np.median(errors)), initial_rms,
+        tuple(float(value) for value in errors), float(information))
+
+
+def fit_calibration_correspondences(
+        session: "CalibrationSession", matches: list[CalibrationCorrespondence],
+        initial: Calibration, *, model: str = "automatic") -> CalibrationFitResult:
+    """Fit a proposed camera profile from user-confirmed 2D/3D matches."""
+    enabled = [item for item in matches if item.enabled]
+    if len(enabled) < 8:
+        raise CalibrationError("Add at least 8 enabled point matches before fitting")
+    view_count = len({item.reference_index for item in enabled})
+    if view_count < 2 and len(session.references) > 1:
+        raise CalibrationError("Add matches in at least two reference views before fitting")
+    pixels = np.asarray([item.image_xy for item in enabled], dtype=np.float64)
+    normalized = np.column_stack((pixels[:, 0]/initial.image_width,
+                                  pixels[:, 1]/initial.image_height))
+    span_x, span_y = np.ptp(normalized, axis=0)
+    centered_radius = np.linalg.norm(normalized-.5, axis=1)
+    outer_matches = int(np.count_nonzero(centered_radius >= .32))
+    distortion_ready = (len(enabled) >= 18 and span_x >= .55 and span_y >= .45
+                        and outer_matches >= 6)
+    fisheye_ready = distortion_ready and len(enabled) >= 24
+    if model == "opencv" and not distortion_ready:
+        raise CalibrationError(
+            "Radial/tangential fitting needs at least 18 matches, including at least 6 near the image edges, "
+            "with broad horizontal and vertical coverage. Add matches or fit Pinhole first.")
+    if model == "fisheye" and not fisheye_ready:
+        raise CalibrationError(
+            "Fisheye fitting needs at least 24 matches with broad center, edge, and corner coverage. "
+            "Add more matches or fit Pinhole first.")
+    if model == "automatic":
+        requested = ["pinhole"]
+        if distortion_ready:
+            requested.append("opencv")
+        if fisheye_ready:
+            requested.append("fisheye")
+    else:
+        requested = [model]
+    results = []
+    failures = []
+    for value in requested:
+        try:
+            results.append(_fit_candidate(session, enabled, initial, value))
+        except CalibrationError as exc:
+            failures.append(str(exc))
+    if not results:
+        raise CalibrationError(failures[0] if failures else "No valid camera model could be fitted")
+    return min(results, key=lambda item: item.information_score)
+
+
+def pick_cloud_point(
+        xyz: np.ndarray, frame: FrameObservation, calibration: Calibration,
+        image_xy: tuple[float, float], *, radius_px: float = 14.0) -> np.ndarray | None:
+    """Pick the nearest visible cloud point around an original-frame pixel."""
+    target = np.asarray(image_xy, dtype=np.float64)
+    center, camera_to_world = calibration.camera_pose(
+        frame.position_world_m, frame.orientation_xyzw, frame.camera_pitch_degrees)
+    candidates: list[tuple[float, float, np.ndarray]] = []
+    points = np.asarray(xyz, dtype=np.float64)
+    for start in range(0, len(points), 250_000):
+        chunk = points[start:start+250_000]
+        camera = (chunk-center) @ camera_to_world
+        valid = np.isfinite(camera).all(axis=1) & (camera[:, 2] > .05) & (camera[:, 2] < 60.)
+        if not np.any(valid):
+            continue
+        source = chunk[valid]
+        camera = camera[valid]
+        uv = calibration.project_camera_points(camera)
+        distance = np.linalg.norm(uv-target, axis=1)
+        nearby = np.flatnonzero(np.isfinite(distance) & (distance <= radius_px))
+        if not len(nearby):
+            continue
+        local_distance = distance[nearby]
+        keep_count = min(64, len(nearby))
+        keep = nearby[np.argpartition(local_distance, keep_count-1)[:keep_count]]
+        candidates.extend((float(distance[index]), float(camera[index, 2]),
+                           source[index].copy()) for index in keep)
+    if not candidates:
+        return None
+    minimum = min(item[0] for item in candidates)
+    # Prefer proximity to the cursor. Points within one original-frame pixel
+    # of the best candidate are resolved toward the front visible surface.
+    finalists = [item for item in candidates if item[0] <= minimum+1.0]
+    return min(finalists, key=lambda item: item[1])[2]
+
+
 @dataclass
 class CalibrationSession:
     """Bounded local data used for interactive multi-frame calibration."""
@@ -138,10 +510,13 @@ class CalibrationSession:
     def load(cls, folder: str | Path, *, las_override: str | Path | None = None,
              calibration_path: str | Path, reference_count: int = 3,
              geometry_path: str | Path | None = None,
-             source_to_geometry: np.ndarray | None = None) -> "CalibrationSession":
+             source_to_geometry: np.ndarray | None = None,
+             progress: Callable[[str], None] | None = None) -> "CalibrationSession":
         from .flight import discover_source, inspect_video_coverage, load_telemetry
         from .service import cache_directory
 
+        if progress:
+            progress("Loading synchronized calibration frames…")
         source = discover_source(str(folder), las_override=(str(las_override) if las_override else None),
                                  calibration_override=str(calibration_path))
         if not source.las_path or not source.videos or not source.starnet_path or not source.trajectory_path:
@@ -166,25 +541,31 @@ class CalibrationSession:
                      if geometry_path else np.eye(4, dtype=np.float64))
         focus_frames = [_aligned_frame(reference, telemetry, base, transform)
                         for reference in references]
-        xyz = sample_las_points(
-            geometry, maximum_points=1_000_000,
-            focus_views=[(frame, base) for frame in focus_frames])
+        view_points = load_calibration_view_points(
+            geometry, [(frame, base) for frame in focus_frames],
+            progress=(lambda done, total: progress(
+                f"Loading full-detail calibration regions… {done / max(1, total):.0%}")
+                if progress else None))
+        xyz = view_points[0]
         cloud_label = (f"Merged cloud · {Path(geometry).name}" if geometry_path
                        else f"Native flight cloud · {Path(geometry).name}")
         return cls(base_path, base, xyz, telemetry, references, elapsed_values,
-                   [xyz] * len(references), [telemetry] * len(references),
+                   view_points, [telemetry] * len(references),
                    [name] * len(references), [transform] * len(references),
                    [cloud_label] * len(references))
 
     @classmethod
     def load_manual(cls, requests: list[CalibrationReferenceRequest], *,
-                    calibration_path: str | Path) -> "CalibrationSession":
+                    calibration_path: str | Path,
+                    progress: Callable[[str], None] | None = None) -> "CalibrationSession":
         """Load selected moments, including references from different flights."""
         from .flight import discover_source, inspect_video_coverage, load_telemetry
         from .service import cache_directory
 
         if not requests:
             raise CalibrationError("Choose at least one manual reference frame")
+        if progress:
+            progress("Loading synchronized calibration frames…")
         base_path = Path(calibration_path).expanduser().resolve()
         base = Calibration.load(base_path)
         contexts: dict[tuple[Path, Path | None], tuple[Any, Any, Any, Path, float]] = {}
@@ -238,18 +619,24 @@ class CalibrationSession:
             cloud_labels.append(
                 f"Merged cloud · {geometry.name}" if request.geometry_path
                 else f"Native flight cloud · {geometry.name}")
-        geometry_cache: dict[Path, np.ndarray] = {}
+        xyz_values: list[np.ndarray | None] = [None] * len(references)
         for geometry in dict.fromkeys(geometry_paths):
             indices = [index for index, value in enumerate(geometry_paths) if value == geometry]
             focus_frames = [_aligned_frame(
                 references[index], telemetry_values[index], base, transforms[index])
                 for index in indices]
-            geometry_cache[geometry] = sample_las_points(
-                geometry, maximum_points=1_000_000,
-                focus_views=[(frame, base) for frame in focus_frames])
-        xyz_values = [geometry_cache[path] for path in geometry_paths]
-        return cls(base_path, base, xyz_values[0], telemetry_values[0], references,
-                   elapsed_values, xyz_values, telemetry_values, names,
+            loaded = load_calibration_view_points(
+                geometry, [(frame, base) for frame in focus_frames],
+                progress=(lambda done, total, name=geometry.name: progress(
+                    f"Loading {name} calibration regions… {done / max(1, total):.0%}")
+                    if progress else None))
+            for local_index, reference_index in enumerate(indices):
+                xyz_values[reference_index] = loaded[local_index]
+        resolved_xyz = [value for value in xyz_values if value is not None]
+        if len(resolved_xyz) != len(references):
+            raise CalibrationError("Could not load calibration geometry for every reference view")
+        return cls(base_path, base, resolved_xyz[0], telemetry_values[0], references,
+                   elapsed_values, resolved_xyz, telemetry_values, names,
                    transforms, cloud_labels)
 
     def frame_for(self, index: int, calibration: Calibration) -> FrameObservation:
@@ -330,30 +717,81 @@ def _observation_near(source: Any, telemetry: Any, coverage: Any,
     return frame, max(0.0, float(frame.timestamp_s - origin))
 
 
+def _view_focus_mask(xyz: np.ndarray, frame: FrameObservation,
+                     calibration: Calibration,
+                     buffer_fraction: float = .35) -> np.ndarray:
+    """Return points inside one buffered calibration camera frustum."""
+    center, camera_to_world = calibration.camera_pose(
+        frame.position_world_m, frame.orientation_xyzw, frame.camera_pitch_degrees)
+    camera = (np.asarray(xyz, dtype=np.float64) - center) @ camera_to_world
+    depth = camera[:, 2]
+    valid = np.isfinite(camera).all(axis=1) & (depth > .05) & (depth < 60.0)
+    if not np.any(valid):
+        return valid
+    x_over_z = camera[:, 0] / np.maximum(depth, 1e-6)
+    y_over_z = camera[:, 1] / np.maximum(depth, 1e-6)
+    margin_x = calibration.image_width * buffer_fraction
+    margin_y = calibration.image_height * buffer_fraction
+    x_min = (-margin_x - calibration.cx) / calibration.fx
+    x_max = (calibration.image_width + margin_x - calibration.cx) / calibration.fx
+    y_min = (-margin_y - calibration.cy) / calibration.fy
+    y_max = (calibration.image_height + margin_y - calibration.cy) / calibration.fy
+    return (valid & (x_over_z >= x_min) & (x_over_z <= x_max)
+            & (y_over_z >= y_min) & (y_over_z <= y_max))
+
+
 def _focus_mask(xyz: np.ndarray,
                 focus_views: list[tuple[FrameObservation, Calibration]],
-                buffer_fraction: float = .30) -> np.ndarray:
-    """Select a generously buffered union of recorded camera frustums."""
+                buffer_fraction: float = .35) -> np.ndarray:
+    """Select the buffered union of recorded camera frustums."""
     selected = np.zeros(len(xyz), dtype=bool)
     for frame, calibration in focus_views:
-        center, camera_to_world = calibration.camera_pose(
-            frame.position_world_m, frame.orientation_xyzw, frame.camera_pitch_degrees)
-        camera = (xyz - center) @ camera_to_world
-        depth = camera[:, 2]
-        valid = np.isfinite(camera).all(axis=1) & (depth > .08) & (depth < 50.0)
-        if not np.any(valid):
-            continue
-        x_over_z = camera[:, 0] / np.maximum(depth, 1e-6)
-        y_over_z = camera[:, 1] / np.maximum(depth, 1e-6)
-        margin_x = calibration.image_width * buffer_fraction
-        margin_y = calibration.image_height * buffer_fraction
-        x_min = (-margin_x - calibration.cx) / calibration.fx
-        x_max = (calibration.image_width + margin_x - calibration.cx) / calibration.fx
-        y_min = (-margin_y - calibration.cy) / calibration.fy
-        y_max = (calibration.image_height + margin_y - calibration.cy) / calibration.fy
-        selected |= (valid & (x_over_z >= x_min) & (x_over_z <= x_max)
-                     & (y_over_z >= y_min) & (y_over_z <= y_max))
+        selected |= _view_focus_mask(xyz, frame, calibration, buffer_fraction)
     return selected
+
+
+def load_calibration_view_points(
+        path: str | Path,
+        focus_views: list[tuple[FrameObservation, Calibration]], *,
+        buffer_fraction: float = .35,
+        progress: Callable[[int, int], None] | None = None) -> list[np.ndarray]:
+    """Stream a LAS once and retain every point in each buffered reference view.
+
+    The workbench intentionally has no global/context sample.  Each returned
+    array belongs to one reference frame, so all available geometric detail is
+    preserved where the user is actually calibrating.
+    """
+    import laspy
+
+    if not focus_views:
+        raise CalibrationError("At least one calibration reference view is required")
+    source = Path(path).expanduser().resolve()
+    retained: list[list[np.ndarray]] = [[] for _ in focus_views]
+    with laspy.open(source) as reader:
+        if int(reader.header.point_count) < 1:
+            raise CalibrationError("The calibration point cloud is empty")
+        processed = 0
+        total = int(reader.header.point_count)
+        for points in reader.chunk_iterator(1_000_000):
+            xyz = np.column_stack((points.x, points.y, points.z))
+            for index, (frame, calibration) in enumerate(focus_views):
+                mask = _view_focus_mask(xyz, frame, calibration, buffer_fraction)
+                if np.any(mask):
+                    retained[index].append(xyz[mask])
+            processed += len(points)
+            if progress:
+                progress(processed, total)
+    result = [
+        np.ascontiguousarray(np.concatenate(chunks, axis=0), dtype=np.float64)
+        if chunks else np.empty((0, 3), dtype=np.float64)
+        for chunks in retained
+    ]
+    empty = [str(index + 1) for index, values in enumerate(result) if not len(values)]
+    if empty:
+        raise CalibrationError(
+            "No point-cloud geometry projects near reference view(s) " + ", ".join(empty)
+            + ". Check the selected cloud and flight-to-merged-cloud alignment.")
+    return result
 
 
 def _stable_hash(indices: np.ndarray) -> np.ndarray:
@@ -376,16 +814,12 @@ def sample_las_points(path: str | Path, maximum_points: int = 250_000, *,
         maximum_points = max(1, int(maximum_points))
         chunks = []
         if focus_views and count > maximum_points:
-            global_budget = max(1, maximum_points // 4)
-            focus_budget = max(1, maximum_points - global_budget)
-            global_stride = max(1, int(np.ceil(count / global_budget)))
+            focus_budget = maximum_points
             focus_xyz = np.empty((0, 3), dtype=np.float64)
             focus_hash = np.empty(0, dtype=np.uint64)
             offset = 0
             for points in reader.chunk_iterator(1_000_000):
                 xyz = np.column_stack((points.x, points.y, points.z))
-                first = (-offset) % global_stride
-                chunks.append(xyz[first::global_stride])
                 mask = _focus_mask(xyz, focus_views)
                 if np.any(mask):
                     local_indices = offset + np.flatnonzero(mask)
@@ -400,8 +834,9 @@ def sample_las_points(path: str | Path, maximum_points: int = 250_000, *,
             if len(focus_xyz) > focus_budget:
                 keep = np.argpartition(focus_hash, focus_budget - 1)[:focus_budget]
                 focus_xyz = focus_xyz[keep]
-            global_xyz = np.concatenate(chunks, axis=0)[:global_budget]
-            sampled = np.concatenate((focus_xyz, global_xyz), axis=0)
+            if not len(focus_xyz):
+                raise CalibrationError("No point-cloud geometry falls inside the calibration views")
+            sampled = focus_xyz
             order = np.random.default_rng(0).permutation(len(sampled))
             sampled = sampled[order]
             chunks = []
@@ -479,70 +914,14 @@ def render_cloud_composite(frame: FrameObservation, xyz: np.ndarray,
                            point_radius: int = 3, video_opacity: float = .55,
                            color_mode: str = "elevation", edl_strength: float = 1.2,
                            display_mode: str = "composite", preview_width: int = 1280,
-                           zoom: float = 1.0, pan_px: tuple[float, float] = (0, 0),
-                           context_angles: tuple[float, float] = (0, 0)) -> CloudViewResult:
+                           zoom: float = 1.0,
+                           pan_px: tuple[float, float] = (0, 0)) -> CloudViewResult:
     """Render a dense, depth-tested, EDL-shaded point-cloud/video comparison."""
     points = np.asarray(xyz, dtype=np.float64)
     target_points = int(np.clip(target_points, 1_000, max(1_000, len(points))))
     if len(points) > target_points:
         stride = int(np.ceil(len(points) / target_points))
         points = points[::stride]
-    if display_mode == "context":
-        center, camera_to_world = calibration.camera_pose(
-            frame.position_world_m, frame.orientation_xyzw, frame.camera_pitch_degrees)
-        camera_points = (points - center) @ camera_to_world
-        target = np.array((0.0, 0.0, 4.0), dtype=np.float64)
-        pitch, yaw = context_angles
-        orbit = Rotation.from_euler("xy", (pitch, yaw), degrees=True).as_matrix()
-        camera_points = (camera_points - target) @ orbit + target
-        identity = replace(
-            calibration, rotation_xyzw=(0, 0, 0, 1), translation_m=(0, 0, 0),
-            tilt_axis_body=(0, 1, 0), tilt_pivot_body_m=(0, 0, 0),
-            tilt_zero_degrees=0, distortion_model="pinhole", distortion_coefficients=())
-        context_frame = replace(
-            frame, position_world_m=np.zeros(3), orientation_xyzw=np.array((0, 0, 0, 1)),
-            camera_pitch_degrees=0)
-        context_result = render_cloud_composite(
-            context_frame, camera_points, identity, target_points=len(camera_points),
-            point_radius=point_radius, video_opacity=0, color_mode="neutral",
-            edl_strength=edl_strength, display_mode="cloud", preview_width=preview_width,
-            zoom=zoom, pan_px=pan_px)
-        image = context_result.rgb.copy()
-        frustum_depth = 1.2
-        corners = np.array([
-            ((0 - calibration.cx) / calibration.fx * frustum_depth,
-             (0 - calibration.cy) / calibration.fy * frustum_depth, frustum_depth),
-            ((calibration.image_width - calibration.cx) / calibration.fx * frustum_depth,
-             (0 - calibration.cy) / calibration.fy * frustum_depth, frustum_depth),
-            ((calibration.image_width - calibration.cx) / calibration.fx * frustum_depth,
-             (calibration.image_height - calibration.cy) / calibration.fy * frustum_depth,
-             frustum_depth),
-            ((0 - calibration.cx) / calibration.fx * frustum_depth,
-             (calibration.image_height - calibration.cy) / calibration.fy * frustum_depth,
-             frustum_depth),
-        ])
-        frustum = np.vstack((np.zeros((1, 3)), corners))
-        frustum = (frustum - target) @ orbit + target
-        valid = frustum[:, 2] > .05
-        projected = np.zeros((5, 2), dtype=np.float64)
-        projected[valid, 0] = (frustum[valid, 0] / frustum[valid, 2] * calibration.fx
-                               + calibration.cx)
-        projected[valid, 1] = (frustum[valid, 1] / frustum[valid, 2] * calibration.fy
-                               + calibration.cy)
-        view_scale = image.shape[1] / calibration.image_width
-        projected *= view_scale
-        projected[:, 0] = ((projected[:, 0] - image.shape[1] / 2) * zoom
-                           + image.shape[1] / 2 + pan_px[0])
-        projected[:, 1] = ((projected[:, 1] - image.shape[0] / 2) * zoom
-                           + image.shape[0] / 2 + pan_px[1])
-        segments = [(0, 1), (0, 2), (0, 3), (0, 4),
-                    (1, 2), (2, 3), (3, 4), (4, 1)]
-        for first, second in segments:
-            if valid[first] and valid[second]:
-                cv2.line(image, tuple(np.rint(projected[first]).astype(int)),
-                         tuple(np.rint(projected[second]).astype(int)),
-                         (75, 220, 245), 2, cv2.LINE_AA)
-        return replace(context_result, rgb=image)
     scale = min(1.0, preview_width / calibration.image_width)
     width = max(2, round(calibration.image_width * scale))
     height = max(2, round(calibration.image_height * scale))

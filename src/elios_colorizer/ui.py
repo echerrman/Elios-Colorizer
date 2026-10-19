@@ -1,11 +1,11 @@
 """Desktop interface for single- and multi-flight colorization."""
 from __future__ import annotations
-import json, math, os, re, shutil, sys, threading, time, traceback
+import inspect, json, math, os, re, shutil, sys, threading, time, traceback
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from PySide6.QtCore import QObject, QSettings, QSignalBlocker, QThread, QTime, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QEventLoop, QObject, QSettings, QSignalBlocker, QThread, QTime, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QAbstractSpinBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -503,12 +503,14 @@ class ServiceWorker(QObject):
         finally:self.finished.emit()
 
 class CalibrationLoadWorker(QObject):
-    """Prepare synchronized frames and adaptive cloud samples without blocking Qt."""
-    result=Signal(object);error=Signal(str);finished=Signal()
+    """Prepare synchronized frames and focused cloud regions without blocking Qt."""
+    result=Signal(object);error=Signal(str);progress=Signal(str);finished=Signal()
     def __init__(self,loader):super().__init__();self.loader=loader
     @Slot()
     def run(self):
-        try:self.result.emit(self.loader())
+        try:
+            parameters=inspect.signature(self.loader).parameters
+            self.result.emit(self.loader(self.progress.emit) if parameters else self.loader())
         except Exception as exc:self.error.emit(str(exc) or type(exc).__name__)
         finally:self.finished.emit()
 
@@ -837,7 +839,7 @@ class MainWindow(QMainWindow):
         self.progress_bar=QProgressBar();self.progress_bar.setRange(0,1000);self.progress_bar.setTextVisible(False);sticky.addWidget(self.progress_bar,1,0,1,2)
         self.progress_badge=_label("0%");self.progress_badge.setObjectName("percentBadge");self.progress_badge.setAlignment(Qt.AlignmentFlag.AlignCenter);self.progress_badge.setMinimumWidth(58);sticky.addWidget(self.progress_badge,1,2)
         self.elapsed_label=_label("Elapsed: 00:00",True);sticky.addWidget(self.elapsed_label,2,0);self.eta_label=_label("Estimated time left: —",True);self.eta_label.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter);sticky.addWidget(self.eta_label,2,1,1,2)
-        shell=QWidget(objectName="appShell");shell_layout=QVBoxLayout(shell);shell_layout.setContentsMargins(0,0,0,0);shell_layout.setSpacing(0);shell_layout.addWidget(scroll,1);shell_layout.addWidget(self.sticky_bar);self.setCentralWidget(shell);self.app_shell=shell;self.app_shell_layout=shell_layout;self.drop_overlay=QFrame(shell,objectName="folderDropOverlay");self.drop_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents,True);self.drop_overlay.hide();self.calibration_loading_overlay=QFrame(shell,objectName="calibrationLoadingOverlay");self.calibration_loading_overlay.setStyleSheet("QFrame#calibrationLoadingOverlay{background:rgba(8,18,27,205);border:none} QLabel{color:#f1f8fb;background:transparent;font-size:12pt;font-weight:650}");loading_box=QVBoxLayout(self.calibration_loading_overlay);loading_box.addStretch();self.calibration_loading_spinner=LoadingSpinner();loading_box.addWidget(self.calibration_loading_spinner,alignment=Qt.AlignmentFlag.AlignCenter);self.calibration_loading_label=_label("Preparing calibration reference views and adaptive point-cloud sample…");self.calibration_loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter);loading_box.addWidget(self.calibration_loading_label);loading_box.addStretch();self.calibration_loading_overlay.hide();self._application_drop_active=False;self.scroll_area=scroll;self._wide_layout=None;self._layout_state=None;self._apply_responsive_layout()
+        shell=QWidget(objectName="appShell");shell_layout=QVBoxLayout(shell);shell_layout.setContentsMargins(0,0,0,0);shell_layout.setSpacing(0);shell_layout.addWidget(scroll,1);shell_layout.addWidget(self.sticky_bar);self.setCentralWidget(shell);self.app_shell=shell;self.app_shell_layout=shell_layout;self.drop_overlay=QFrame(shell,objectName="folderDropOverlay");self.drop_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents,True);self.drop_overlay.hide();self.calibration_loading_overlay=QFrame(shell,objectName="calibrationLoadingOverlay");self.calibration_loading_overlay.setStyleSheet("QFrame#calibrationLoadingOverlay{background:rgba(8,18,27,205);border:none} QLabel{color:#f1f8fb;background:transparent;font-size:12pt;font-weight:650}");loading_box=QVBoxLayout(self.calibration_loading_overlay);loading_box.addStretch();self.calibration_loading_spinner=LoadingSpinner();loading_box.addWidget(self.calibration_loading_spinner,alignment=Qt.AlignmentFlag.AlignCenter);self.calibration_loading_label=_label("Preparing reference frames and loading full-detail calibration regions…");self.calibration_loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter);loading_box.addWidget(self.calibration_loading_label);loading_box.addStretch();self.calibration_loading_overlay.hide();self._application_drop_active=False;self.scroll_area=scroll;self._wide_layout=None;self._layout_state=None;self._apply_responsive_layout()
     def resizeEvent(self,event):
         super().resizeEvent(event)
         if hasattr(self,"drop_overlay"):self.drop_overlay.setGeometry(self.app_shell.rect())
@@ -1099,17 +1101,20 @@ class MainWindow(QMainWindow):
         if chooser.automatic.isChecked():
             flight=chooser.automatic_flight_selection()
             index=chooser.automatic_flight_index()
-            loader=lambda:CalibrationSession.load(
+            loader=lambda progress:CalibrationSession.load(
                 flight.folder,las_override=flight.las_override,calibration_path=profile,
-                geometry_path=geometry_path,source_to_geometry=transforms[index])
+                geometry_path=geometry_path,source_to_geometry=transforms[index],progress=progress)
         else:
             requests=chooser.manual_requests()
-            loader=lambda:CalibrationSession.load_manual(requests,calibration_path=profile)
+            loader=lambda progress:CalibrationSession.load_manual(
+                requests,calibration_path=profile,progress=progress)
         self._start_calibration_load(loader)
 
     def _start_calibration_load(self,loader):
         if self._calibration_thread is not None:return
         self._pending_calibration_session=None;self._pending_calibration_error=None
+        self.calibration_loading_label.setText(
+            "Preparing reference frames and loading full-detail calibration regions…")
         self.scroll_area.setEnabled(False);self.sticky_bar.setEnabled(False)
         self.calibration_loading_overlay.setGeometry(self.app_shell.rect())
         self.calibration_loading_overlay.show();self.calibration_loading_overlay.raise_()
@@ -1120,6 +1125,7 @@ class MainWindow(QMainWindow):
         self._calibration_thread.started.connect(self._calibration_worker.run)
         self._calibration_worker.result.connect(self._calibration_load_result)
         self._calibration_worker.error.connect(self._calibration_load_error)
+        self._calibration_worker.progress.connect(self.calibration_loading_label.setText)
         self._calibration_worker.finished.connect(self._calibration_thread.quit)
         self._calibration_worker.finished.connect(self._calibration_worker.deleteLater)
         self._calibration_thread.finished.connect(self._calibration_load_finished)
@@ -1136,17 +1142,27 @@ class MainWindow(QMainWindow):
         session=self._pending_calibration_session;error=self._pending_calibration_error
         self._pending_calibration_session=None;self._pending_calibration_error=None
         self._calibration_thread=None;self._calibration_worker=None
-        self.calibration_loading_spinner.stop();self.calibration_loading_overlay.hide()
-        self.scroll_area.setEnabled(True);self.sticky_bar.setEnabled(True);self._update_actions()
+        def finish_loading_surface():
+            self.calibration_loading_spinner.stop();self.calibration_loading_overlay.hide()
+            self.scroll_area.setEnabled(True);self.sticky_bar.setEnabled(True);self._update_actions()
         if self._close_after_calibration:
-            self._close_after_calibration=False;self.close();return
+            finish_loading_surface();self._close_after_calibration=False;self.close();return
         if error:
+            finish_loading_surface()
             QMessageBox.warning(self,"Calibration workbench unavailable",error);return
         if session is None:
+            finish_loading_surface()
             QMessageBox.warning(self,"Calibration workbench unavailable",
                                 "Calibration preparation finished without a usable session.");return
         from .calibration_ui import CalibrationWorkbenchDialog
         dialog=CalibrationWorkbenchDialog(session,self)
+        dialog.setWindowIcon(QApplication.windowIcon())
+        # Keep the existing progress surface visible while Qt creates the
+        # workbench's native OpenGL window. Expose and paint the dialog first,
+        # then transition directly to it so Windows never sees a no-window gap.
+        dialog.show();dialog.raise_();dialog.activateWindow()
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        finish_loading_surface()
         if dialog.exec()==QDialog.DialogCode.Accepted and dialog.saved_path:
             self.calibration_edit.setText(str(dialog.saved_path));self._inputs_changed()
     def _browse_output(self):

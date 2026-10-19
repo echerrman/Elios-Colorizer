@@ -48,22 +48,39 @@ beside their physical points.
 2. Select **Calibration** at the top of the window. Use the three automatic
    views, or choose manual flight/timestamp pairs in `M:SS` when you know where
    the clearest reference features occur.
-3. In **Composite**, adjust Video opacity until both the EDL-shaded cloud and
+3. Choose a calibration path in the right panel:
+   - In **Point Matching**, select **Add point match**, click a rigid feature in
+     the video, and then click the same feature in the shaded cloud. Add at least
+     eight matches across two views; use 20 or more well-distributed matches for
+     reliable distortion fitting. Choose Automatic, Pinhole, Radial/tangential,
+     or Fisheye, then select **Calculate best fit**. Review the numeric residuals
+     and all views before accepting the proposal. If incorrect calibration puts
+     the cloud feature outside the video, wheel down during the cloud step; the
+     dashed frame boundary separates the video from pickable buffered overscan.
+   - In **Manual Adjustments**, tune the same profile directly with the existing
+     value controls. A calculated proposal can be accepted first and then
+     refined manually.
+4. In **Composite**, adjust Video opacity until both the EDL-shaded cloud and
    video are readable. Make the same physical railing, pipe, platform edge,
    corner, or door frame occupy the same pixels in both layers. Prefer rigid
    geometry over paint, glare, shadows, or texture. Wheel zooms both layers,
-   dragging pans them, and double-click resets the view. 3D Inspector is for
-   orientation rather than judging pixel alignment and resets to the recorded
-   camera view each time you return to it.
-   Adjust Point size, Density, Cloud color, and Depth shading as needed. Move
+   dragging pans them, and double-click resets the view.
+   Adjust Point size, Cloud color, and Depth shading strength/radius as needed.
+   Press and hold **Hold: video only** to see the unobstructed frame, then
+   release it to return to the slider's chosen composite opacity.
+   While a control is moving the GPU uses a responsive progressive preview and
+   automatically restores every retained point when interaction stops. Move
    through every selected reference view rather than correcting only one frame.
-4. Adjust the smallest relevant control:
+5. Adjust the smallest relevant control when using Manual Adjustments:
    - **Video → telemetry** corrects displacement that changes with drone or
      camera-head motion.
    - **Principal X/Y** corrects a nearly constant horizontal or vertical image
      shift.
-   - **Focal scale** corrects error that grows from the image center toward its
-     edges.
+   - **Focal X/Y** independently correct horizontal and vertical error that
+     grows from the image center toward its edges.
+   - Under Radial/tangential, **K1/K2** correct symmetric radial curvature and
+     **P1/P2** correct asymmetric tangential distortion. Under Fisheye, K1–K4
+     are separate angular-model coefficients and are not interchangeable.
    - **Roll/Pitch/Yaw** correct camera-mount angular error. Roll rotates about
      camera-forward, pitch about camera-right, and yaw about camera-down.
    - **Translate X/Y/Z** correct measured camera-center displacement.
@@ -71,22 +88,28 @@ beside their physical points.
    A click makes the fine step shown by the control. Holding an arrow accelerates
    the repeated change for larger adjustments. The reset icon beside any value
    resets only that setting.
-5. Review every reference view, choose **Save profile and use**, and save to a
+6. Review every reference view, choose **Save profile and use**, and save to a
    new JSON file. The starting profile is never overwritten.
 
 The cloud name shown above the viewport identifies the geometry being used.
 Single/separate workflows use the native flight cloud. A merged workflow uses
 the supplied merged cloud plus the selected flight's alignment matrix. The
-workbench loads an adaptive temporary sample of at most 1,000,000 points. It
-concentrates points inside the three buffered reference-view areas and keeps
-distant context sparse; this does not change the source LAS/LAZ or reduce the
-final colorization density.
+workbench retains every source point inside each selected reference frame plus
+a surrounding buffer. It does not spend memory or rendering time on unrelated
+distant context, and it does not change the source LAS/LAZ or reduce final
+colorization density.
 
 The saved schema-v2 profile contains the adjusted camera parameters, the timing
 correction, review metadata, and a complete copy of the original schema-v1
 profile. Reopen the workbench and select **Use original fallback** to start over
 from that baseline. The readiness checklist identifies refined profiles and
-their fallback explicitly.
+their fallback explicitly. Point matches are saved beside the profile in an
+optional `.matches.json` session file and restored when the same reference
+labels are available again.
+
+When distortion is added to a pinhole baseline, only the derived profile is
+converted to the OpenCV model. Its embedded fallback remains the original
+pinhole profile.
 
 Calibration corrects where video lands on geometry. It cannot create points for
 details absent from the LAS, and a correction should not be trusted when it only

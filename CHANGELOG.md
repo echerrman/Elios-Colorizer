@@ -5,6 +5,53 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.1.0] - Unreleased
+
+### Changed
+
+- Added guided 2D-video-to-3D-cloud point matching with zoom-aware cloud
+  picking, visible target/projection residuals, match inclusion controls, and
+  automatic restoration of saved match sessions. Cloud picking supports
+  zoomed-out buffered overscan when a miscalibrated projection places the
+  matching geometry beyond the recorded video boundary.
+- Added background robust camera fitting with pinhole, OpenCV
+  radial/tangential, and OpenCV fisheye candidates, complexity-aware automatic
+  model selection, per-match/per-view reprojection errors, outlier highlighting,
+  and an explicit preview/accept/discard workflow.
+- Automatic fitting now solves physical mount rotation, eligible camera-head
+  zero, and depth-supported camera translation before permitting strongly
+  regularized optical changes. Distortion models require substantially more
+  edge coverage, and non-monotonic projections that fold or reverse viewing
+  rays are rejected instead of being previewed.
+- Added a shared projection-model selector and model-correct manual controls:
+  K1/K2/P1/P2 for radial/tangential projection and K1–K4 for fisheye. Accepted
+  automatic fits remain available for subsequent manual refinement while the
+  original embedded fallback stays unchanged.
+- Calibration now retains every point inside each selected reference frame's
+  buffered camera frustum instead of sharing a capped sample with unrelated
+  global context.
+- Replaced the CPU bitmap cloud preview with a GPU point renderer using true
+  depth testing, progressive interaction detail, precise point diameters, and
+  screen-space eye-dome lighting.
+- Simplified calibration views to Composite and Edge Diagnostic. Removed the
+  unrelated 3D Inspector and manual density presets; full retained detail is
+  restored automatically as soon as interaction stops.
+- Added amber, elevation, and neutral cloud coloring plus adjustable EDL
+  strength and radius for clearer railings, pipes, edges, and depth breaks.
+- Added a press-and-hold video-only comparison button that restores the chosen
+  composite opacity immediately when released.
+- Pressing Enter after typing a calibration value now commits only that value
+  instead of also activating Previous and returning to an earlier view.
+- The loading overlay now remains visible until the OpenGL calibration window
+  is exposed, eliminating the blank transition; the workbench also explicitly
+  retains the Elios Colorizer application icon.
+- Split the linked focal adjustment into independent Focal X and Focal Y
+  controls and exposed the calibration model's full adjustment ranges,
+  including ±15° camera angles.
+- Added live K1/K2 radial and P1/P2 tangential distortion controls. Nonzero
+  corrections safely derive an OpenCV profile from a pinhole baseline while
+  preserving the unchanged pinhole fallback.
+
 ## [2.0.0] - 2026-10-19
 
 ### Added

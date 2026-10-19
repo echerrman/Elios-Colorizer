@@ -5,6 +5,59 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-19
+
+### Added
+
+- Added a non-destructive calibration workbench that uses three automatic views
+  or user-entered flight/timestamp references and provides live,
+  bounded timing, focal, principal-point, camera-mount, translation, and
+  camera-head zero adjustments.
+- Added an interactive calibration point-cloud viewport with depth-tested point
+  splats, EDL-style depth shading, video opacity, point-size and density
+  controls, elevation/neutral coloring, synchronized zoom and pan, and an
+  orbitable 3D Inspector view.
+- Added adaptive deterministic temporary cloud subsampling with 75k, 200k,
+  500k, and one-million-point viewing levels. Selected reference frustums and a
+  surrounding buffer receive most of the density while distant context remains
+  sparse, without changing the source or final colorization density.
+- Merged workflows now calibrate against the supplied merged cloud by moving
+  each flight's camera pose through its source-to-merged transform; other
+  workflows use the flight's native geometry.
+- Retained the green/orange/magenta image-edge visualization as an optional
+  Edge diagnostic rather than the primary calibration view.
+- Calibration control arrows now accelerate when held while retaining their
+  precise single-click step.
+- Added a reset icon beside every calibration setting and corrected the optical
+  axis mapping so Roll, Pitch, and Yaw rotate about camera-forward,
+  camera-right, and camera-down respectively.
+- Calibration reference preparation now runs in a background thread behind a
+  faded, input-blocking progress overlay so the application remains responsive.
+- Added schema-v2 refined calibration profiles with an explicit
+  video-to-telemetry timing correction, refinement evidence, and a complete
+  embedded schema-v1 fallback profile.
+- Added repeatable neutral-white consensus diagnostics to processing reports,
+  including preserved bright points and rejected isolated bright observations.
+- Added per-point pose-diverse candidate groups (15 cm / 3 degrees), a 60%
+  independent-view white majority, and image/depth-boundary confidence so
+  adjacent video frames cannot independently validate glare or edge bleed.
+
+### Changed
+
+- Bright pixels are no longer rejected solely for exceeding luminance 252.
+  Pose-diverse majority neutral-white observations are preserved, while a
+  bright minority remains an outlier during accuracy fusion.
+- Illumination balancing now excludes saturated observations from fitting and
+  gain correction without removing their original RGB from color selection.
+- Accuracy fusion and true-white preservation are enabled by default in the
+  desktop workflow; users can still disable fusion in Advanced Processing.
+- Both CPU and CUDA color selection use the same bright-surface behavior.
+
+### Compatibility
+
+- Existing schema-v1 camera profiles continue to load without modification and
+  remain the fallback source for every workbench-derived profile.
+
 ## [1.6.0] - 2026-10-15
 
 ### Changed

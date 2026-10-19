@@ -344,6 +344,54 @@ __device__ void sample_rgb(const std::uint8_t* images, const DeviceFrame& frame,
     }
 }
 
+__device__ float pixel_luminance(const std::uint8_t* image, int width, int x, int y) {
+    const std::size_t offset = (static_cast<std::size_t>(y) * width + x) * 3;
+    return image[offset] * 0.2126f + image[offset + 1] * 0.7152f
+        + image[offset + 2] * 0.0722f;
+}
+
+__device__ float boundary_confidence(
+        const float* depth, const std::uint8_t* images, const DeviceFrame& frame,
+        const DeviceConfig& config, int frame_index, int center_x, int center_y,
+        double u, double v) {
+    const std::size_t pixels = static_cast<std::size_t>(config.depth_width) * config.depth_height;
+    const float* frame_depth = depth + static_cast<std::size_t>(frame_index) * pixels;
+    float local_min = CUDART_INF_F;
+    float local_max = -CUDART_INF_F;
+    for (int dy = -1; dy <= 1; ++dy) {
+        const int y = center_y + dy;
+        if (y < 0 || y >= config.depth_height) continue;
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int x = center_x + dx;
+            if (x < 0 || x >= config.depth_width) continue;
+            const float value = frame_depth[static_cast<std::size_t>(y) * config.depth_width + x];
+            if (isfinite(value)) {
+                local_min = fminf(local_min, value);
+                local_max = fmaxf(local_max, value);
+            }
+        }
+    }
+    float depth_edge = 0.0f;
+    if (isfinite(local_min) && isfinite(local_max)) {
+        const float tolerance = static_cast<float>(config.occlusion_absolute
+            + local_min * config.occlusion_relative);
+        depth_edge = fminf(1.0f, fmaxf(0.0f, (local_max - local_min - tolerance)
+            / fmaxf(0.05f, tolerance * 4.0f)));
+    }
+
+    const int image_x = max(1, min(config.image_width - 2, static_cast<int>(nearbyint(u))));
+    const int image_y = max(1, min(config.image_height - 2, static_cast<int>(nearbyint(v))));
+    const std::uint8_t* image = images + frame.image_offset;
+    const float horizontal = fabsf(pixel_luminance(image, config.image_width, image_x + 1, image_y)
+                                   - pixel_luminance(image, config.image_width, image_x - 1, image_y));
+    const float vertical = fabsf(pixel_luminance(image, config.image_width, image_x, image_y + 1)
+                                 - pixel_luminance(image, config.image_width, image_x, image_y - 1));
+    const float image_edge = fminf(1.0f, fmaxf(0.0f, (hypotf(horizontal, vertical) - 12.0f) / 96.0f));
+    const float confidence = (1.0f - 0.15f * image_edge) * (1.0f - 0.45f * depth_edge)
+        * (1.0f - 0.55f * image_edge * depth_edge);
+    return fminf(1.0f, fmaxf(0.15f, confidence));
+}
+
 __global__ void assignment_kernel(
         const double* xyz, std::size_t point_count, const DeviceFrame* frames,
         int frame_count, const DeviceConfig* config, const std::uint8_t* images,
@@ -382,6 +430,7 @@ __global__ void assignment_kernel(
         const double luminance = rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
         bool usable = !config->reject_exposure_extremes
             || (luminance >= config->minimum_luminance && luminance <= config->maximum_luminance);
+        bool illumination_usable = true;
         if (config->illumination_balancing) {
             const std::uint8_t maximum_channel = max(rgb[0], max(rgb[1], rgb[2]));
             const bool exposure_ok = luminance >= fmaxf(3.0f, config->minimum_luminance)
@@ -390,7 +439,7 @@ __global__ void assignment_kernel(
             if (!exposure_ok) {
                 atomicAdd(counters + 1, 1ULL);
             }
-            usable = usable && exposure_ok;
+            illumination_usable = exposure_ok;
         }
         const double distance = sqrt(camera_x * camera_x + camera_y * camera_y
                                    + camera_z * camera_z);
@@ -406,15 +455,17 @@ __global__ void assignment_kernel(
         const double edge_weight = fmin(1.0, fmax(0.05, border_distance / 0.15));
         const double exposure_weight = 0.5 + 0.5 *
             (1.0 - fabs(luminance - 127.5) / 127.5);
+        const float boundary_weight = boundary_confidence(
+            depth, images, frame, *config, frame_index, depth_x, depth_y, u, v);
         float score = static_cast<float>(frame.sharpness_weight * cosine * cosine
-                    * edge_weight * exposure_weight
+                    * edge_weight * boundary_weight * exposure_weight
                     / (1.0 + (camera_z / 5.0) * (camera_z / 5.0)));
         if (fusion_slots == 0 && !(score > best_quality)) {
             continue;
         }
 
         std::uint8_t corrected[3] = {rgb[0], rgb[1], rgb[2]};
-        if (frame.illumination_enabled) {
+        if (frame.illumination_enabled && illumination_usable) {
             const double scale_x = fmax(config->cx, config->image_width - config->cx);
             const double scale_y = fmax(config->cy, config->image_height - config->cy);
             const double radius = fmin(1.0, ((u - config->cx) * (u - config->cx)

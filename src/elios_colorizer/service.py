@@ -76,6 +76,7 @@ def dependency_status() -> list[dict]:
     rows = []
     for label, module, distribution in (
         ('Desktop interface', 'PySide6.QtWidgets', 'PySide6-Essentials'),
+        ('Calibration 3D viewport', 'PySide6.QtOpenGLWidgets', 'PySide6-Essentials'),
         ('Numerical processing', 'numpy', 'numpy'),
         ('Pose interpolation', 'scipy.spatial.transform', 'scipy'),
         ('Video decoder', 'cv2', 'opencv-python-headless'),
@@ -152,7 +153,12 @@ def inspect_source(folder: str, las_override: str | None = None,
     if source.calibration_path:
         try:
             calibration = Calibration.load(source.calibration_path)
-            check('RGB camera calibration', True, calibration.profile_name)
+            detail = calibration.profile_name
+            if calibration.schema_version == 2:
+                fallback = calibration.fallback().profile_name
+                detail += (f' · overlay refined · timing {calibration.video_to_telemetry_offset_s:+.3f} s'
+                           f' · fallback: {fallback}')
+            check('RGB camera calibration', True, detail)
         except Exception as exc:
             check('RGB camera calibration', False, str(exc))
     else:
@@ -383,7 +389,8 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
     emit('Colorizing', .03, f'Projecting sampled RGB frames onto the existing LAS ({expected_frames} planned views)…', force=True)
     raw_frames = iter_observations(source, telemetry, sample_interval_s=sample_interval_s,
                                    max_frames=max_frames, start_s=start_s, end_s=end_s,
-                                   cancelled=cancelled, video_coverage=video_coverage)
+                                   cancelled=cancelled, video_coverage=video_coverage,
+                                   video_to_telemetry_offset_s=calibration.video_to_telemetry_offset_s)
     logical_cpus = os.cpu_count() or 1
     import laspy
     with laspy.open(source.las_path) as source_reader:
@@ -686,7 +693,8 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                 raise ValueError(f'Time range does not overlap recorded video timing for {flight_name}.')
             expected_views.append(max(1, int((selected_end - selected_begin) / sample_interval_s) + 1))
             raw = iter_observations(source, telemetry, sample_interval_s=sample_interval_s, cancelled=cancelled,
-                                    start_s=start_s,end_s=end_s,video_coverage=coverage)
+                                    start_s=start_s,end_s=end_s,video_coverage=coverage,
+                                    video_to_telemetry_offset_s=calibration.video_to_telemetry_offset_s)
             adaptive_stats: dict[str, int] = {}
             transformed = transform_observations(raw, matrix, index)
             streams.append(prefetch(

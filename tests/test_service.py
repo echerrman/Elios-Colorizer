@@ -120,10 +120,13 @@ def test_advanced_processing_settings_are_applied_and_reported(tmp_path, monkeyp
     assert report['summary']['user_settings']['image_edge_exclusion_percent'] == 5
     assert report['summary']['user_settings']['blur_rejection'] == 'Off'
     assert report['summary']['user_settings']['multi_frame_fusion_requested']
-    assert report['summary']['user_settings']['multi_frame_fusion_applied']
+    # The synthetic fixture is stationary, so its correlated frames correctly
+    # remain one pose group and cannot satisfy diverse-view fusion.
+    assert not report['summary']['user_settings']['multi_frame_fusion_applied']
     assert report['processing_configuration']['multi_frame_fusion']
     assert report['result']['multi_frame_fusion']['requested']
-    assert report['result']['multi_frame_fusion']['points_fused'] == 3
+    assert report['result']['multi_frame_fusion']['points_fused'] == 0
+    assert report['result']['multi_frame_fusion']['points_using_best_observation_fallback'] == 3
     assert report['processing_configuration']['minimum_sharpness'] == 0
     with pytest.raises(ValueError, match='between 0.25 and 30'):
         run_colorization(str(source), str(tmp_path / 'too-fast.las'), sample_interval_s=.01)

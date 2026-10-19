@@ -793,10 +793,13 @@ def load_telemetry(source: FlightSource, cache_dir, progress=None, cancelled=Non
 
 def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interval_s=1.0,
                       max_frames=None, start_s=None, end_s=None, progress=None, cancelled=None,
-                      video_coverage: VideoCoverage | None = None) -> Iterator:
+                      video_coverage: VideoCoverage | None = None,
+                      video_to_telemetry_offset_s: float = 0.0) -> Iterator:
     """Yield upright RGB observations with exact global frame-counter matching.
 
     start_s/end_s are seconds relative to the first frame synchronization time.
+    video_to_telemetry_offset_s shifts only pose/tilt lookup; decoded frame
+    identity and recorded video timestamps remain unchanged.
     Decoding seeks to each chosen frame, checks the returned index and uses the
     decoder PTS only for the explicitly lower-quality metadata-offset fallback.
     Tail frames missing FrameSync are never extrapolated.
@@ -805,6 +808,8 @@ def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interva
     from .colorize import FrameObservation
     if sample_interval_s <= 0:
         raise ValueError("Frame sampling interval must be positive.")
+    if not np.isfinite(video_to_telemetry_offset_s) or abs(video_to_telemetry_offset_s) > 2:
+        raise ValueError("Video-to-telemetry timing offset must be within ±2 seconds.")
     if max_frames is not None and max_frames <= 0:
         return
     coverage = video_coverage or inspect_video_coverage(source, telemetry, cancelled)
@@ -819,8 +824,9 @@ def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interva
     if has_sync:
         usable_start = max(telemetry.pose_times_s[0], telemetry.pitch_times_s[0])
         usable_end = min(telemetry.pose_times_s[-1], telemetry.pitch_times_s[-1])
+        aligned_times = telemetry.frame_times_s + video_to_telemetry_offset_s
         telemetry.timing_diagnostics['timestamped_frames_outside_pose_tilt_interval'] = int(
-            np.sum((telemetry.frame_times_s < usable_start) | (telemetry.frame_times_s > usable_end)))
+            np.sum((aligned_times < usable_start) | (aligned_times > usable_end)))
     for segment, segment_info in enumerate(coverage.segments):
         video = segment_info.path
         _check_cancel(cancelled)
@@ -848,7 +854,7 @@ def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interva
                 _check_cancel(cancelled)
                 if timestamp < lower or timestamp > upper or timestamp - last_sample < sample_interval_s - 1e-6:
                     continue
-                pose = telemetry.interpolate(float(timestamp))
+                pose = telemetry.interpolate(float(timestamp) + video_to_telemetry_offset_s)
                 if pose is None:
                     continue
                 capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
@@ -863,7 +869,7 @@ def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interva
                     if not np.isfinite(pts) or (frame_index > 0 and pts <= 0):
                         raise FlightError("Video decoder does not expose usable presentation timestamps.")
                     timestamp = origin + fallback_segment_offset + pts
-                    pose = telemetry.interpolate(float(timestamp))
+                    pose = telemetry.interpolate(float(timestamp) + video_to_telemetry_offset_s)
                     if pose is None:
                         continue
                 if rotation == 180:

@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -18,7 +19,11 @@ from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QGroupBox
 
 import elios_colorizer.ui as ui_module
 from elios_colorizer.inspector_discovery import InspectorAsset, InspectorFlight, InspectorInspection
-from elios_colorizer.ui import InspectorAssetDialog, MainWindow
+from elios_colorizer.calibration_ui import CalibrationReferenceDialog, CalibrationWorkbenchDialog
+from elios_colorizer.calibration_workbench import CalibrationSession
+from elios_colorizer.camera import Calibration
+from elios_colorizer.colorize import FrameObservation
+from elios_colorizer.ui import FlightSelection, InspectorAssetDialog, MainWindow
 
 
 @pytest.fixture(scope="module")
@@ -115,6 +120,23 @@ def prepare(window, output):
     window.output_edit.setText(str(output))
     window._start_pending_inspection()
     wait_until(lambda: window._thread is None)
+
+
+def test_calibration_reference_dialog_preserves_merged_geometry_context(app, tmp_path):
+    flight = FlightSelection("flight-folder", "flight.las", "Flight 6")
+    transform = np.eye(4)
+    transform[0, 3] = 2.5
+    dialog = CalibrationReferenceDialog(
+        [flight], geometry_path=tmp_path / "merged.las",
+        source_to_geometry=[transform])
+    dialog.manual.setChecked(True)
+    dialog._manual_rows[0][1].setText("2:34")
+    request = dialog.manual_requests()[0]
+    assert request.flight_name == "Flight 6"
+    assert request.elapsed_s == 154
+    assert request.geometry_path == tmp_path / "merged.las"
+    np.testing.assert_array_equal(request.source_to_geometry, transform)
+    dialog.close()
 
 
 def test_ready_requires_validated_inputs_and_las_output(ui, tmp_path):
@@ -336,7 +358,7 @@ def test_sticky_focus_preflight_settings_and_output_preview(ui, tmp_path):
     window.advanced_settings = ui_module.AdvancedProcessingSettings(5, 4, 8, True, 10, 30, True)
     output = tmp_path / "result.las"
     window.output_edit.setText(str(output));window._update_processing_summaries()
-    assert [chip.text() for chip in window.settings_chips] == ["5 fps", "Exclude outer 4%", "Strong blur", "Fusion On", "00:00:10–00:00:30"]
+    assert [chip.text() for chip in window.settings_chips] == ["5 fps", "Exclude outer 4%", "Strong blur", "White protection On", "00:00:10–00:00:30"]
     assert "approximately 100 sampled frames" in window.preflight_summary.text()
     assert window.output_preview.isHidden() and window.output_preview.text() == ""
     assert window.sticky_bar.parent() is window.centralWidget()
@@ -461,6 +483,7 @@ def test_processing_receives_inputs_and_reports_coverage(ui, tmp_path):
     assert backend.illumination_balancing
     assert backend.processing_settings == {
         'sample_interval_s': .5, 'image_border_fraction': .05, 'minimum_sharpness': 8,
+        'multi_frame_fusion': True,
         'resource_settings': ui_module.ResourcePreferences().to_dict()}
     assert backend.last_run == ("flight", str(output), "source.las", "camera.json")
     assert window.progress_bar.value() == 1000
@@ -542,6 +565,76 @@ def test_cancel_stays_responsive_and_waits_for_worker(ui, tmp_path):
     assert backend.run_cancelled.is_set()
     assert window.state_label.text() == "Colorization cancelled."
     assert window.run_button.isEnabled()
+
+
+def test_calibration_load_uses_blocking_overlay_without_freezing_ui(ui, monkeypatch):
+    window = ui(FakeBackend())
+    started = threading.Event()
+    release = threading.Event()
+    warnings = []
+    monkeypatch.setattr(
+        ui_module.QMessageBox, "warning",
+        lambda _parent, title, message: warnings.append((title, message)))
+
+    def loader():
+        started.set()
+        if not release.wait(4):
+            raise RuntimeError("test loader timed out")
+        raise RuntimeError("synthetic calibration failure")
+
+    window._start_calibration_load(loader)
+    wait_until(started.is_set)
+    assert not window.calibration_loading_overlay.isHidden()
+    assert window.calibration_loading_spinner._timer.isActive()
+    assert not window.scroll_area.isEnabled()
+    QApplication.processEvents()  # the GUI event loop remains responsive
+    release.set()
+    wait_until(lambda: window._calibration_thread is None)
+    assert window.calibration_loading_overlay.isHidden()
+    assert window.scroll_area.isEnabled()
+    assert warnings == [("Calibration workbench unavailable",
+                         "synthetic calibration failure")]
+
+
+def test_calibration_controls_reset_individually_and_inspector_resets(app, tmp_path):
+    camera = Calibration(160, 120, 90, 90, 80, 60, (0, 0, 0, 1), (0, 0, 0),
+                         (0, 1, 0), (0, 0, 0), 1, 0,
+                         profile_name="Synthetic", validated=True)
+
+    class Telemetry:
+        def interpolate(self, _timestamp):
+            return type("Pose", (), dict(
+                position_world_m=np.zeros(3),
+                orientation_xyzw=np.array([0, 0, 0, 1]),
+                camera_pitch_degrees=0))()
+
+    frame = FrameObservation(np.zeros((120, 160, 3), dtype=np.uint8),
+                             (0, 0, 0), (0, 0, 0, 1), 0, 0)
+    session = CalibrationSession(
+        tmp_path / "base.json", camera, np.array([[0.0, 0.0, 3.0]]),
+        Telemetry(), [frame], [0.0])
+    dialog = CalibrationWorkbenchDialog(session)
+    try:
+        assert set(dialog._reset_buttons) == set(dialog._controls)
+        dialog._controls["mount_pitch_degrees"].setValue(1.25)
+        dialog._controls["mount_yaw_degrees"].setValue(2.0)
+        dialog._reset_buttons["mount_pitch_degrees"].click()
+        assert dialog._controls["mount_pitch_degrees"].value() == 0
+        assert dialog._controls["mount_yaw_degrees"].value() == 2.0
+
+        assert [dialog.display_mode.itemText(index)
+                for index in range(dialog.display_mode.count())] == [
+                    "Composite", "3D Inspector", "Edge Diagnostic"]
+        dialog.display_mode.setCurrentIndex(1)
+        dialog.preview.context_angles[:] = (12, 24)
+        dialog.display_mode.setCurrentIndex(0)
+        dialog.display_mode.setCurrentIndex(1)
+        np.testing.assert_allclose(dialog.preview.context_angles, 0)
+        assert dialog.density.itemData(dialog.density.count() - 1) == 1_000_000
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        QApplication.processEvents()
 
 
 def test_missing_inputs_block_processing(ui, tmp_path):

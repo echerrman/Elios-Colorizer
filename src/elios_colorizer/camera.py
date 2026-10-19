@@ -26,6 +26,11 @@ pitch rotation is angle = tilt_sign * (reported_pitch - tilt_zero_degrees),
 around tilt_axis_body through tilt_pivot_body_m. Calibration values must come
 from measurements, supplier data, or a separately validated calibration; this
 module intentionally supplies no guessed Elios RGB profile.
+
+Schema 2 is written only by the overlay calibration workbench. It preserves a
+complete schema-1 fallback snapshot and adds an explicit video-to-telemetry
+timing offset. Schema-1 profiles remain first-class inputs and are never
+modified in place.
 """
 
 from __future__ import annotations
@@ -77,14 +82,28 @@ class Calibration:
     distortion_coefficients: tuple[float, ...] = ()
     profile_name: str = ""
     validated: bool = False
+    schema_version: int = 1
+    video_to_telemetry_offset_s: float = 0.0
+    fallback_calibration: dict[str, Any] | None = None
+    refinement: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.schema_version not in (1, 2):
+            raise CalibrationError("Unsupported calibration schema version; expected 1 or 2")
+        if self.schema_version == 2:
+            if (not isinstance(self.fallback_calibration, dict)
+                    or self.fallback_calibration.get("schema_version") != 1):
+                raise CalibrationError("Schema 2 requires a complete schema-1 fallback_calibration")
+            if not isinstance(self.refinement, dict):
+                raise CalibrationError("Schema 2 requires refinement metadata")
         if (not isinstance(self.image_width, int) or not isinstance(self.image_height, int)
                 or self.image_width < 2 or self.image_height < 2):
             raise CalibrationError("Image width and height must be integers of at least 2")
         if not np.isfinite([self.fx, self.fy, self.cx, self.cy, self.tilt_sign,
-                            self.tilt_zero_degrees]).all() or min(self.fx, self.fy) <= 0:
+                            self.tilt_zero_degrees, self.video_to_telemetry_offset_s]).all() or min(self.fx, self.fy) <= 0:
             raise CalibrationError("Intrinsics and tilt values must be finite, with positive focal lengths")
+        if abs(self.video_to_telemetry_offset_s) > 2.0:
+            raise CalibrationError("Video-to-telemetry timing offset must be within ±2 seconds")
         if not (0 <= self.cx < self.image_width and 0 <= self.cy < self.image_height):
             raise CalibrationError("Principal point must lie inside the calibrated image")
         _rotation(self.rotation_xyzw, "camera_to_body.rotation_xyzw")
@@ -110,8 +129,9 @@ class Calibration:
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, require_validated: bool = True) -> "Calibration":
         try:
-            if data["schema_version"] != 1:
-                raise CalibrationError("Unsupported calibration schema version; expected 1")
+            schema_version = int(data["schema_version"])
+            if schema_version not in (1, 2):
+                raise CalibrationError("Unsupported calibration schema version; expected 1 or 2")
             if not isinstance(data["validated"], bool):
                 raise CalibrationError("Calibration validated field must be a boolean")
             if require_validated and data["validated"] is not True:
@@ -132,6 +152,11 @@ class Calibration:
                 distortion_model=distortion["model"],
                 distortion_coefficients=tuple(distortion["coefficients"]),
                 profile_name=str(data["profile_name"]), validated=data["validated"],
+                schema_version=schema_version,
+                video_to_telemetry_offset_s=float(
+                    (data.get("timing") or {}).get("video_to_telemetry_offset_s", 0.0)),
+                fallback_calibration=(data.get("fallback_calibration") if schema_version == 2 else None),
+                refinement=(data.get("refinement") if schema_version == 2 else None),
             )
         except (KeyError, TypeError, ValueError) as exc:
             if isinstance(exc, CalibrationError):
@@ -147,8 +172,8 @@ class Calibration:
             raise CalibrationError(f"Cannot read RGB calibration: {exc}") from exc
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema_version": 1, "profile_name": self.profile_name, "validated": self.validated,
+        result = {
+            "schema_version": self.schema_version, "profile_name": self.profile_name, "validated": self.validated,
             "image_width": self.image_width, "image_height": self.image_height,
             "intrinsics": {"fx": self.fx, "fy": self.fy, "cx": self.cx, "cy": self.cy},
             "distortion": {"model": self.distortion_model, "coefficients": list(self.distortion_coefficients)},
@@ -158,6 +183,19 @@ class Calibration:
                 "tilt_sign": self.tilt_sign, "tilt_zero_degrees": self.tilt_zero_degrees,
             },
         }
+        if self.schema_version == 2:
+            result["timing"] = {"video_to_telemetry_offset_s": self.video_to_telemetry_offset_s}
+            if self.fallback_calibration is not None:
+                result["fallback_calibration"] = self.fallback_calibration
+            if self.refinement is not None:
+                result["refinement"] = self.refinement
+        return result
+
+    def fallback(self) -> "Calibration":
+        """Return the preserved base profile for a refined calibration."""
+        if self.schema_version == 2 and self.fallback_calibration:
+            return Calibration.from_dict(self.fallback_calibration)
+        return self
 
     def camera_pose(self, position_world_m: Any, orientation_xyzw: Any,
                     camera_pitch_degrees: float) -> tuple[np.ndarray, np.ndarray]:

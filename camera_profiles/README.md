@@ -19,5 +19,10 @@ Select the desired JSON file with the **Camera profile** browser. The selection
 is shared by every flight in a workflow and is the only file path remembered
 between sessions.
 
+The version 2.0 overlay workbench can derive a schema-v2 profile from either of
+these schema-v1 files. It saves to a new path, embeds the complete starting
+profile as a fallback, and records any video-to-telemetry timing correction.
+Existing profiles are never rewritten and continue to work unchanged.
+
 See [the calibration guide](../docs/CALIBRATION.md) before creating or marking a
 profile as validated.

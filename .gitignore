@@ -16,6 +16,7 @@ analysis/native_flight/*.jpg
 .readme-preview/
 selftest-output/
 .release-selftest-*/
+.release-pytest/
 
 # Local research retained outside the public repository.
 tools/

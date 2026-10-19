@@ -37,6 +37,61 @@ local workspace and try again.
 You can also add an individual flight row or drag flight folders into the main
 window. Both approaches use the same validation and colorization pipeline.
 
+## Calibrate before colorization
+
+Calibration is optional when the selected camera profile already aligns well,
+but it should be reviewed when fine details consistently land above, below, or
+beside their physical points.
+
+1. Select at least one complete flight, its matching LAS/export, and the
+   existing camera profile you want to keep as the fallback.
+2. Select **Calibration** at the top of the window. Use the three automatic
+   views, or choose manual flight/timestamp pairs in `M:SS` when you know where
+   the clearest reference features occur.
+3. In **Composite**, adjust Video opacity until both the EDL-shaded cloud and
+   video are readable. Make the same physical railing, pipe, platform edge,
+   corner, or door frame occupy the same pixels in both layers. Prefer rigid
+   geometry over paint, glare, shadows, or texture. Wheel zooms both layers,
+   dragging pans them, and double-click resets the view. 3D Inspector is for
+   orientation rather than judging pixel alignment and resets to the recorded
+   camera view each time you return to it.
+   Adjust Point size, Density, Cloud color, and Depth shading as needed. Move
+   through every selected reference view rather than correcting only one frame.
+4. Adjust the smallest relevant control:
+   - **Video → telemetry** corrects displacement that changes with drone or
+     camera-head motion.
+   - **Principal X/Y** corrects a nearly constant horizontal or vertical image
+     shift.
+   - **Focal scale** corrects error that grows from the image center toward its
+     edges.
+   - **Roll/Pitch/Yaw** correct camera-mount angular error. Roll rotates about
+     camera-forward, pitch about camera-right, and yaw about camera-down.
+   - **Translate X/Y/Z** correct measured camera-center displacement.
+   - **Tilt zero** corrects error associated with camera-head angle.
+   A click makes the fine step shown by the control. Holding an arrow accelerates
+   the repeated change for larger adjustments. The reset icon beside any value
+   resets only that setting.
+5. Review every reference view, choose **Save profile and use**, and save to a
+   new JSON file. The starting profile is never overwritten.
+
+The cloud name shown above the viewport identifies the geometry being used.
+Single/separate workflows use the native flight cloud. A merged workflow uses
+the supplied merged cloud plus the selected flight's alignment matrix. The
+workbench loads an adaptive temporary sample of at most 1,000,000 points. It
+concentrates points inside the three buffered reference-view areas and keeps
+distant context sparse; this does not change the source LAS/LAZ or reduce the
+final colorization density.
+
+The saved schema-v2 profile contains the adjusted camera parameters, the timing
+correction, review metadata, and a complete copy of the original schema-v1
+profile. Reopen the workbench and select **Use original fallback** to start over
+from that baseline. The readiness checklist identifies refined profiles and
+their fallback explicitly.
+
+Calibration corrects where video lands on geometry. It cannot create points for
+details absent from the LAS, and a correction should not be trusted when it only
+matches one wall, one distance, or one camera-head angle.
+
 ## Choose a workflow
 
 ### Single flight
@@ -79,11 +134,14 @@ Open **Advanced processing settings** to adjust settings for the current session
 - **Image edge exclusion** ignores a 0–15% border around every frame; the
   default is 2%.
 - **Blur rejection** can be Off, Normal, or Strong; the default is Normal.
-- **Robust multi-frame color fusion** retains up to five strong RGB observations
-  per point, rejects brightness outliers, and chooses an actual observed color
-  supported by the available views. It requires at least three observations;
-  otherwise that point uses the normal best-observation result. Fusion is Off by
-  default and uses additional temporary disk space.
+- **Accuracy fusion and true-white preservation** retains observations from up
+  to five distinct camera poses per point. Views within 15 cm and 3 degrees
+  compete for one slot, so adjacent 30-fps frames cannot cast repeated votes.
+  Neutral white is protected only when at least two independent poses and a 60%
+  majority agree. Image/depth-boundary confidence also reduces color bleeding
+  near railings and silhouettes. At least three independent observations are
+  required; otherwise the point uses the normal best-observation result.
+  Accuracy fusion is On by default and uses additional temporary disk space.
 - **Process only a time range** limits RGB observations to start/end times
   elapsed from each flight's first synchronized video frame. Leave **Through
   end of video** selected to adapt automatically to each flight's duration.
@@ -138,6 +196,6 @@ workflow. No setting is required when resizing the window.
 - On completion, the results card summarizes coverage, runtime, frame usage,
   strategy, and warnings, with direct output and report actions.
 
-Keyboard shortcuts include `Ctrl+Shift+A` to add a flight, `Ctrl+R` to refresh
-checks, `Ctrl+,` for Advanced Processing Settings, and `Ctrl+Enter` to start an
-available run.
+Keyboard shortcuts include `Ctrl+Shift+A` to add a flight, `Ctrl+Shift+C` to
+open the calibration workbench, `Ctrl+R` to refresh checks, `Ctrl+,` for Advanced
+Processing Settings, and `Ctrl+Enter` to start an available run.

@@ -63,7 +63,7 @@ class ColorizationOptions:
     maximum_depth_m: float = 40.0
     image_border_fraction: float = 0.02
     minimum_luminance: float = 3.0
-    maximum_luminance: float = 252.0
+    maximum_luminance: float = 255.0
     minimum_sharpness: float = 2.0
     reject_exposure_extremes: bool = True
     overwrite: bool = False
@@ -140,6 +140,42 @@ class _PreparedFrame:
     sharpness_weight: float
     illumination_model: Any = None
     illumination_frame: int = 0
+    diversity_group: int = 0
+    depth_edge_strength: np.ndarray | None = None
+
+
+class _PoseDiversityGroups:
+    """Assign stable groups to genuinely different calibrated camera poses."""
+
+    def __init__(self, translation_m: float = .15, rotation_degrees: float = 3.0):
+        self.translation_m = translation_m
+        self.rotation_degrees = rotation_degrees
+        self._bins: dict[tuple[int, int, int, int], list[tuple[np.ndarray, np.ndarray, int]]] = {}
+        self._next_group = 1
+
+    @staticmethod
+    def _rotation_degrees(first: np.ndarray, second: np.ndarray) -> float:
+        cosine = float(np.clip((np.trace(first.T @ second) - 1) * .5, -1, 1))
+        return math.degrees(math.acos(cosine))
+
+    def assign(self, frame: _PreparedFrame) -> int:
+        center = np.asarray(frame.center, dtype=np.float64)
+        cell = np.floor(center / self.translation_m).astype(np.int64)
+        source = int(frame.observation.source_flight)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    key = (source, int(cell[0] + dx), int(cell[1] + dy), int(cell[2] + dz))
+                    for anchor_center, anchor_rotation, group in self._bins.get(key, ()):
+                        if (np.linalg.norm(center - anchor_center) < self.translation_m
+                                and self._rotation_degrees(frame.camera_to_world, anchor_rotation)
+                                < self.rotation_degrees):
+                            return group
+        group = self._next_group
+        self._next_group += 1
+        key = (source, int(cell[0]), int(cell[1]), int(cell[2]))
+        self._bins.setdefault(key, []).append((center.copy(), frame.camera_to_world.copy(), group))
+        return group
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -388,6 +424,51 @@ def _update_visibility(xyz: np.ndarray, frame: _PreparedFrame, calibration: Cali
     np.minimum.at(frame.depth, (y, x), z)
 
 
+def _finalize_visibility(frame: _PreparedFrame, options: ColorizationOptions, *,
+                         expand_occlusion: bool = True) -> None:
+    """Record geometric boundary risk before expanding the visibility buffer."""
+    kernel = np.ones((3, 3), np.uint8)
+    local_min = cv2.erode(frame.depth, kernel, borderType=cv2.BORDER_CONSTANT,
+                          borderValue=float("inf"))
+    finite_for_max = np.where(np.isfinite(frame.depth), frame.depth, -np.inf)
+    local_max = cv2.dilate(finite_for_max, kernel, borderType=cv2.BORDER_CONSTANT,
+                           borderValue=-float("inf"))
+    valid = np.isfinite(local_min) & np.isfinite(local_max)
+    tolerance = np.full(frame.depth.shape, options.occlusion_absolute_tolerance_m,
+                        dtype=np.float32)
+    tolerance[valid] += local_min[valid] * options.occlusion_relative_tolerance
+    denominator = np.maximum(.05, tolerance * 4)
+    strength = np.zeros(frame.depth.shape, dtype=np.float32)
+    strength[valid] = np.clip((local_max[valid] - local_min[valid] - tolerance[valid])
+                              / denominator[valid], 0, 1)
+    frame.depth_edge_strength = strength
+    if expand_occlusion and options.occlusion_radius_pixels:
+        size = 2 * options.occlusion_radius_pixels + 1
+        frame.depth = cv2.erode(frame.depth, np.ones((size, size), np.uint8),
+                                borderType=cv2.BORDER_CONSTANT, borderValue=float("inf"))
+
+
+def _edge_confidence(frame: _PreparedFrame, uv: np.ndarray,
+                     depth_x: np.ndarray, depth_y: np.ndarray) -> np.ndarray:
+    """Downweight samples where image texture and 3-D depth boundaries are fragile."""
+    image = frame.observation.rgb
+    x = np.clip(np.rint(uv[:, 0]).astype(np.intp), 1, image.shape[1] - 2)
+    y = np.clip(np.rint(uv[:, 1]).astype(np.intp), 1, image.shape[0] - 2)
+    weights = np.array([.2126, .7152, .0722], dtype=np.float32)
+    horizontal = np.abs((image[y, x + 1].astype(np.float32)
+                         - image[y, x - 1].astype(np.float32)) @ weights)
+    vertical = np.abs((image[y + 1, x].astype(np.float32)
+                       - image[y - 1, x].astype(np.float32)) @ weights)
+    image_edge = np.clip((np.hypot(horizontal, vertical) - 12) / 96, 0, 1)
+    depth_edge = (frame.depth_edge_strength[depth_y, depth_x]
+                  if frame.depth_edge_strength is not None else np.zeros(len(uv), dtype=np.float32))
+    # A texture edge alone may be real paint, and a depth edge alone may be a
+    # valid thin object. Their coincidence is the high-risk projection case.
+    confidence = ((1 - .15 * image_edge) * (1 - .45 * depth_edge)
+                  * (1 - .55 * image_edge * depth_edge))
+    return np.clip(confidence, .15, 1).astype(np.float32)
+
+
 def _estimate_illumination(sample_xyz, batch, calibration, options):
     radii = np.full((len(batch), len(sample_xyz)), np.nan)
     light = np.full_like(radii, np.nan)
@@ -424,6 +505,7 @@ def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
         if not visible.any():
             continue
         selected, uv, z, camera = selected[visible], uv[visible], z[visible], camera[visible]
+        x, y = x[visible], y[visible]
         rgb = _sample_rgb(frame.observation.rgb, uv)
         luminance = rgb @ np.array([0.2126, 0.7152, 0.0722])
         usable = np.ones(len(rgb), dtype=bool)
@@ -432,7 +514,8 @@ def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
         if options.illumination_balancing:
             exposure_ok = raw_usable(rgb, options.minimum_luminance, options.maximum_luminance, luminance)
             rejected_count += int(np.count_nonzero(~exposure_ok))
-            usable &= exposure_ok
+            # Saturated observations are unsafe illumination-fit evidence, but
+            # can be genuine white surface colors and remain eligible here.
         point_distance = np.linalg.norm(camera, axis=1)
         if options.maximum_color_distance_m is not None:
             usable &= point_distance <= options.maximum_color_distance_m
@@ -442,7 +525,8 @@ def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
             1 - uv[:, 0] / calibration.image_width, 1 - uv[:, 1] / calibration.image_height))
         edge_weight = np.clip(border_distance / 0.15, 0.05, 1)
         exposure_weight = 0.5 + 0.5 * (1 - np.abs(luminance - 127.5) / 127.5)
-        score = (frame.sharpness_weight * cosine**2 * edge_weight * exposure_weight
+        boundary_weight = _edge_confidence(frame, uv, x, y)
+        score = (frame.sharpness_weight * cosine**2 * edge_weight * boundary_weight * exposure_weight
                  / (1 + (z / 5)**2)).astype(np.float32)
         indices = selected + offset
         better = usable & (score > quality[indices])
@@ -451,13 +535,23 @@ def _assign_chunk_colors(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
         if frame.illumination_model is not None:
             # Penalties never exceed one, so an existing loser cannot become a
             # winner. Compute gains and encode RGB only for potential winners.
-            gains, penalty = frame.illumination_model.adjustment(
-                chosen_rgb, radius_squared(uv[candidates], calibration), frame.illumination_frame)
+            balance_ok = raw_usable(chosen_rgb, options.minimum_luminance,
+                                    options.maximum_luminance)
+            gains = np.ones(len(chosen_rgb), dtype=np.float32)
+            penalty = np.ones(len(chosen_rgb), dtype=np.float32)
+            if balance_ok.any():
+                gains[balance_ok], penalty[balance_ok] = frame.illumination_model.adjustment(
+                    chosen_rgb[balance_ok], radius_squared(uv[candidates][balance_ok], calibration),
+                    frame.illumination_frame)
             score[candidates] *= penalty
             wins = score[candidates] > quality[indices[candidates]]
             better[candidates] = wins
             chosen_rgb = chosen_rgb[wins]
-            corrected = apply_gain(chosen_rgb, gains[wins])
+            corrected = chosen_rgb.copy()
+            safe_winners = balance_ok[wins]
+            if safe_winners.any():
+                corrected[safe_winners] = apply_gain(
+                    chosen_rgb[safe_winners], gains[wins][safe_winners])
             corrected_count += int(np.count_nonzero(np.any(corrected != chosen_rgb, axis=1)))
             chosen_rgb = corrected
         chosen = indices[better]
@@ -472,7 +566,8 @@ def _assign_chunk_fusion(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
                          colors: np.ndarray, quality: np.ndarray, distances: np.ndarray,
                          sources: np.ndarray, fusion_colors: np.ndarray,
                          fusion_weights: np.ndarray, fusion_distances: np.ndarray,
-                         fusion_sources: np.ndarray, calibration: Calibration,
+                         fusion_sources: np.ndarray, fusion_groups: np.ndarray,
+                         calibration: Calibration,
                          options: ColorizationOptions) -> tuple[int, int, int, int]:
     """Retain the strongest visible observations for later robust per-point fusion."""
     corrected_count = rejected_count = 0
@@ -484,6 +579,7 @@ def _assign_chunk_fusion(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
         if not visible.any():
             continue
         selected, uv, z, camera = selected[visible], uv[visible], z[visible], camera[visible]
+        x, y = x[visible], y[visible]
         rgb = _sample_rgb(frame.observation.rgb, uv)
         adjusted_rgb = rgb.copy()
         luminance = rgb @ np.array([0.2126, 0.7152, 0.0722])
@@ -493,7 +589,8 @@ def _assign_chunk_fusion(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
         if options.illumination_balancing:
             exposure_ok = raw_usable(rgb, options.minimum_luminance, options.maximum_luminance, luminance)
             rejected_count += int(np.count_nonzero(~exposure_ok))
-            usable &= exposure_ok
+            # Saturated observations are unsafe illumination-fit evidence, but
+            # can be genuine white surface colors and remain eligible here.
         point_distance = np.linalg.norm(camera, axis=1)
         if options.maximum_color_distance_m is not None:
             usable &= point_distance <= options.maximum_color_distance_m
@@ -503,16 +600,21 @@ def _assign_chunk_fusion(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
             1 - uv[:, 0] / calibration.image_width, 1 - uv[:, 1] / calibration.image_height))
         edge_weight = np.clip(border_distance / 0.15, 0.05, 1)
         exposure_weight = 0.5 + 0.5 * (1 - np.abs(luminance - 127.5) / 127.5)
-        score = (frame.sharpness_weight * cosine**2 * edge_weight * exposure_weight
+        boundary_weight = _edge_confidence(frame, uv, x, y)
+        score = (frame.sharpness_weight * cosine**2 * edge_weight * boundary_weight * exposure_weight
                  / (1 + (z / 5)**2)).astype(np.float32)
         if frame.illumination_model is not None:
             candidates = np.flatnonzero(usable)
-            gains, penalty = frame.illumination_model.adjustment(
-                rgb[candidates], radius_squared(uv[candidates], calibration), frame.illumination_frame)
-            score[candidates] *= penalty
-            corrected = apply_gain(rgb[candidates], gains)
-            corrected_count += int(np.count_nonzero(np.any(corrected != rgb[candidates], axis=1)))
-            adjusted_rgb[candidates] = corrected
+            balance_ok = raw_usable(rgb[candidates], options.minimum_luminance,
+                                    options.maximum_luminance)
+            if balance_ok.any():
+                safe = candidates[balance_ok]
+                gains, penalty = frame.illumination_model.adjustment(
+                    rgb[safe], radius_squared(uv[safe], calibration), frame.illumination_frame)
+                score[safe] *= penalty
+                corrected = apply_gain(rgb[safe], gains)
+                corrected_count += int(np.count_nonzero(np.any(corrected != rgb[safe], axis=1)))
+                adjusted_rgb[safe] = corrected
         candidates = np.flatnonzero(usable & (score > 0))
         if not len(candidates):
             continue
@@ -532,9 +634,18 @@ def _assign_chunk_fusion(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
             sources[chosen] = frame.observation.source_flight
 
         rows = fusion_weights[indices]
-        slots = np.argmin(rows, axis=1)
-        weakest = rows[np.arange(len(indices)), slots]
-        retain = candidate_scores > weakest
+        groups = fusion_groups[indices]
+        same_group = (groups == frame.diversity_group) & (rows > 0)
+        has_same_group = np.any(same_group, axis=1)
+        same_slots = np.argmax(same_group, axis=1)
+        empty = rows <= 0
+        has_empty = np.any(empty, axis=1)
+        empty_slots = np.argmax(empty, axis=1)
+        weakest_slots = np.argmin(rows, axis=1)
+        slots = np.where(has_same_group, same_slots,
+                         np.where(has_empty, empty_slots, weakest_slots))
+        retained_scores = rows[np.arange(len(indices)), slots]
+        retain = candidate_scores > retained_scores
         if retain.any():
             chosen = indices[retain]
             slot = slots[retain]
@@ -542,19 +653,31 @@ def _assign_chunk_fusion(offset: int, xyz: np.ndarray, batch: list[_PreparedFram
             fusion_weights[chosen, slot] = candidate_scores[retain]
             fusion_distances[chosen, slot] = candidate_distances[retain]
             fusion_sources[chosen, slot] = frame.observation.source_flight
+            fusion_groups[chosen, slot] = frame.diversity_group
     return offset, len(xyz), corrected_count, rejected_count
 
 
 def _finalize_fusion(colors: np.ndarray, quality: np.ndarray, distances: np.ndarray,
                      sources: np.ndarray, fusion_colors: np.ndarray,
                      fusion_weights: np.ndarray, fusion_distances: np.ndarray,
-                     fusion_sources: np.ndarray, options: ColorizationOptions) -> dict[str, Any]:
+                     fusion_sources: np.ndarray, fusion_groups: np.ndarray,
+                     options: ColorizationOptions) -> dict[str, Any]:
     """Choose a robust observed-color medoid after rejecting luminance outliers."""
     report = dict(requested=True, applied=False, maximum_observations=options.fusion_max_observations,
                   minimum_observations=options.fusion_min_observations,
                   points_with_multiple_observations=0, points_fused=0,
                   points_using_best_observation_fallback=0, rejected_outlier_observations=0,
-                  method='top-quality reservoir; linear-RGB luminance outlier rejection; weighted observed-color medoid')
+                  bright_consensus_points=0, diverse_bright_consensus_points=0,
+                  isolated_bright_observations_rejected=0,
+                  pose_translation_threshold_m=.15, pose_rotation_threshold_degrees=3.0,
+                  white_consensus_fraction=.60,
+                  edge_confidence_policy={
+                      'image_gradient_start': 12.0,
+                      'depth_tolerance': 'occlusion_absolute + depth * occlusion_relative',
+                      'minimum_weight': .15,
+                  },
+                  method=('pose-diverse top-quality reservoir; diverse-view neutral-white majority; '
+                          'linear-RGB luminance outlier rejection; weighted observed-color medoid'))
     for offset in range(0, len(colors), options.chunk_size):
         end = min(len(colors), offset + options.chunk_size)
         weights = np.asarray(fusion_weights[offset:end])
@@ -567,6 +690,24 @@ def _finalize_fusion(colors: np.ndarray, quality: np.ndarray, distances: np.ndar
         candidate_weights = weights[eligible].astype(np.float32, copy=True)
         candidate_colors = np.asarray(fusion_colors[offset:end][eligible])
         active = candidate_weights > 0
+        candidate_groups = np.asarray(fusion_groups[offset:end][eligible])
+        duplicate_groups = ((candidate_groups[:, :, None] == candidate_groups[:, None, :])
+                            & active[:, :, None] & active[:, None, :]
+                            & ~np.eye(options.fusion_max_observations, dtype=bool)[None])
+        if np.any(duplicate_groups):
+            raise ColorizationError("Fusion reservoir contains duplicate pose-diversity groups")
+        channel_spread = candidate_colors.max(axis=2) - candidate_colors.min(axis=2)
+        srgb_luminance = candidate_colors @ np.array([.2126, .7152, .0722], dtype=np.float32)
+        bright = active & (srgb_luminance >= 235) & (channel_spread <= 28)
+        bright_count = np.count_nonzero(bright, axis=1)
+        sorted_bright = np.sort(np.where(bright, srgb_luminance, np.inf), axis=1)
+        median_slot = np.maximum(0, (bright_count - 1) // 2)
+        bright_median = np.take_along_axis(sorted_bright, median_slot[:, None], axis=1)[:, 0]
+        stable_bright = bright & (np.abs(srgb_luminance - bright_median[:, None]) <= 20)
+        required_bright = np.maximum(2, np.ceil(counts[eligible] * .60).astype(np.intp))
+        bright_consensus = np.count_nonzero(stable_bright, axis=1) >= required_bright
+        report['bright_consensus_points'] += int(np.count_nonzero(bright_consensus))
+        report['diverse_bright_consensus_points'] += int(np.count_nonzero(bright_consensus))
         linear = LINEAR[candidate_colors].astype(np.float32, copy=False)
         luminance = linear @ np.array([.2126, .7152, .0722], dtype=np.float32)
         luminance[~active] = np.nan
@@ -575,6 +716,12 @@ def _finalize_fusion(colors: np.ndarray, quality: np.ndarray, distances: np.ndar
         mad = np.nanmedian(deviation, axis=1)
         threshold = np.maximum(.04, 3.0 * mad)
         inlier = active & (deviation <= threshold[:, None])
+        isolated_bright = bright & ~bright_consensus[:, None]
+        report['isolated_bright_observations_rejected'] += int(np.count_nonzero(isolated_bright & ~inlier))
+        # A majority of pose-diverse neutral-white observations indicates
+        # persistent surface color. Restrict those points to that consensus so
+        # a few projection misses onto the darker neighborhood cannot erase it.
+        inlier[bright_consensus] = stable_bright[bright_consensus]
         # The median/MAD rule always retains a central observation, but require
         # two agreeing views; otherwise preserve the legacy best observation.
         consensus = np.count_nonzero(inlier, axis=1) >= 2
@@ -706,8 +853,9 @@ def colorize_las(
     cuda_backend, cuda_reason = (cuda_projection_backend(calibration) if options.cuda_enabled else
                                  (None,'CUDA disabled by custom hardware resource settings'))
     acceleration.update(
-        processing_backend=('cuda_fusion' if cuda_backend and options.multi_frame_fusion else
-                            ('cuda_projection' if cuda_backend else 'cpu_reference')),
+        processing_backend=(('cuda_visibility_cpu_diverse_fusion' if options.multi_frame_fusion
+                             else 'cuda_visibility_cpu_color')
+                            if cuda_backend else 'cpu_reference'),
         cuda_acceleration_active=cuda_backend is not None,
         fallback_reason=cuda_reason,
         visibility_chunks=0,
@@ -720,9 +868,9 @@ def colorize_las(
         selected_cuda_device=options.cuda_device_index if cuda_backend is not None else None,
     )
     acceleration['summary'] = (
-        (f"CUDA device {options.cuda_device_index + 1} projection and fusion candidate collection enabled on {acceleration.get('device_name')}"
-         if cuda_backend and options.multi_frame_fusion else
-         f"CUDA device {options.cuda_device_index + 1} projection enabled on {acceleration.get('device_name')}")
+        (f"CUDA device {options.cuda_device_index + 1} visibility with deterministic CPU "
+         f"{'pose-diverse fusion' if options.multi_frame_fusion else 'edge-aware color selection'} "
+         f"enabled on {acceleration.get('device_name')}")
         if cuda_backend else f"CPU fallback: {cuda_reason}")
     _emit(progress, "acceleration", **acceleration)
     if destination.exists() and not options.overwrite:
@@ -738,7 +886,7 @@ def colorize_las(
     header = _output_header(original_header, options.merged_output)
     destination.parent.mkdir(parents=True, exist_ok=True)
     use_xyz_cache = _use_xyz_cache(count, options)
-    fusion_bytes = (count * options.fusion_max_observations * (3 + 4 + 4 + 2)
+    fusion_bytes = (count * options.fusion_max_observations * (3 + 4 + 4 + 2 + 4)
                     if options.multi_frame_fusion else 0)
     required_bytes = count * ((16 if candidate_path is not None else header.point_format.size + 14)) + fusion_bytes + 64 * 1024**2
     if shutil.disk_usage(destination.parent).free < required_bytes:
@@ -747,7 +895,8 @@ def colorize_las(
     illumination = dict(requested=options.illumination_balancing, applied=False,
         accepted_batches=0, skipped_batches=0, overlap_sample_count=0,
         radial_gain_range=[1., 1.], exposure_gain_range=[1., 1.],
-        corrected_observations=0, rejected_exposure_observations=0,
+        corrected_observations=0, excluded_from_correction_observations=0,
+        rejected_exposure_observations=0,
         minimum_model_confidence=None, fallback_reasons={},
         scope="batch-local radial response and matched per-frame exposure offsets")
     fusion = dict(requested=options.multi_frame_fusion, applied=False,
@@ -756,7 +905,7 @@ def colorize_las(
                   points_with_multiple_observations=0, points_fused=0,
                   points_using_best_observation_fallback=0,
                   rejected_outlier_observations=0,
-                  method=('top-quality reservoir; linear-RGB luminance outlier rejection; '
+                  method=('pose-diverse top-quality reservoir; linear-RGB luminance outlier rejection; '
                           'weighted observed-color medoid'))
     sample_ids = (np.linspace(0, count - 1, min(count, 8192), dtype=np.int64)
                   if options.illumination_balancing else np.empty(0, dtype=np.int64))
@@ -769,7 +918,7 @@ def colorize_las(
         quality = np.memmap(work / "quality.f32", mode="w+", dtype=np.float32, shape=(count,))
         distances = np.memmap(work / "distance.f32", mode="w+", dtype=np.float32, shape=(count,))
         sources = np.memmap(work / "source.u16", mode="w+", dtype=np.uint16, shape=(count,))
-        fusion_colors = fusion_weights = fusion_distances = fusion_sources = None
+        fusion_colors = fusion_weights = fusion_distances = fusion_sources = fusion_groups = None
         if options.multi_frame_fusion:
             shape = (count, options.fusion_max_observations)
             fusion_colors = np.memmap(work / "fusion-rgb.u8", mode="w+", dtype=np.uint8,
@@ -780,8 +929,11 @@ def colorize_las(
                                          shape=shape)
             fusion_sources = np.memmap(work / "fusion-source.u16", mode="w+", dtype=np.uint16,
                                        shape=shape)
+            fusion_groups = np.memmap(work / "fusion-group.u32", mode="w+", dtype=np.uint32,
+                                      shape=shape)
         # Freshly created mapped files are zero initialized by the operating system.
         active_cuda_batch = None
+        diversity_groups = _PoseDiversityGroups()
         try:
             # Chunk bounds are tiny (about 4 KB per 20M points) and let later passes
             # seek past distant/behind-camera chunks without decoding their XYZ.
@@ -822,6 +974,7 @@ def colorize_las(
                     if prepared is None:
                         rejected += 1
                     else:
+                        prepared.diversity_group = diversity_groups.assign(prepared)
                         batch.append(prepared)
                 if not batch:
                     _emit(progress, "frames_rejected", frames_received=received, frames_rejected=rejected)
@@ -844,7 +997,9 @@ def colorize_las(
                             _emit(progress, "visibility", batch=batch_index,
                                   points_processed=offset + len(xyz), point_count=count,
                                   frames_received=received, frames_used=used)
-                        cuda_batch.finish_visibility(options.occlusion_radius_pixels)
+                        # Copy the raw CUDA depth map back before applying the
+                        # shared edge analysis and occlusion expansion on CPU.
+                        cuda_batch.finish_visibility(0)
                     except CudaBackendError as exc:
                         if cuda_batch is not None:
                             cuda_batch.close()
@@ -869,11 +1024,8 @@ def colorize_las(
                             list(executor.map(lambda frame: _update_visibility(xyz, frame, calibration, options), batch))
                         _emit(progress, "visibility", batch=batch_index, points_processed=offset + len(xyz),
                               point_count=count, frames_received=received, frames_used=used)
-                    if options.occlusion_radius_pixels:
-                        size = 2 * options.occlusion_radius_pixels + 1
-                        for frame in batch:
-                            frame.depth = cv2.erode(frame.depth, np.ones((size, size), np.uint8),
-                                                    borderType=cv2.BORDER_CONSTANT, borderValue=float("inf"))
+                for frame in batch:
+                    _finalize_visibility(frame, options)
                 timings.add('cuda_visibility' if cuda_batch is not None else 'cpu_visibility',
                             time.perf_counter() - visibility_started)
                 if options.illumination_balancing:
@@ -909,83 +1061,19 @@ def colorize_las(
                 chunks = prefetch(_xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache), 2)
                 color_started = time.perf_counter()
                 if options.multi_frame_fusion:
-                    if cuda_batch is not None:
-                        for offset, xyz in chunks:
-                            try:
-                                length = len(xyz)
-                                corrected_count, rejected_count = cuda_batch.assign_fusion(
-                                    xyz, colors[offset:offset + length], quality[offset:offset + length],
-                                    distances[offset:offset + length], sources[offset:offset + length],
-                                    fusion_colors[offset:offset + length],
-                                    fusion_weights[offset:offset + length],
-                                    fusion_distances[offset:offset + length],
-                                    fusion_sources[offset:offset + length])
-                                acceleration['color_chunks'] += 1
-                                acceleration['points_processed_for_color'] += length * len(batch)
-                            except CudaBackendError as exc:
-                                cuda_batch.close()
-                                cuda_batch = active_cuda_batch = None
-                                cuda_backend = None
-                                cuda_reason = str(exc)
-                                acceleration.update(processing_backend='cpu_reference',
-                                                    cuda_acceleration_active=False,
-                                                    fallback_reason=cuda_reason,
-                                                    summary=f'CPU fallback: {cuda_reason}')
-                                _emit(progress, "acceleration", **acceleration)
-                                _, length, corrected_count, rejected_count = _assign_chunk_fusion(
-                                    offset, xyz, batch, colors, quality, distances, sources,
-                                    fusion_colors, fusion_weights, fusion_distances, fusion_sources,
-                                    calibration, options)
-                            illumination['corrected_observations'] += corrected_count
-                            illumination['rejected_exposure_observations'] += rejected_count
-                            _check_cancel(cancelled)
-                            _emit(progress, "colorizing", batch=batch_index,
-                                  points_processed=offset + length, point_count=count,
-                                  frames_received=received, frames_used=used)
-                    else:
-                        assign = lambda item: _assign_chunk_fusion(
-                            item[0], item[1], batch, colors, quality, distances, sources,
-                            fusion_colors, fusion_weights, fusion_distances, fusion_sources,
-                            calibration, options)
-                        completed_chunks = (map(assign, chunks) if executor is None else
-                                            _bounded_parallel_map(executor, assign, chunks, options.worker_threads))
-                        for offset, length, corrected_count, rejected_count in completed_chunks:
-                            illumination['corrected_observations'] += corrected_count
-                            illumination['rejected_exposure_observations'] += rejected_count
-                            _check_cancel(cancelled)
-                            _emit(progress, "colorizing", batch=batch_index, points_processed=offset + length,
-                                  point_count=count, frames_received=received, frames_used=used)
-                elif cuda_batch is not None:
-                    for offset, xyz in chunks:
-                        if cuda_batch is not None:
-                            try:
-                                corrected_count, rejected_count = cuda_batch.assign(
-                                    xyz, colors[offset:offset + len(xyz)],
-                                    quality[offset:offset + len(xyz)],
-                                    distances[offset:offset + len(xyz)],
-                                    sources[offset:offset + len(xyz)])
-                                acceleration['color_chunks'] += 1
-                                acceleration['points_processed_for_color'] += len(xyz) * len(batch)
-                            except CudaBackendError as exc:
-                                cuda_batch.close()
-                                cuda_batch = active_cuda_batch = None
-                                cuda_backend = None
-                                cuda_reason = str(exc)
-                                acceleration.update(processing_backend='cpu_reference',
-                                                    cuda_acceleration_active=False,
-                                                    fallback_reason=cuda_reason,
-                                                    summary=f'CPU fallback: {cuda_reason}')
-                                _emit(progress, "acceleration", **acceleration)
-                        if cuda_batch is None:
-                            _, _, corrected_count, rejected_count = _assign_chunk_colors(
-                                offset, xyz, batch, colors, quality, distances,
-                                sources, calibration, options)
+                    assign = lambda item: _assign_chunk_fusion(
+                        item[0], item[1], batch, colors, quality, distances, sources,
+                        fusion_colors, fusion_weights, fusion_distances, fusion_sources,
+                        fusion_groups, calibration, options)
+                    completed_chunks = (map(assign, chunks) if executor is None else
+                                        _bounded_parallel_map(executor, assign, chunks, options.worker_threads))
+                    for offset, length, corrected_count, rejected_count in completed_chunks:
                         illumination['corrected_observations'] += corrected_count
                         illumination['rejected_exposure_observations'] += rejected_count
+                        illumination['excluded_from_correction_observations'] += rejected_count
                         _check_cancel(cancelled)
-                        _emit(progress, "colorizing", batch=batch_index,
-                              points_processed=offset + len(xyz), point_count=count,
-                              frames_received=received, frames_used=used)
+                        _emit(progress, "colorizing", batch=batch_index, points_processed=offset + length,
+                              point_count=count, frames_received=received, frames_used=used)
                 else:
                     if executor is None:
                         completed_chunks = (_assign_chunk_colors(offset, xyz, batch, colors, quality, distances,
@@ -999,11 +1087,12 @@ def colorize_las(
                     for offset, length, corrected_count, rejected_count in completed_chunks:
                         illumination['corrected_observations'] += corrected_count
                         illumination['rejected_exposure_observations'] += rejected_count
+                        illumination['excluded_from_correction_observations'] += rejected_count
                         _check_cancel(cancelled)
                         _emit(progress, "colorizing", batch=batch_index, points_processed=offset + length,
                               point_count=count, frames_received=received, frames_used=used)
-                timings.add('cpu_fusion_candidates' if options.multi_frame_fusion else
-                            ('cuda_color_assignment' if cuda_batch is not None else 'cpu_color_assignment'),
+                timings.add('cpu_fusion_candidates' if options.multi_frame_fusion
+                            else 'cpu_edge_aware_color_assignment',
                             time.perf_counter() - color_started)
                 if cuda_batch is not None:
                     cuda_batch.close()
@@ -1040,7 +1129,7 @@ def colorize_las(
                 _emit(progress, "fusion", points_processed=0, point_count=count)
                 fusion = _finalize_fusion(colors, quality, distances, sources,
                                           fusion_colors, fusion_weights, fusion_distances,
-                                          fusion_sources, options)
+                                          fusion_sources, fusion_groups, options)
                 _emit(progress, "fusion", points_processed=count, point_count=count, **fusion)
                 timings.add('final_fusion', time.perf_counter() - fusion_started)
                 _check_cancel(cancelled)
@@ -1102,7 +1191,7 @@ def colorize_las(
             quality._mmap.close()
             distances._mmap.close()
             sources._mmap.close()
-            for array in (fusion_colors, fusion_weights, fusion_distances, fusion_sources):
+            for array in (fusion_colors, fusion_weights, fusion_distances, fusion_sources, fusion_groups):
                 if array is not None:
                     array._mmap.close()
 

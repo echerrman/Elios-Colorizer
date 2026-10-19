@@ -10,6 +10,7 @@ from scipy.spatial.transform import Rotation
 
 from elios_colorizer.camera import Calibration, CalibrationError
 from elios_colorizer.colorize import (
+    _edge_confidence, _finalize_visibility, _prepare, _update_visibility,
     adaptively_select_observations,
     ColorizationCancelled, ColorizationError, ColorizationOptions,
     FrameObservation, colorize_las, group_nearby_observations, reduce_candidate_shards,
@@ -185,6 +186,86 @@ def test_multi_frame_fusion_rejects_bright_glare_outlier(tmp_path, camera, optio
     assert fused.multi_frame_fusion['rejected_outlier_observations'] == 1
 
 
+def test_repeatable_neutral_white_survives_fusion_and_isolated_glare_does_not(
+        tmp_path, camera, options):
+    make_las(tmp_path / "source.las", [(0, 0, 3)])
+    wall = [replace(solid_frame((105, 95, 85)), position_world_m=(position, 0, 0),
+                    timestamp_s=float(index))
+            for index, position in enumerate((-.4, -.2))]
+    paint = [replace(solid_frame(color), position_world_m=(position, 0, 0),
+                     timestamp_s=float(index + 2))
+             for index, (position, color) in enumerate(((0, (255, 254, 253)),
+                                                        (.2, (252, 253, 255)),
+                                                        (.4, (250, 252, 251))))]
+    fused = colorize_las(
+        tmp_path / "source.las", tmp_path / "paint.las", [*wall, *paint], camera,
+        options=replace(options, reject_exposure_extremes=True, multi_frame_fusion=True))
+    cloud = laspy.read(fused.output_path)
+    assert min(cloud.red[0], cloud.green[0], cloud.blue[0]) // 257 >= 252
+    assert fused.multi_frame_fusion['bright_consensus_points'] == 1
+
+    glare = replace(solid_frame((255, 255, 255)), position_world_m=(.6, 0, 0),
+                    timestamp_s=6.0)
+    isolated = colorize_las(
+        tmp_path / "source.las", tmp_path / "glare.las", [*wall, glare], camera,
+        options=replace(options, reject_exposure_extremes=True, multi_frame_fusion=True))
+    isolated_cloud = laspy.read(isolated.output_path)
+    assert isolated_cloud.red[0] // 257 == 105
+    assert isolated.multi_frame_fusion['bright_consensus_points'] == 0
+
+
+def test_near_duplicate_glare_frames_do_not_create_white_consensus(tmp_path, camera, options):
+    make_las(tmp_path / "source.las", [(0, 0, 3)])
+    wall = [replace(solid_frame((110, 95, 80)), position_world_m=(position, 0, 0),
+                    timestamp_s=float(index))
+            for index, position in enumerate((-.4, -.2, 0))]
+    glare = [replace(solid_frame((255, 255, 255)), position_world_m=(.40 + index * .01, 0, 0),
+                     timestamp_s=4 + index / 30)
+             for index in range(4)]
+    result = colorize_las(
+        tmp_path / "source.las", tmp_path / "correlated-glare.las", [*wall, *glare], camera,
+        options=replace(options, multi_frame_fusion=True, cuda_enabled=False))
+    cloud = laspy.read(result.output_path)
+    assert cloud.red[0] // 257 == 110
+    assert result.multi_frame_fusion['bright_consensus_points'] == 0
+    assert result.multi_frame_fusion['points_fused'] == 1
+
+
+def test_white_requires_a_majority_of_diverse_views(tmp_path, camera, options):
+    make_las(tmp_path / "source.las", [(0, 0, 3)])
+    colors = [(255, 254, 253), (252, 253, 255), (110, 95, 80), (108, 94, 82), (112, 96, 81)]
+    frames = [replace(solid_frame(color), position_world_m=(index * .2, 0, 0),
+                      timestamp_s=float(index)) for index, color in enumerate(colors)]
+    result = colorize_las(
+        tmp_path / "source.las", tmp_path / "minority-white.las", frames, camera,
+        options=replace(options, multi_frame_fusion=True, cuda_enabled=False))
+    cloud = laspy.read(result.output_path)
+    assert cloud.red[0] // 257 in (108, 110, 112)
+    assert result.multi_frame_fusion['bright_consensus_points'] == 0
+
+
+def test_image_and_depth_boundaries_reduce_projection_confidence(camera, options):
+    image = np.full((100, 100, 3), 40, dtype=np.uint8)
+    image[:, 51:] = 230
+    prepared = _prepare(FrameObservation(image, (0, 0, 0), (0, 0, 0, 1), 0, 0),
+                        camera, options)
+    assert prepared is not None
+    _update_visibility(np.array([[0, 0, 2], [.08, 0, 4]], dtype=np.float64),
+                       prepared, camera, options)
+    _finalize_visibility(prepared, options)
+    risky = _edge_confidence(prepared, np.array([[50., 50.]]),
+                             np.array([50]), np.array([50]))[0]
+
+    smooth = _prepare(solid_frame((100, 100, 100)), camera, options)
+    assert smooth is not None
+    _update_visibility(np.array([[0, 0, 2]], dtype=np.float64), smooth, camera, options)
+    _finalize_visibility(smooth, options)
+    safe = _edge_confidence(smooth, np.array([[50., 50.]]),
+                            np.array([50]), np.array([50]))[0]
+    assert safe == pytest.approx(1)
+    assert risky < .5
+
+
 def test_multi_frame_fusion_falls_back_and_off_is_identical(tmp_path, camera, options):
     make_las(tmp_path / "source.las", [(0, 0, 3), (.5, 0, 3)])
     frames = [solid_frame((80, 120, 200), source_flight=1),
@@ -260,6 +341,19 @@ def test_calibration_validation_and_round_trip(camera, tmp_path):
         Calibration.from_dict(invalid)
     with pytest.raises(CalibrationError, match="unit xyzw"):
         replace(camera, rotation_xyzw=(0, 0, 0, 10))
+
+
+def test_schema_two_calibration_preserves_schema_one_fallback(camera):
+    from elios_colorizer.calibration_workbench import CalibrationAdjustments
+
+    refined = CalibrationAdjustments(principal_y_px=-12, mount_pitch_degrees=.35,
+                                     timing_offset_s=.04).apply(camera, reviewed_frames=3)
+    loaded = Calibration.from_dict(refined.to_dict())
+    assert loaded.schema_version == 2
+    assert loaded.video_to_telemetry_offset_s == pytest.approx(.04)
+    assert loaded.cy == pytest.approx(38)
+    assert loaded.fallback() == camera
+    assert loaded.refinement['reviewed_reference_frames'] == 3
 
 
 def test_distributed_default_and_template_camera_profiles():

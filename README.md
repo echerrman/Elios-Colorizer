@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml?query=branch%3Amain"><img alt="Tests" src="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v1.5.1"><img alt="Release v1.5.1" src="https://img.shields.io/badge/release-v1.5.1-2f6f89"></a>
+  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v2.0.0"><img alt="Release v2.0.0" src="https://img.shields.io/badge/release-v2.0.0-2f6f89"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2f6f89"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2f6f89">
   <img alt="Local processing" src="https://img.shields.io/badge/processing-local-187548">
@@ -34,8 +34,8 @@ native flight telemetry, and recorded 4K video. It preserves unobserved geometry
 marks every point with an explicit colorization status, and performs all work on
 the local computer. Flight data is not uploaded to a cloud service.
 
-> **Version 1.5:** browse Inspector 5 Assets by their named inspections and
-> flights, while retaining manual flight-folder import and the same processing pipeline.
+> **Version 2.0:** refine RGB-to-LAS alignment in a synchronized workbench
+> workbench and preserve real white surfaces without accepting isolated glare.
 
 ## Install
 
@@ -60,6 +60,14 @@ bundled `_internal` directory beside the executable. See the
 Navigation-camera calibration files do not describe the 4K recording camera. A
 profile marked as validated must be backed by measured calibration and independent
 reprojection checks. Read the [camera calibration guide](docs/CALIBRATION.md).
+
+The desktop calibration workbench starts from that selected profile and uses
+either automatic reference views or user-selected flight timestamps. Its
+interactive EDL-shaded point-cloud viewport provides video opacity, adjustable
+point size and temporary density, synchronized zoom and pan, and a resettable
+3D Inspector view. It saves corrections as a separate schema-v2 file, never
+overwrites the starting profile, and embeds that complete schema-v1 profile as
+its fallback.
 
 ## Workflows
 
@@ -99,8 +107,13 @@ correction, and observation scoring in bounded batches. The application falls
 back automatically to the CPU implementation and independently chooses between
 an in-memory coordinate cache and a bounded-memory streaming path.
 
-Optional [multi-frame fusion](docs/MULTI_FRAME_FUSION.md) keeps CUDA-accelerated
+Default [multi-frame fusion](docs/MULTI_FRAME_FUSION.md) keeps CUDA-accelerated
 visibility when available, then performs deterministic robust fusion on the CPU.
+Only a majority of pose-diverse neutral-white observations is treated as
+persistent surface color; correlated adjacent frames share one vote and a
+bright minority remains a glare candidate. Image/depth-edge confidence reduces
+bleeding near thin geometry. Saturated samples are not used to fit illumination
+gains, but their original RGB remains eligible for colorization.
 Ordinary multi-flight merged processing can colorize flights concurrently against
 the same immutable merged point indices, then deterministically reduce their
 candidates into one final LAS. CPU-only, single-GPU, and multi-GPU machines use
@@ -186,6 +199,21 @@ Elios Colorizer is available under the [MIT License](LICENSE).
 Elios, Elios 3, Inspector, and Flyability are trademarks of their respective
 owners. This independent open-source project is not affiliated with, sponsored
 by, or endorsed by Flyability.
+
+### v2.0.0
+
+Version 2.0.0 adds a non-destructive synchronized video/LAS calibration
+workbench and schema-v2 derived profiles with embedded schema-v1 fallbacks. It
+also replaces the saturated-white cutoff with multi-view true-white
+preservation: a majority of pose-diverse neutral-white evidence is kept,
+correlated glare is rejected, image/depth-edge confidence protects thin
+geometry, and illumination balancing no longer removes genuine saturated RGB.
+
+### v1.6.0
+
+Version 1.6.0 compacts flight and readiness sections, defaults multi-flight
+setup to a supplied merged cloud, removes automatic CloudCompare alignment,
+and restores detailed per-flight RGB-assignment progress.
 
 ### v1.5.1
 

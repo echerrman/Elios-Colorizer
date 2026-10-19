@@ -124,7 +124,7 @@ def test_fallback_unchanged_and_disabled_does_not_fit(tmp_path, monkeypatch):
     colorize_las(source, tmp_path / 'disabled.las', frames, camera, options=opts)
 
 
-def test_engine_rejects_unusable_raw_pixels_even_without_fit(tmp_path):
+def test_engine_preserves_bright_surface_colors_but_rejects_crushed_black(tmp_path):
     source = tmp_path / 'source.las'
     camera, frames = scene(source, 25)
     frame = frames[0]
@@ -135,7 +135,10 @@ def test_engine_rejects_unusable_raw_pixels_even_without_fit(tmp_path):
         options=ColorizationOptions(minimum_sharpness=0, illumination_balancing=True))
     report = result.illumination_balancing
     assert report['rejected_exposure_observations'] > 0
+    assert report['excluded_from_correction_observations'] == report['rejected_exposure_observations']
     assert result.colored_point_count < result.point_count
+    cloud = laspy.read(result.output_path)
+    assert cloud.red.max() == 65535
 
 def test_equation_budget_and_point_disjoint_validation():
     radii, light = evidence(points=20000, exposures=(0, .02, -.02, 0))

@@ -28,9 +28,11 @@ approximately ±10%, and total scalar gain to 0.75–1.35. Beyond the observed 9
 percentile radius, the gain stops increasing. The sRGB transfer function is an
 assumption for decoded RGB; this is not a calibrated radiometric recovery.
 
-Raw nearly-black pixels and pixels with a saturated channel are rejected before
-correction. Gains operate on linear RGB and are reduced uniformly to avoid
-channel clipping. Gain strength and model uncertainty reduce the existing
+Raw nearly-black pixels and pixels with a saturated channel are excluded from
+illumination-model fitting and gain correction. Saturated pixels retain their
+original RGB and remain eligible for color selection so real white paint and
+objects are not erased. Gains operate on linear RGB and are reduced uniformly to
+avoid channel clipping. Gain strength and model uncertainty reduce the existing
 geometric observation score. Only potential winners need gain evaluation;
 only winners need corrected RGB. A 64 KiB encoding table avoids per-channel
 power evaluation and differs from direct conversion by at most one 8-bit code.
@@ -40,12 +42,14 @@ power evaluation and differs from direct conversion by at most one 8-bit code.
 The result.illumination_balancing report records requested/applied flags,
 accepted/skipped batch counts, matched equation count, accepted radial and
 exposure gain ranges, minimum accepted confidence, fallback reason counts,
-corrected observations, and raw exposure rejections. Corrected observations count
-winning updates whose encoded RGB changed, not distinct final points. Rejections
-count visible sampled observations; whole-frame rejections remain in the
-existing frame counters. Statistics are aggregated, so report storage does not
-grow with frame count. Processing details report acceptance or why a batch
-was skipped.
+corrected observations, and observations excluded from correction. Corrected
+observations count winning updates whose encoded RGB changed, not distinct
+final points. Exclusions count visible samples that retained raw RGB instead of
+receiving a gain. The legacy `rejected_exposure_observations` key remains as an
+alias for report compatibility; it no longer means those colors were removed.
+Whole-frame rejections remain in the existing frame counters. Statistics are
+aggregated, so report storage does not grow with frame count. Processing details
+report acceptance or why a batch was skipped.
 
 ## Local verification and performance
 

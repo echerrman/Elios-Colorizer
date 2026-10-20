@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml?query=branch%3Amain"><img alt="Tests" src="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v2.0.0"><img alt="Release v2.0.0" src="https://img.shields.io/badge/release-v2.0.0-2f6f89"></a>
+  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v2.1.0"><img alt="Release v2.1.0" src="https://img.shields.io/badge/release-v2.1.0-2f6f89"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2f6f89"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2f6f89">
   <img alt="Local processing" src="https://img.shields.io/badge/processing-local-187548">
@@ -27,8 +27,8 @@ native flight telemetry, and recorded 4K video. It preserves unobserved geometry
 marks every point with an explicit colorization status, and performs all work on
 the local computer. Flight data is not uploaded to a cloud service.
 
-> **Version 2.0:** refine RGB-to-LAS alignment in a synchronized workbench
-> workbench and preserve real white surfaces without accepting isolated glare.
+> **Version 2.1:** align video and cloud geometry manually or fit a bounded
+> camera projection from matched 2D video pixels and 3D cloud points.
 
 ## Install
 
@@ -195,6 +195,14 @@ Elios Colorizer is available under the [MIT License](LICENSE).
 Elios, Elios 3, Inspector, and Flyability are trademarks of their respective
 owners. This independent open-source project is not affiliated with, sponsored
 by, or endorsed by Flyability.
+
+### v2.1.0
+
+Version 2.1.0 adds guided 2D-video-to-3D-cloud point matching and robust,
+bounded fitting for pinhole, radial/tangential, and fisheye camera models. The
+calibration viewport now retains full detail inside each buffered reference
+view, uses GPU rendering with screen-space EDL, and provides clearer manual
+projection controls, comparison tools, and fit diagnostics.
 
 ### v2.0.0
 

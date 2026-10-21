@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import copy
+import json
 import math
 import os
 from pathlib import Path
@@ -254,10 +255,16 @@ def spatially_index_geometry(source_path: str | Path, destination: str | Path, *
             if header.evlrs:writer.write_evlrs(header.evlrs)
         os.replace(temporary, output)
         occupied = int(np.count_nonzero(counts))
-        return output, dict(method='lossless uniform-grid spatial ordering', point_count=count,
+        tile_ranges = [[int(starts[index]), int(value)] for index, value in enumerate(counts) if value]
+        index_report = dict(method='lossless uniform-grid spatial ordering', point_count=count,
                             cell_size_m=cell_size, grid_dimensions=dimensions.tolist(),
                             occupied_cells=occupied, total_cells=cell_count,
-                            attributes_preserved=True)
+                            tile_ranges=tile_ranges, attributes_preserved=True)
+        sidecar = output.with_suffix(output.suffix + '.tiles.json')
+        sidecar_temp = sidecar.with_suffix(sidecar.suffix + '.tmp')
+        sidecar_temp.write_text(json.dumps(index_report, indent=2), encoding='utf-8')
+        os.replace(sidecar_temp, sidecar)
+        return output, index_report
     finally:
         del ordered
         raw_path.unlink(missing_ok=True)

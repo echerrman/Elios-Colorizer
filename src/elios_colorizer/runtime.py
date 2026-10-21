@@ -5,12 +5,15 @@ from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 import os
 import platform
 import threading
 import time
 import queue
 from typing import Callable, Iterable, Iterator, TypeVar
+
+import numpy as np
 
 
 T = TypeVar("T")
@@ -101,9 +104,67 @@ class ResourcePlan:
     concurrent_flights: int
     workers_per_flight: int
     cuda_streams: int
+    worker_tuning: str = 'hardware_heuristic'
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@lru_cache(maxsize=8)
+def autotune_worker_threads(logical_cpus: int | None = None) -> tuple[int, dict]:
+    """Measure the local memory-bound array throughput and choose its knee."""
+    logical = max(1, logical_cpus or (os.cpu_count() or 1))
+    import cv2
+    maximum = max(1, logical - (2 if logical >= 6 else 1))
+    candidates = sorted({min(maximum, value) for value in (1, 2, 4, 6, 8, 12, 16, 24, 32)})
+    # Fixed total work makes scores comparable and prevents higher worker counts
+    # from appearing faster merely because they performed less work.
+    points = 3_000_000
+    xyz = np.linspace(-1., 1., points * 3, dtype=np.float64).reshape(points, 3)
+    rotation = np.array(((.999, -.02, .03), (.021, .999, -.01),
+                         (-.03, .011, .999)), dtype=np.float64)
+
+    def run(workers: int) -> float:
+        # Keep task granularity fixed like LAS chunks; changing only concurrency
+        # exposes the point where extra workers begin contending for bandwidth.
+        slices = [part for part in np.array_split(xyz, 32) if len(part)]
+        started = time.perf_counter()
+        def project(part):
+            # Mirror the engine's bandwidth-heavy transform/projection/score
+            # operations without calling a possibly internally threaded BLAS.
+            camera_x = part[:, 0] * rotation[0, 0] + part[:, 1] * rotation[1, 0] + part[:, 2] * rotation[2, 0]
+            camera_y = part[:, 0] * rotation[0, 1] + part[:, 1] * rotation[1, 1] + part[:, 2] * rotation[2, 1]
+            camera_z = part[:, 0] * rotation[0, 2] + part[:, 1] * rotation[1, 2] + part[:, 2] * rotation[2, 2]
+            camera = np.column_stack((camera_x, camera_y, np.abs(camera_z) + 1.01))
+            uv, _ = cv2.projectPoints(camera, np.zeros(3), np.zeros(3),
+                                      np.array(((1900., 0., 1920.), (0., 1900., 1080.), (0., 0., 1.))),
+                                      np.array((-.08, .015, .0005, -.0003, 0.)))
+            u, v = uv.reshape(-1, 2).T
+            distance = np.sqrt(camera_x * camera_x + camera_y * camera_y + camera_z * camera_z)
+            score = ((u / 3840.) ** 2 + (v / 2160.) ** 2) / (1. + distance * distance)
+            return float(np.sum(score))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(project, slices))
+        return time.perf_counter() - started
+
+    # Warm native kernels and thread creation paths before scoring.
+    run(min(2, maximum))
+    timings = {}
+    for workers in candidates:
+        timings[workers] = min(run(workers), run(workers))
+    fastest = min(timings, key=timings.get)
+    best_time = timings[fastest]
+    # Prefer the smallest count within 3% of peak; it leaves capacity for video
+    # decode, UI, storage, and CUDA submission without sacrificing throughput.
+    selected = min(workers for workers, seconds in timings.items()
+                   if seconds <= best_time * 1.03)
+    report = {
+        'method': 'local memory-bound projection microbenchmark',
+        'selected_workers': selected,
+        'fastest_workers': fastest,
+        'seconds_by_workers': {str(key): round(value, 6) for key, value in timings.items()},
+    }
+    return selected, report
 
 
 def plan_resources(point_count: int, *, available_memory_bytes: int | None = None,
@@ -111,8 +172,9 @@ def plan_resources(point_count: int, *, available_memory_bytes: int | None = Non
                    cuda_devices: int = 0, flight_count: int = 1,
                    fusion: bool = False,
                    available_vram_bytes: int | None = None,
+                   autotuned_worker_threads: int | None = None,
                    preferences: ResourcePreferences | dict | None = None) -> ResourcePlan:
-    """Choose a bounded plan that scales beyond the old fixed 8/12 worker cap."""
+    """Choose a bounded plan tuned for the memory-bound projection workload."""
     logical = max(1, logical_cpus if logical_cpus is not None else (os.cpu_count() or 1))
     prefs=(preferences if isinstance(preferences,ResourcePreferences) else ResourcePreferences.from_dict(preferences)) if preferences is not None else ResourcePreferences()
     custom=not prefs.use_recommended
@@ -121,10 +183,12 @@ def plan_resources(point_count: int, *, available_memory_bytes: int | None = Non
     if custom:
         cuda_available=bool(cuda_available and prefs.cuda_enabled)
         cuda_devices=min(cuda_devices,max(1,prefs.max_gpus)) if cuda_available else 0
-    # NumPy/OpenCV release the GIL in the expensive projection operations. Leave
-    # two logical CPUs for decoding, I/O, the UI, and the CUDA submission thread.
+    # The projection workers are memory-bandwidth bound. Recommended mode uses
+    # the local calibration result when supplied; 12 is only the conservative
+    # pre-calibration heuristic. Custom mode remains an unrestricted override.
     worker_threads = (max(1,min(logical,round(logical*prefs.cpu_percent/100))) if custom else
-                      max(1, min(32, logical - (2 if logical >= 6 else 1))))
+                      max(1, min(autotuned_worker_threads or 12,
+                                 logical - (2 if logical >= 6 else 1))))
     memory_cap = (32 if memory_gib >= 32 else 24 if memory_gib >= 20 else
                   16 if memory_gib >= 12 else 12 if memory_gib >= 8 else
                   8 if memory_gib >= 5 else 4)
@@ -149,7 +213,9 @@ def plan_resources(point_count: int, *, available_memory_bytes: int | None = Non
     workers_per_flight = max(1, worker_threads // concurrent)
     return ResourcePlan(logical, planned_memory, cuda_available, cuda_devices,
                         worker_threads, frame_batch_size, 2, concurrent,
-                        workers_per_flight, 1 if cuda_available else 0)
+                        workers_per_flight, 1 if cuda_available else 0,
+                        ('measured_local_throughput' if autotuned_worker_threads is not None and not custom
+                         else 'manual_override' if custom else 'hardware_heuristic'))
 
 
 @contextmanager

@@ -5,6 +5,8 @@ Set-Location -LiteralPath $projectRoot
 if ($LASTEXITCODE -ne 0) { throw 'Application icon generation failed.' }
 & (Join-Path $PSScriptRoot 'build_cuda_probe.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'CUDA checkpoint build failed.' }
+& (Join-Path $PSScriptRoot 'build_cpu_backend.ps1')
+if ($LASTEXITCODE -ne 0) { throw 'Native CPU backend build failed.' }
 & '.\.venv\Scripts\python.exe' -m PyInstaller --noconfirm EliosColorizer.spec
 if ($LASTEXITCODE -ne 0) { throw 'Application build failed.' }
 & '.\.venv\Scripts\python.exe' scripts/package_metadata.py

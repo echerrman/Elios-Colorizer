@@ -10,7 +10,7 @@
 #include <vector>
 
 namespace {
-constexpr std::uint32_t kAbiVersion = 4;
+constexpr std::uint32_t kAbiVersion = 5;
 constexpr int kProbeElementCount = 4096;
 
 #pragma pack(push, 1)
@@ -62,6 +62,7 @@ struct ProjectionFrameInput {
     double rotation[9];
     double sharpness_weight;
     std::uint16_t source_flight;
+    std::uint32_t diversity_group;
 };
 
 struct IlluminationInput {
@@ -102,6 +103,7 @@ struct DeviceFrame {
     double rotation[9];
     double sharpness_weight;
     std::uint16_t source_flight;
+    std::uint32_t diversity_group;
     std::uint64_t image_offset;
     int illumination_enabled;
     double radial;
@@ -117,6 +119,7 @@ struct BatchContext {
     std::vector<DeviceFrame> host_frames;
     DeviceConfig* device_config = nullptr;
     DeviceFrame* device_frames = nullptr;
+    std::uint8_t* device_frame_mask = nullptr;
     std::uint8_t* device_images = nullptr;
     float* device_depth = nullptr;
     float* device_depth_temp = nullptr;
@@ -130,11 +133,14 @@ struct BatchContext {
     float* device_fusion_weights = nullptr;
     float* device_fusion_distances = nullptr;
     std::uint16_t* device_fusion_sources = nullptr;
+    std::uint32_t* device_fusion_groups = nullptr;
+    int occlusion_radius = 0;
     std::size_t capacity = 0;
     int frame_count = 0;
 
     ~BatchContext() {
         cudaSetDevice(selected_device);
+        cudaFree(device_fusion_groups);
         cudaFree(device_fusion_sources);
         cudaFree(device_fusion_distances);
         cudaFree(device_fusion_weights);
@@ -148,6 +154,7 @@ struct BatchContext {
         cudaFree(device_depth_temp);
         cudaFree(device_depth);
         cudaFree(device_images);
+        cudaFree(device_frame_mask);
         cudaFree(device_frames);
         cudaFree(device_config);
         if (stream != nullptr) cudaStreamDestroy(stream);
@@ -263,10 +270,11 @@ __global__ void initialize_depth(float* depth, std::size_t count) {
 
 __global__ void visibility_kernel(const double* xyz, std::size_t point_count,
                                   const DeviceFrame* frames, int frame_count,
+                                  const std::uint8_t* frame_mask,
                                   const DeviceConfig* config, float* depth) {
     const std::size_t point = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int frame_index = blockIdx.y;
-    if (point >= point_count || frame_index >= frame_count) {
+    if (point >= point_count || frame_index >= frame_count || !frame_mask[frame_index]) {
         return;
     }
     double x, y, z, u, v;
@@ -394,11 +402,14 @@ __device__ float boundary_confidence(
 
 __global__ void assignment_kernel(
         const double* xyz, std::size_t point_count, const DeviceFrame* frames,
-        int frame_count, const DeviceConfig* config, const std::uint8_t* images,
-        const float* depth, std::uint16_t* colors, float* quality,
+        int frame_count, const std::uint8_t* frame_mask,
+        const DeviceConfig* config, const std::uint8_t* images,
+        const float* raw_depth, const float* occlusion_depth,
+        std::uint16_t* colors, float* quality,
         float* distances, std::uint16_t* sources, unsigned long long* counters,
         std::uint8_t* fusion_colors, float* fusion_weights,
-        float* fusion_distances, std::uint16_t* fusion_sources, int fusion_slots) {
+        float* fusion_distances, std::uint16_t* fusion_sources,
+        std::uint32_t* fusion_groups, int fusion_slots) {
     const std::size_t point = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (point >= point_count) {
         return;
@@ -410,6 +421,7 @@ __global__ void assignment_kernel(
     const std::size_t depth_pixels = static_cast<std::size_t>(config->depth_width) * config->depth_height;
 
     for (int frame_index = 0; frame_index < frame_count; ++frame_index) {
+        if (!frame_mask[frame_index]) continue;
         const DeviceFrame& frame = frames[frame_index];
         double camera_x, camera_y, camera_z, u, v;
         if (!project_point(xyz + point * 3, frame, *config, true,
@@ -418,7 +430,7 @@ __global__ void assignment_kernel(
         }
         const int depth_x = static_cast<int>(u * config->depth_width / config->image_width);
         const int depth_y = static_cast<int>(v * config->depth_height / config->image_height);
-        const float near_depth = depth[static_cast<std::size_t>(frame_index) * depth_pixels
+        const float near_depth = occlusion_depth[static_cast<std::size_t>(frame_index) * depth_pixels
             + static_cast<std::size_t>(depth_y) * config->depth_width + depth_x];
         if (camera_z > near_depth + config->occlusion_absolute
                 + near_depth * config->occlusion_relative) {
@@ -456,7 +468,7 @@ __global__ void assignment_kernel(
         const double exposure_weight = 0.5 + 0.5 *
             (1.0 - fabs(luminance - 127.5) / 127.5);
         const float boundary_weight = boundary_confidence(
-            depth, images, frame, *config, frame_index, depth_x, depth_y, u, v);
+            raw_depth, images, frame, *config, frame_index, depth_x, depth_y, u, v);
         float score = static_cast<float>(frame.sharpness_weight * cosine * cosine
                     * edge_weight * boundary_weight * exposure_weight
                     / (1.0 + (camera_z / 5.0) * (camera_z / 5.0)));
@@ -491,19 +503,32 @@ __global__ void assignment_kernel(
         }
         if (fusion_slots > 0 && score > 0.0f) {
             const std::size_t base = point * static_cast<std::size_t>(fusion_slots);
+            int selected_slot = -1;
             int weakest_slot = 0;
-            float weakest = fusion_weights[base];
-            for (int slot = 1; slot < fusion_slots; ++slot) {
-                if (fusion_weights[base + slot] < weakest) {
-                    weakest = fusion_weights[base + slot];
-                    weakest_slot = slot;
+            float retained = fusion_weights[base];
+            for (int slot = 0; slot < fusion_slots; ++slot) {
+                const float weight = fusion_weights[base + slot];
+                if (weight > 0.0f && fusion_groups[base + slot] == frame.diversity_group) {
+                    selected_slot = slot;
+                    retained = weight;
+                    break;
                 }
+                if (selected_slot < 0 && weight <= 0.0f) {
+                    selected_slot = slot;
+                    retained = weight;
+                }
+                if (weight < fusion_weights[base + weakest_slot]) weakest_slot = slot;
             }
-            if (score > weakest) {
-                const std::size_t candidate = base + weakest_slot;
+            if (selected_slot < 0) {
+                selected_slot = weakest_slot;
+                retained = fusion_weights[base + weakest_slot];
+            }
+            if (score > retained) {
+                const std::size_t candidate = base + selected_slot;
                 fusion_weights[candidate] = score;
                 fusion_distances[candidate] = static_cast<float>(distance);
                 fusion_sources[candidate] = frame.source_flight;
+                fusion_groups[candidate] = frame.diversity_group;
                 for (int channel = 0; channel < 3; ++channel) {
                     fusion_colors[candidate * 3 + channel] = corrected[channel];
                 }
@@ -538,6 +563,7 @@ int ensure_capacity(BatchContext* context, std::size_t count, char* error,
     cudaFree(context->device_colors); context->device_colors = nullptr;
     cudaFree(context->device_xyz); context->device_xyz = nullptr;
     cudaFree(context->device_fusion_sources); context->device_fusion_sources = nullptr;
+    cudaFree(context->device_fusion_groups); context->device_fusion_groups = nullptr;
     cudaFree(context->device_fusion_distances); context->device_fusion_distances = nullptr;
     cudaFree(context->device_fusion_weights); context->device_fusion_weights = nullptr;
     cudaFree(context->device_fusion_colors); context->device_fusion_colors = nullptr;
@@ -550,6 +576,7 @@ int ensure_capacity(BatchContext* context, std::size_t count, char* error,
     if (status == cudaSuccess) status = cudaMalloc(reinterpret_cast<void**>(&context->device_fusion_weights), count * 8 * sizeof(float));
     if (status == cudaSuccess) status = cudaMalloc(reinterpret_cast<void**>(&context->device_fusion_distances), count * 8 * sizeof(float));
     if (status == cudaSuccess) status = cudaMalloc(reinterpret_cast<void**>(&context->device_fusion_sources), count * 8 * sizeof(std::uint16_t));
+    if (status == cudaSuccess) status = cudaMalloc(reinterpret_cast<void**>(&context->device_fusion_groups), count * 8 * sizeof(std::uint32_t));
     if (status != cudaSuccess) {
         write_error(error, error_length, "CUDA chunk buffer allocation failed", status);
         context->capacity = 0;
@@ -684,6 +711,7 @@ extern "C" __declspec(dllexport) int elios_cuda_batch_create(
         std::memcpy(frame.rotation, input_frames[index].rotation, sizeof(frame.rotation));
         frame.sharpness_weight = input_frames[index].sharpness_weight;
         frame.source_flight = input_frames[index].source_flight;
+        frame.diversity_group = input_frames[index].diversity_group;
         frame.image_offset = static_cast<std::uint64_t>(index) * image_stride;
         frame.illumination_enabled = 0;
     }
@@ -698,6 +726,7 @@ extern "C" __declspec(dllexport) int elios_cuda_batch_create(
     if (status == cudaSuccess) status = cudaStreamCreateWithFlags(&context->stream, cudaStreamNonBlocking);
     if (status == cudaSuccess) status = cudaMalloc(reinterpret_cast<void**>(&context->device_config), sizeof(DeviceConfig));
     if (status == cudaSuccess) status = cudaMalloc(reinterpret_cast<void**>(&context->device_frames), frame_count * sizeof(DeviceFrame));
+    if (status == cudaSuccess) status = cudaMalloc(reinterpret_cast<void**>(&context->device_frame_mask), frame_count);
     if (status == cudaSuccess) status = cudaMalloc(reinterpret_cast<void**>(&context->device_images), image_stride * frame_count);
     const std::size_t depth_count = static_cast<std::size_t>(config.depth_width) * config.depth_height * frame_count;
     if (status == cudaSuccess) status = cudaMalloc(reinterpret_cast<void**>(&context->device_depth), depth_count * sizeof(float));
@@ -726,16 +755,20 @@ extern "C" __declspec(dllexport) int elios_cuda_batch_create(
 
 extern "C" __declspec(dllexport) int elios_cuda_visibility(
         void* opaque, const double* xyz, std::uint64_t count,
+        const std::uint8_t* frame_mask,
         char* error, std::uint32_t error_length) {
     BatchContext* context = static_cast<BatchContext*>(opaque);
-    if (context == nullptr || xyz == nullptr || count == 0) return 13;
+    if (context == nullptr || xyz == nullptr || frame_mask == nullptr || count == 0) return 13;
     int result = ensure_capacity(context, static_cast<std::size_t>(count), error, error_length);
     if (result != 0) return result;
     cudaError_t status = cudaMemcpy(context->device_xyz, xyz, count * 3 * sizeof(double), cudaMemcpyHostToDevice);
+    if (status == cudaSuccess) status = cudaMemcpyAsync(context->device_frame_mask, frame_mask,
+        context->frame_count, cudaMemcpyHostToDevice, context->stream);
     if (status == cudaSuccess) {
         const dim3 grid(static_cast<unsigned int>((count + 255) / 256), context->frame_count);
         visibility_kernel<<<grid, 256, 0, context->stream>>>(context->device_xyz, static_cast<std::size_t>(count),
-            context->device_frames, context->frame_count, context->device_config, context->device_depth);
+            context->device_frames, context->frame_count, context->device_frame_mask,
+            context->device_config, context->device_depth);
         status = cudaGetLastError();
     }
     if (status == cudaSuccess) status = cudaStreamSynchronize(context->stream);
@@ -750,6 +783,7 @@ extern "C" __declspec(dllexport) int elios_cuda_finish_visibility(
         void* opaque, int radius, char* error, std::uint32_t error_length) {
     BatchContext* context = static_cast<BatchContext*>(opaque);
     if (context == nullptr || radius < 0 || radius > 4) return 15;
+    context->occlusion_radius = radius;
     if (radius == 0) return 0;
     const std::size_t total = static_cast<std::size_t>(context->host_config.depth_width)
         * context->host_config.depth_height * context->frame_count;
@@ -762,7 +796,6 @@ extern "C" __declspec(dllexport) int elios_cuda_finish_visibility(
         write_error(error, error_length, "CUDA depth-buffer expansion failed", status);
         return 16;
     }
-    std::swap(context->device_depth, context->device_depth_temp);
     return 0;
 }
 
@@ -809,15 +842,19 @@ extern "C" __declspec(dllexport) int elios_cuda_set_illumination(
 
 extern "C" __declspec(dllexport) int elios_cuda_assign(
         void* opaque, const double* xyz, std::uint64_t count,
+        const std::uint8_t* frame_mask,
         std::uint16_t* colors, float* quality, float* distances,
         std::uint16_t* sources, std::uint64_t* corrected_count,
         std::uint64_t* rejected_count, char* error, std::uint32_t error_length) {
     BatchContext* context = static_cast<BatchContext*>(opaque);
-    if (context == nullptr || xyz == nullptr || colors == nullptr || quality == nullptr
+    if (context == nullptr || xyz == nullptr || frame_mask == nullptr
+            || colors == nullptr || quality == nullptr
             || distances == nullptr || sources == nullptr || count == 0) return 22;
     int result = ensure_capacity(context, static_cast<std::size_t>(count), error, error_length);
     if (result != 0) return result;
     cudaError_t status = cudaMemcpy(context->device_xyz, xyz, count * 3 * sizeof(double), cudaMemcpyHostToDevice);
+    if (status == cudaSuccess) status = cudaMemcpyAsync(context->device_frame_mask, frame_mask,
+        context->frame_count, cudaMemcpyHostToDevice, context->stream);
     if (status == cudaSuccess) status = cudaMemcpy(context->device_colors, colors, count * 3 * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
     if (status == cudaSuccess) status = cudaMemcpy(context->device_quality, quality, count * sizeof(float), cudaMemcpyHostToDevice);
     if (status == cudaSuccess) status = cudaMemcpy(context->device_distances, distances, count * sizeof(float), cudaMemcpyHostToDevice);
@@ -826,10 +863,13 @@ extern "C" __declspec(dllexport) int elios_cuda_assign(
     if (status == cudaSuccess) {
         assignment_kernel<<<static_cast<unsigned int>((count + 255) / 256), 256, 0, context->stream>>>(
             context->device_xyz, static_cast<std::size_t>(count), context->device_frames,
-            context->frame_count, context->device_config, context->device_images,
-            context->device_depth, context->device_colors, context->device_quality,
+            context->frame_count, context->device_frame_mask,
+            context->device_config, context->device_images,
+            context->device_depth,
+            context->occlusion_radius ? context->device_depth_temp : context->device_depth,
+            context->device_colors, context->device_quality,
             context->device_distances, context->device_sources, context->device_counters,
-            nullptr, nullptr, nullptr, nullptr, 0);
+            nullptr, nullptr, nullptr, nullptr, nullptr, 0);
         status = cudaGetLastError();
     }
     if (status == cudaSuccess) status = cudaStreamSynchronize(context->stream);
@@ -851,22 +891,26 @@ extern "C" __declspec(dllexport) int elios_cuda_assign(
 
 extern "C" __declspec(dllexport) int elios_cuda_fusion_assign(
         void* opaque, const double* xyz, std::uint64_t count,
+        const std::uint8_t* frame_mask,
         std::uint16_t* colors, float* quality, float* distances,
         std::uint16_t* sources, std::uint8_t* fusion_colors,
         float* fusion_weights, float* fusion_distances,
-        std::uint16_t* fusion_sources, int fusion_slots,
+        std::uint16_t* fusion_sources, std::uint32_t* fusion_groups, int fusion_slots,
         std::uint64_t* corrected_count, std::uint64_t* rejected_count,
         char* error, std::uint32_t error_length) {
     BatchContext* context = static_cast<BatchContext*>(opaque);
-    if (context == nullptr || xyz == nullptr || colors == nullptr || quality == nullptr
+    if (context == nullptr || xyz == nullptr || frame_mask == nullptr
+            || colors == nullptr || quality == nullptr
             || distances == nullptr || sources == nullptr || fusion_colors == nullptr
             || fusion_weights == nullptr || fusion_distances == nullptr
-            || fusion_sources == nullptr || count == 0
+            || fusion_sources == nullptr || fusion_groups == nullptr || count == 0
             || fusion_slots < 3 || fusion_slots > 8) return 24;
     int result = ensure_capacity(context, static_cast<std::size_t>(count), error, error_length);
     if (result != 0) return result;
     const std::size_t candidates = static_cast<std::size_t>(count) * fusion_slots;
     cudaError_t status = cudaMemcpyAsync(context->device_xyz, xyz, count * 3 * sizeof(double), cudaMemcpyHostToDevice, context->stream);
+    if (status == cudaSuccess) status = cudaMemcpyAsync(context->device_frame_mask, frame_mask,
+        context->frame_count, cudaMemcpyHostToDevice, context->stream);
     if (status == cudaSuccess) status = cudaMemcpy(context->device_colors, colors, count * 3 * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
     if (status == cudaSuccess) status = cudaMemcpy(context->device_quality, quality, count * sizeof(float), cudaMemcpyHostToDevice);
     if (status == cudaSuccess) status = cudaMemcpy(context->device_distances, distances, count * sizeof(float), cudaMemcpyHostToDevice);
@@ -875,15 +919,20 @@ extern "C" __declspec(dllexport) int elios_cuda_fusion_assign(
     if (status == cudaSuccess) status = cudaMemcpy(context->device_fusion_weights, fusion_weights, candidates * sizeof(float), cudaMemcpyHostToDevice);
     if (status == cudaSuccess) status = cudaMemcpy(context->device_fusion_distances, fusion_distances, candidates * sizeof(float), cudaMemcpyHostToDevice);
     if (status == cudaSuccess) status = cudaMemcpy(context->device_fusion_sources, fusion_sources, candidates * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
+    if (status == cudaSuccess) status = cudaMemcpy(context->device_fusion_groups, fusion_groups, candidates * sizeof(std::uint32_t), cudaMemcpyHostToDevice);
     if (status == cudaSuccess) status = cudaMemset(context->device_counters, 0, 2 * sizeof(unsigned long long));
     if (status == cudaSuccess) {
         assignment_kernel<<<static_cast<unsigned int>((count + 255) / 256), 256, 0, context->stream>>>(
             context->device_xyz, static_cast<std::size_t>(count), context->device_frames,
-            context->frame_count, context->device_config, context->device_images,
-            context->device_depth, context->device_colors, context->device_quality,
+            context->frame_count, context->device_frame_mask,
+            context->device_config, context->device_images,
+            context->device_depth,
+            context->occlusion_radius ? context->device_depth_temp : context->device_depth,
+            context->device_colors, context->device_quality,
             context->device_distances, context->device_sources, context->device_counters,
             context->device_fusion_colors, context->device_fusion_weights,
-            context->device_fusion_distances, context->device_fusion_sources, fusion_slots);
+            context->device_fusion_distances, context->device_fusion_sources,
+            context->device_fusion_groups, fusion_slots);
         status = cudaGetLastError();
     }
     if (status == cudaSuccess) status = cudaStreamSynchronize(context->stream);
@@ -895,6 +944,7 @@ extern "C" __declspec(dllexport) int elios_cuda_fusion_assign(
     if (status == cudaSuccess) status = cudaMemcpy(fusion_weights, context->device_fusion_weights, candidates * sizeof(float), cudaMemcpyDeviceToHost);
     if (status == cudaSuccess) status = cudaMemcpy(fusion_distances, context->device_fusion_distances, candidates * sizeof(float), cudaMemcpyDeviceToHost);
     if (status == cudaSuccess) status = cudaMemcpy(fusion_sources, context->device_fusion_sources, candidates * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
+    if (status == cudaSuccess) status = cudaMemcpy(fusion_groups, context->device_fusion_groups, candidates * sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
     unsigned long long counters[2] = {0, 0};
     if (status == cudaSuccess) status = cudaMemcpy(counters, context->device_counters, sizeof(counters), cudaMemcpyDeviceToHost);
     if (status != cudaSuccess) {

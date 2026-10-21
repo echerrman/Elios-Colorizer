@@ -44,6 +44,35 @@ def test_parallel_candidate_reduction_matches_global_best_view(tmp_path):
         np.testing.assert_array_equal(expected_las[name], reduced_las[name])
 
 
+def test_parallel_candidate_reduction_matches_global_fusion(tmp_path):
+    camera = Calibration(100, 100, 50, 50, 50, 50, (0, 0, 0, 1), (0, 0, 0),
+                         (0, 1, 0), (0, 0, 0), 1, 0, validated=True)
+    make_las(tmp_path / 'source.las', [(0, 0, 2)])
+    frames = [replace(solid_frame((90 + index * 5, 120, 150)),
+                      position_world_m=(index * .2, 0, 0),
+                      timestamp_s=float(index), source_flight=1 if index < 2 else 2)
+              for index in range(4)]
+    options = ColorizationOptions(
+        chunk_size=1, frame_batch_size=4, depth_buffer_width=100,
+        minimum_sharpness=0, reject_exposure_extremes=False,
+        multi_frame_fusion=True, merged_output=True, cuda_enabled=False)
+    expected = colorize_las(tmp_path / 'source.las', tmp_path / 'expected-fused.las',
+                            frames, camera, options=options)
+    shards = []
+    for index, subset in enumerate((frames[:2], frames[2:]), 1):
+        result = colorize_las(
+            tmp_path / 'source.las', tmp_path / f'unused-fused-{index}.las',
+            subset, camera, options=options,
+            candidate_directory=tmp_path / f'fused-candidate-{index}')
+        shards.append(result.output_path)
+    reduced = reduce_candidate_shards(
+        tmp_path / 'source.las', tmp_path / 'reduced-fused.las', shards, chunk_size=1)
+    expected_las, reduced_las = laspy.read(expected.output_path), laspy.read(reduced.output_path)
+    for name in expected_las.point_format.dimension_names:
+        np.testing.assert_array_equal(expected_las[name], reduced_las[name])
+    assert reduced.multi_frame_fusion['points_fused'] == 1
+
+
 @pytest.fixture
 def camera():
     return Calibration(100, 100, 50, 50, 50, 50, (0, 0, 0, 1), (0, 0, 0),
@@ -356,12 +385,18 @@ def test_schema_two_calibration_preserves_schema_one_fallback(camera):
     assert loaded.refinement['reviewed_reference_frames'] == 3
 
 
-def test_distributed_default_and_template_camera_profiles():
+def test_distributed_camera_profiles():
     profiles = Path(__file__).resolve().parents[1] / "camera_profiles"
-    default = Calibration.load(profiles / "elios_3_builtin_rgb_default_profile.json")
+    default = Calibration.load(profiles / "elios_3_builtin_rgb_default_starting_profile.json")
     assert default.validated
-    assert default.profile_name == "Elios 3 Built-in RGB Camera - Tested Default Baseline"
+    assert default.profile_name == "Elios 3 Built-in RGB Camera - General Default Starting Profile"
     assert (default.image_width, default.image_height) == (3840, 2160)
+    refined = Calibration.load(
+        profiles / "elios_3_builtin_rgb_developer_tested_refined_profile.json"
+    )
+    assert refined.validated
+    assert refined.profile_name == "Elios 3 Built-in RGB Camera - Developer-Tested Refined Profile"
+    assert refined.fallback() == default
     with pytest.raises(CalibrationError, match="validated"):
         Calibration.load(profiles / "camera_profile_template.json")
     template = Calibration.load(profiles / "camera_profile_template.json",

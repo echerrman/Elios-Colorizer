@@ -57,6 +57,8 @@ def test_spatial_index_preserves_records_and_orders_geometry(tmp_path):
     assert original_rows == ordered_rows
     assert np.count_nonzero(np.diff(np.asarray(ordered.x)) != 0) == 1
     assert report['attributes_preserved'] and report['point_count'] == 20
+    assert indexed.with_suffix('.las.tiles.json').is_file()
+    assert sum(length for _start, length in report['tile_ranges']) == 20
 
 
 def test_matrix_rejects_scale(tmp_path):

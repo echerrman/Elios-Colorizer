@@ -399,12 +399,17 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
     checkpoint = cuda_checkpoint()
     cuda_ready = checkpoint.available
     from .colorize import _available_memory_bytes
-    from .runtime import plan_resources
+    from .runtime import autotune_worker_threads, plan_resources
+    if resource_settings and not resource_settings.get('use_recommended', True):
+        measured_workers, worker_benchmark = None, {'method': 'manual override'}
+    else:
+        measured_workers, worker_benchmark = autotune_worker_threads(logical_cpus)
     resource_plan = plan_resources(
         source_point_count, available_memory_bytes=_available_memory_bytes(),
         logical_cpus=logical_cpus, cuda_available=cuda_ready,
         cuda_devices=checkpoint.device_count if cuda_ready else 0,
-        fusion=multi_frame_fusion,available_vram_bytes=getattr(checkpoint,'free_memory_bytes',None),preferences=resource_settings)
+        fusion=multi_frame_fusion, available_vram_bytes=getattr(checkpoint,'free_memory_bytes',None),
+        autotuned_worker_threads=measured_workers, preferences=resource_settings)
     cuda_ready=resource_plan.cuda_available
     tuning = {'worker_threads': resource_plan.worker_threads,
               'frame_batch_size': resource_plan.frame_batch_size}
@@ -446,7 +451,7 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
             emit('Illumination Balancing', high_water, info['reason'], force=True)
         elif stage == 'indexing':
             fraction = info['points_processed'] / max(info['point_count'], 1)
-            method = (('staging bounded chunks for CUDA visibility and CPU fusion'
+            method = (('staging bounded tile tasks for CUDA fusion'
                        if multi_frame_fusion else 'staging bounded chunks for CUDA projection') if cuda_active else
                       (f"caching coordinates in memory for {info['worker_threads']} CPU workers"
                        if info['xyz_cache_used'] else 'using the bounded-memory CPU streaming path'))
@@ -461,7 +466,8 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
             emit('Saving LAS', .95 + .049 * fraction,
                  f"Writing {info['points_processed']:,} of {info['point_count']:,} points")
         elif stage in ('visibility', 'colorizing'):
-            local = info['points_processed'] / max(info['point_count'], 1)
+            local = (info.get('work_completed', info['points_processed'])
+                     / max(info.get('work_total', info['point_count']), 1))
             within_batch = (.5 if stage == 'colorizing' else 0) + .5 * local
             completed = max(0, info['frames_received'] - options.frame_batch_size)
             candidates = adaptive_stats.get('candidates', 0)
@@ -538,11 +544,12 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
             'acceleration': result.acceleration,
             'resource_plan': {**resource_plan.to_dict(),
                               'workers_for_this_job': options.worker_threads},
+            'worker_autotune': worker_benchmark,
             'resource_settings': resource_settings or {'use_recommended': True},
             'performance': result.performance,
-            'optimization': ('Adaptive view selection and grouping, resource-aware frame batches, bounded CUDA '
-                             'projection with automatic CPU fallback, source-order chunk/frustum indexing, and an '
-                             'automatic in-memory XYZ cache when memory permits'),
+            'optimization': ('Pose-aware view selection, measured worker tuning, distortion-aware tile tasks, '
+                             'bounded CUDA fusion with native CPU fallback, resumable state, and automatic '
+                             'RAM/scratch placement'),
             'adaptive_view_selection': {
                 'candidate_views': adaptive_stats.get('candidates', 0),
                 'retained_views': adaptive_stats.get('retained', 0),
@@ -722,13 +729,18 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
         from .cuda_backend import cuda_checkpoint
         checkpoint = cuda_checkpoint()
         from .colorize import _available_memory_bytes
-        from .runtime import plan_resources
+        from .runtime import autotune_worker_threads, plan_resources
+        if resource_settings and not resource_settings.get('use_recommended', True):
+            measured_workers, worker_benchmark = None, {'method': 'manual override'}
+        else:
+            measured_workers, worker_benchmark = autotune_worker_threads()
         resource_plan = plan_resources(
             merged_point_count, available_memory_bytes=_available_memory_bytes(),
             cuda_available=checkpoint.available,
             cuda_devices=checkpoint.device_count if checkpoint.available else 0,
             flight_count=len(selections), fusion=multi_frame_fusion,
-            available_vram_bytes=getattr(checkpoint,'free_memory_bytes',None),preferences=resource_settings)
+            available_vram_bytes=getattr(checkpoint,'free_memory_bytes',None),
+            autotuned_worker_threads=measured_workers, preferences=resource_settings)
         tuning = {'worker_threads': resource_plan.worker_threads,
                   'frame_batch_size': resource_plan.frame_batch_size}
         options = ColorizationOptions(worker_threads=tuning['worker_threads'],
@@ -772,13 +784,14 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                 engine_emit('Preparing final geometry', preparation_share + color_share * .02 * local,
                          f"Reading {info['points_processed']:,} / {info['point_count']:,} merged points · "
                          f"{options.frame_batch_size}-view batches · "
-                         f"{('CUDA visibility + CPU fusion' if multi_frame_fusion else 'CUDA projection') if cuda_active else f'{options.worker_threads} CPU workers'}")
+                         f"{('CUDA fusion' if multi_frame_fusion else 'CUDA projection') if cuda_active else f'{options.worker_threads} CPU workers'}")
             elif stage == 'fusion':
                 local = info['points_processed'] / max(info['point_count'], 1)
                 engine_emit('Fusing RGB observations', .945 + .005 * local,
                             'Rejecting color outliers and selecting robust multi-frame colors')
             elif stage in ('visibility', 'colorizing'):
-                local = info['points_processed'] / max(info['point_count'], 1)
+                local = (info.get('work_completed', info['points_processed'])
+                         / max(info.get('work_total', info['point_count']), 1))
                 within = (.5 if stage == 'colorizing' else 0) + .5 * local
                 completed = max(0, info['frames_received'] - options.frame_batch_size)
                 candidates = sum(row.get('candidates', 0) for row in adaptive_rows)
@@ -801,16 +814,14 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
         parallel_reason = None
         map_results = []
         map_grouping_rows: list[dict[str, int]] = [{} for _ in streams]
-        candidate_bytes = merged_point_count * 16 * len(streams)
-        can_map_reduce = (not multi_frame_fusion and not illumination_balancing
+        bytes_per_point = 16 + (17 * options.fusion_max_observations if multi_frame_fusion else 0)
+        candidate_bytes = merged_point_count * bytes_per_point * len(streams)
+        can_map_reduce = (not illumination_balancing
                           and shutil.disk_usage(scratch).free >= candidate_bytes + 512 * 1024**2)
-        if multi_frame_fusion:
-            parallel_reason = ('Multi-frame fusion requires shared cross-flight observations; used the global '
-                               'observation stream to preserve identical fusion quality.')
-        elif illumination_balancing:
+        if illumination_balancing:
             parallel_reason = ('Illumination Balancing requires cross-flight overlap evidence; used the global '
                                'observation stream to preserve identical correction quality.')
-        elif not multi_frame_fusion and not can_map_reduce:
+        elif not can_map_reduce:
             parallel_reason = (f'Insufficient temporary disk space for {candidate_bytes / 1024**3:.1f} GiB '
                                'of deterministic flight candidates; used the global streaming path.')
 
@@ -839,7 +850,8 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                     if stage == 'indexing':
                         local = .02 * info['points_processed'] / max(info['point_count'], 1)
                     elif stage in ('visibility', 'colorizing'):
-                        point_fraction = info['points_processed'] / max(info['point_count'], 1)
+                        point_fraction = (info.get('work_completed', info['points_processed'])
+                                          / max(info.get('work_total', info['point_count']), 1))
                         within = (.5 if stage == 'colorizing' else 0.) + .5 * point_fraction
                         completed_views = max(0, info['frames_received'] - options.frame_batch_size)
                         local = .02 + .97 * min(1., (completed_views + options.frame_batch_size * within)
@@ -915,8 +927,7 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                 'skipped_batches': sum(int((item.illumination_balancing or {}).get('skipped_batches', 0))
                                        for item in map_results),
             }
-            result = replace(result, illumination_balancing=illumination,
-                             multi_frame_fusion={'requested': False, 'applied': False})
+            result = replace(result, illumination_balancing=illumination)
         else:
             result = colorize_las(geometry, destination, grouped_stream, calibration,
                                   options=options, progress=engine_progress, cancelled=cancelled)
@@ -980,11 +991,12 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
             'worker_threads': options.worker_threads,
             'acceleration': result.acceleration,
             'resource_plan': resource_plan.to_dict(),
+            'worker_autotune': worker_benchmark,
             'resource_settings': resource_settings or {'use_recommended': True},
             'performance': result.performance,
             'parallel_execution': parallel_details,
-            'optimization': (('Flights independently map their best observations to the same immutable merged '
-                              'point indices; a deterministic reducer selects the global winner.')
+            'optimization': (('Flights independently map pose-diverse observation reservoirs to the same immutable '
+                              'merged point indices; a deterministic reducer performs final global fusion.')
                              if parallel_strategy == 'parallel_flight_map_reduce' else
                              ('Merged-cloud batches reuse each XYZ pass across more views; projection, occlusion, '
                               'RGB sampling, and observation scoring run in bounded CUDA batches with automatic '
@@ -1109,15 +1121,20 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
             raise ValueError(f'Output already exists: {conflicts[0].name}. Choose another output folder.')
         from .colorize import _available_memory_bytes
         from .cuda_backend import cuda_checkpoint
-        from .runtime import plan_resources
+        from .runtime import autotune_worker_threads, plan_resources
         checkpoint = cuda_checkpoint()
+        if resource_settings and not resource_settings.get('use_recommended', True):
+            measured_workers, worker_benchmark = None, {'method': 'manual override'}
+        else:
+            measured_workers, worker_benchmark = autotune_worker_threads()
         scheduler = plan_resources(
             max((int(item.get('point_count') or 0) for item in flight_checks), default=0),
             available_memory_bytes=_available_memory_bytes(),
             cuda_available=checkpoint.available,
             cuda_devices=checkpoint.device_count if checkpoint.available else 0,
             flight_count=len(selections), fusion=multi_frame_fusion,
-            available_vram_bytes=getattr(checkpoint,'free_memory_bytes',None),preferences=resource_settings)
+            available_vram_bytes=getattr(checkpoint,'free_memory_bytes',None),
+            autotuned_worker_threads=measured_workers, preferences=resource_settings)
         cuda_device_count = scheduler.cuda_devices if scheduler.cuda_available else 0
         cuda_gates = [threading.Lock() for _ in range(max(1, cuda_device_count))]
         job_progress = [0.] * len(selections)
@@ -1187,11 +1204,13 @@ def run_workflow(flights: Iterable[dict[str, str | None]], output: str,
                                                                   'start': start_s or 0., 'end': end_s}},
                 'outputs': [item['output'] for item in reports],
                 'parallel_processing': scheduler.to_dict(),
+                'worker_autotune': worker_benchmark,
             },
             'application_version': __version__, 'created_utc': datetime.now(timezone.utc).isoformat(),
             'mode': mode, 'maximum_color_distance_m': maximum_color_distance_m,
             'elapsed_seconds': elapsed_seconds, 'results': reports,
             'parallel_processing': scheduler.to_dict(),
+            'worker_autotune': worker_benchmark,
             'resource_settings': resource_settings or {'use_recommended': True},
         }
         with workflow_report.open('x', encoding='utf-8') as handle:

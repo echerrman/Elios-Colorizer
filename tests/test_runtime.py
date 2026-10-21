@@ -9,9 +9,9 @@ def test_high_core_resource_plan_scales_and_bounds_concurrency():
     gib = 1024**3
     plan = plan_resources(100_000_000, available_memory_bytes=64 * gib,
                           logical_cpus=64, flight_count=8)
-    assert plan.worker_threads == 32
+    assert plan.worker_threads == 12
     assert plan.concurrent_flights == 8
-    assert plan.workers_per_flight == 4
+    assert plan.workers_per_flight == 1
     cuda = plan_resources(100_000_000, available_memory_bytes=64 * gib,
                           logical_cpus=64, cuda_available=True, cuda_devices=1,
                           flight_count=8, fusion=True)
@@ -21,14 +21,14 @@ def test_high_core_resource_plan_scales_and_bounds_concurrency():
                                 logical_cpus=64, cuda_available=True, cuda_devices=4,
                                 flight_count=12)
     assert multi_cuda.concurrent_flights == 4
-    assert multi_cuda.workers_per_flight == 8
+    assert multi_cuda.workers_per_flight == 3
 
 
 def test_custom_resource_plan_enforces_user_budgets_without_changing_default():
     gib=1024**3
     default=plan_resources(100_000_000,available_memory_bytes=64*gib,logical_cpus=64,
                            cuda_available=True,cuda_devices=4,flight_count=8)
-    assert default.worker_threads==32 and default.concurrent_flights==4
+    assert default.worker_threads==12 and default.concurrent_flights==4
     custom=ResourcePreferences(False,50,40,False,1,60,3,'low')
     limited=plan_resources(100_000_000,available_memory_bytes=64*gib,logical_cpus=64,
                            cuda_available=True,cuda_devices=4,flight_count=8,preferences=custom)
@@ -37,6 +37,12 @@ def test_custom_resource_plan_enforces_user_budgets_without_changing_default():
     assert not limited.cuda_available and limited.cuda_devices==0
     assert limited.concurrent_flights==3
     assert limited.workers_per_flight==10
+    full=plan_resources(100_000_000,available_memory_bytes=64*gib,logical_cpus=64,
+                        preferences=ResourcePreferences(False,100,60,True,1,75,1,'normal'))
+    assert full.worker_threads==64
+    measured=plan_resources(100_000_000,available_memory_bytes=64*gib,logical_cpus=64,
+                            autotuned_worker_threads=9)
+    assert measured.worker_threads==9 and measured.worker_tuning=='measured_local_throughput'
 
 
 def test_prefetch_is_ordered_and_uses_background_thread():

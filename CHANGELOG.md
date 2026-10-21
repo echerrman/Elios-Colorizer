@@ -5,6 +5,32 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-20
+
+### Performance
+
+- Moved edge-aware color selection and pose-diverse fusion candidate retention
+  onto CUDA, with CPU/GPU parity coverage for pinhole, OpenCV, and fisheye
+  calibrations. Raw boundary depth remains separate from the expanded
+  occlusion buffer so the accuracy policy is unchanged.
+- Added distortion-aware conservative frustum rejection, per-tile frame masks,
+  persisted spatial-tile boundaries, and a deterministic tile/frame task graph.
+- Replaced repeated short video seeks with verified sequential decode/grab and
+  retained keyframe seeking for long gaps.
+- Precomputed frame gradient maps once, instead of recalculating image-edge
+  confidence for every projected point.
+- Restored exact per-flight map/reduce for multi-frame fusion by reducing
+  pose-diverse top-K reservoirs before the final robust fusion pass.
+- Added resumable per-flight checkpoints, selectable scratch storage, safe RAM
+  state placement, work-unit instrumentation, and work-based progress estimates.
+- Tuned the recommended CPU worker count for the measured memory-bandwidth
+  optimum on the target workstation while retaining explicit custom overrides.
+- Added a packaged native C++ CPU projection kernel for CUDA-unavailable runs,
+  with the existing NumPy/OpenCV implementation retained as a safe fallback.
+- Renamed and documented the bundled Elios 3 profiles as a general default
+  starting profile and an optional developer-tested refined profile, with clear
+  guidance that users must verify calibration accuracy on their own hardware.
+
 ## [2.1.0] - 2026-10-20
 
 ### Changed

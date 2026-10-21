@@ -9,6 +9,9 @@ for package in ('numpy', 'scipy', 'opencv-python-headless', 'laspy', 'PySide6-Es
 cuda_probe = Path('build/cuda/elios_cuda_probe.dll')
 if cuda_probe.is_file():
     data.append((str(cuda_probe), 'elios_colorizer/native'))
+cpu_backend = Path('build/cpu/elios_cpu_projection.dll')
+if cpu_backend.is_file():
+    data.append((str(cpu_backend), 'elios_colorizer/native'))
 a = Analysis(['scripts/desktop_entry.py'], pathex=['src'], binaries=[], datas=data,
              hiddenimports=hidden, hookspath=[], hooksconfig={}, runtime_hooks=[],
              excludes=['PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'tkinter'], noarchive=False)

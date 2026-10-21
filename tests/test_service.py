@@ -13,14 +13,14 @@ from pathlib import Path
 def test_merged_processing_tuning_uses_safe_larger_batches():
     gib = 1024**3
     large = merged_processing_tuning(145_000_000, 20 * gib, 32)
-    assert large == {'worker_threads': 30, 'frame_batch_size': 24}
+    assert large == {'worker_threads': 12, 'frame_batch_size': 24}
     constrained = merged_processing_tuning(145_000_000, 4 * gib, 8)
     assert constrained == {'worker_threads': 6, 'frame_batch_size': 4}
     modest = merged_processing_tuning(20_000_000, 10 * gib, 12)
     assert modest == {'worker_threads': 10, 'frame_batch_size': 12}
     assert processing_tuning(20_000_000, 10 * gib, 12) == modest
     cuda = processing_tuning(47_330_435, 24 * gib, 32, cuda_acceleration=True)
-    assert cuda == {'worker_threads': 30, 'frame_batch_size': 24}
+    assert cuda == {'worker_threads': 12, 'frame_batch_size': 24}
 
 
 def test_projection_progress_detail_is_compact():

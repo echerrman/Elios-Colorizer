@@ -850,6 +850,7 @@ def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interva
                 # a timestamp at the following frame boundary when FrameSync is absent.
                 candidates = ((index, origin + fallback_segment_offset + index / fps)
                               for index in range(0, count, max(1, int(round(fps * sample_interval_s)))))
+            next_decoder_index = 0
             for frame_index, timestamp in candidates:
                 _check_cancel(cancelled)
                 if timestamp < lower or timestamp > upper or timestamp - last_sample < sample_interval_s - 1e-6:
@@ -857,13 +858,25 @@ def iter_observations(source: FlightSource, telemetry: Telemetry, sample_interva
                 pose = telemetry.interpolate(float(timestamp) + video_to_telemetry_offset_s)
                 if pose is None:
                     continue
-                capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+                target_index = int(frame_index)
+                # Short forward gaps are dramatically faster when decoded in
+                # order. Long gaps still seek to the nearest keyframe. Both
+                # paths verify the exact decoded index below.
+                forward_gap = target_index - next_decoder_index
+                if 0 <= forward_gap <= max(1, int(round(fps * 2))):
+                    for skipped in range(forward_gap):
+                        if not capture.grab():
+                            raise FlightError(
+                                f"Cannot advance over frame {next_decoder_index + skipped} in {video.name}.")
+                else:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, target_index)
                 ok, bgr = capture.read()
                 if not ok:
                     raise FlightError(f"Cannot decode frame {frame_index} from {video.name}.")
                 actual_index = int(round(capture.get(cv2.CAP_PROP_POS_FRAMES))) - 1
                 if actual_index != int(frame_index):
                     raise FlightError(f"Decoder returned frame {actual_index}, requested {frame_index}; accurate frame synchronization is unavailable.")
+                next_decoder_index = actual_index + 1
                 if not has_sync:
                     pts = float(capture.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0
                     if not np.isfinite(pts) or (frame_index > 0 and pts <= 0):

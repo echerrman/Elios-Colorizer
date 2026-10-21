@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_name": "Elios 3 Built-in RGB Camera - Tested Default Baseline",
+  "profile_name": "Elios 3 Built-in RGB Camera - General Default Starting Profile",
   "validated": true,
   "image_width": 3840,
   "image_height": 2160,

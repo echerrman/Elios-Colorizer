@@ -1,11 +1,14 @@
 # RGB camera calibration
 
 For the standard Elios 3 built-in RGB camera payload in 3840 × 2160 recording
-mode, use `camera_profiles/elios_3_builtin_rgb_default_profile.json`. It is the
-tested default baseline and is recommended unless the camera payload, recording
-mode, mount geometry, or independently measured calibration differs from the
-standard setup. Navigation-camera YAML files do not describe the 4K recording
-camera and should not be scaled or substituted.
+mode, begin with
+`camera_profiles/elios_3_builtin_rgb_default_starting_profile.json`. The
+optional `elios_3_builtin_rgb_developer_tested_refined_profile.json` contains
+the refinement the developer found most accurate for the tested data and drone;
+it may work well on similar hardware, but is not guaranteed for another drone
+or dataset. Verify either profile against your own flights and use the
+calibration workbench when necessary. Navigation-camera YAML files do not
+describe the 4K recording camera and should not be scaled or substituted.
 
 The application requires a separate JSON profile and blocks normal processing
 when the selected profile is missing, incompatible with the video dimensions,

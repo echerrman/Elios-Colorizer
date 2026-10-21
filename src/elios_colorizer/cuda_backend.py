@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 
 
-ABI_VERSION = 4
+ABI_VERSION = 5
 
 
 class _NativeProbe(ctypes.Structure):
@@ -171,6 +171,7 @@ class _ProjectionFrame(ctypes.Structure):
         ('rotation', ctypes.c_double * 9),
         ('sharpness_weight', ctypes.c_double),
         ('source_flight', ctypes.c_uint16),
+        ('diversity_group', ctypes.c_uint32),
     ]
 
 
@@ -195,6 +196,7 @@ def _bind_projection_api(library: Any) -> None:
     library.elios_cuda_batch_create.restype = ctypes.c_int
     library.elios_cuda_visibility.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(ctypes.c_double), ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint8),
         _ERROR_POINTER, ctypes.c_uint32]
     library.elios_cuda_visibility.restype = ctypes.c_int
     library.elios_cuda_finish_visibility.argtypes = [
@@ -210,6 +212,7 @@ def _bind_projection_api(library: Any) -> None:
     library.elios_cuda_set_illumination.restype = ctypes.c_int
     library.elios_cuda_assign.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(ctypes.c_double), ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint8),
         ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint16),
         ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
@@ -217,10 +220,12 @@ def _bind_projection_api(library: Any) -> None:
     library.elios_cuda_assign.restype = ctypes.c_int
     library.elios_cuda_fusion_assign.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(ctypes.c_double), ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint8),
         ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint16),
         ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint16), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint16),
+        ctypes.POINTER(ctypes.c_uint32), ctypes.c_int,
         ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
         _ERROR_POINTER, ctypes.c_uint32]
     library.elios_cuda_fusion_assign.restype = ctypes.c_int
@@ -286,6 +291,7 @@ class CudaProjectionBatch:
                 *np.asarray(frame.camera_to_world, dtype=np.float64).ravel())
             native_frames[index].sharpness_weight = frame.sharpness_weight
             native_frames[index].source_flight = frame.observation.source_flight
+            native_frames[index].diversity_group = frame.diversity_group
         _native_call(self.library.elios_cuda_batch_create, ctypes.byref(config), native_frames,
                      image_pointers, len(frames), ctypes.byref(self.context))
 
@@ -293,10 +299,19 @@ class CudaProjectionBatch:
     def _xyz(xyz: np.ndarray) -> np.ndarray:
         return np.ascontiguousarray(xyz, dtype=np.float64)
 
-    def visibility(self, xyz: np.ndarray) -> None:
+    def _frame_mask(self, active_frames: tuple[int, ...] | None) -> np.ndarray:
+        mask = np.ones(len(self.frames), dtype=np.uint8)
+        if active_frames is not None:
+            mask.fill(0)
+            mask[list(active_frames)] = 1
+        return mask
+
+    def visibility(self, xyz: np.ndarray, active_frames: tuple[int, ...] | None = None) -> None:
         points = self._xyz(xyz)
+        mask = self._frame_mask(active_frames)
         _native_call(self.library.elios_cuda_visibility, self.context,
-                     points.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), len(points))
+                     points.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), len(points),
+                     mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)))
 
     def finish_visibility(self, radius: int) -> None:
         _native_call(self.library.elios_cuda_finish_visibility, self.context, radius)
@@ -318,8 +333,10 @@ class CudaProjectionBatch:
                      inputs, len(self.frames))
 
     def assign(self, xyz: np.ndarray, colors: np.ndarray, quality: np.ndarray,
-               distances: np.ndarray, sources: np.ndarray) -> tuple[int, int]:
+               distances: np.ndarray, sources: np.ndarray,
+               active_frames: tuple[int, ...] | None = None) -> tuple[int, int]:
         points = self._xyz(xyz)
+        mask = self._frame_mask(active_frames)
         arrays = (colors, quality, distances, sources)
         if not all(array.flags.c_contiguous for array in arrays):
             raise CudaBackendError('CUDA output slices must be contiguous')
@@ -328,6 +345,7 @@ class CudaProjectionBatch:
         _native_call(
             self.library.elios_cuda_assign, self.context,
             points.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), len(points),
+            mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             colors.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
             quality.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -339,10 +357,12 @@ class CudaProjectionBatch:
                       distances: np.ndarray, sources: np.ndarray,
                       fusion_colors: np.ndarray, fusion_weights: np.ndarray,
                       fusion_distances: np.ndarray,
-                      fusion_sources: np.ndarray) -> tuple[int, int]:
+                      fusion_sources: np.ndarray, fusion_groups: np.ndarray,
+                      active_frames: tuple[int, ...] | None = None) -> tuple[int, int]:
         points = self._xyz(xyz)
+        mask = self._frame_mask(active_frames)
         arrays = (colors, quality, distances, sources, fusion_colors,
-                  fusion_weights, fusion_distances, fusion_sources)
+                  fusion_weights, fusion_distances, fusion_sources, fusion_groups)
         if not all(array.flags.c_contiguous for array in arrays):
             raise CudaBackendError('CUDA fusion output slices must be contiguous')
         slots = fusion_weights.shape[1]
@@ -353,6 +373,7 @@ class CudaProjectionBatch:
         _native_call(
             self.library.elios_cuda_fusion_assign, self.context,
             points.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), len(points),
+            mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             colors.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
             quality.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -360,7 +381,8 @@ class CudaProjectionBatch:
             fusion_colors.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             fusion_weights.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             fusion_distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            fusion_sources.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)), slots,
+            fusion_sources.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            fusion_groups.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)), slots,
             ctypes.byref(corrected), ctypes.byref(rejected))
         return int(corrected.value), int(rejected.value)
 

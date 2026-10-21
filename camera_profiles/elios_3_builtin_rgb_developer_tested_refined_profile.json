@@ -1,0 +1,125 @@
+{
+  "schema_version": 2,
+  "profile_name": "Elios 3 Built-in RGB Camera - Developer-Tested Refined Profile",
+  "validated": true,
+  "image_width": 3840,
+  "image_height": 2160,
+  "intrinsics": {
+    "fx": 1719.74876204894,
+    "fy": 1727.5363212009324,
+    "cx": 1947.5490322732076,
+    "cy": 1008.1236846526983
+  },
+  "distortion": {
+    "model": "opencv",
+    "coefficients": [
+      -0.21097406865125043,
+      0.03315193393041179,
+      0.005448163437490608,
+      0.0014221438538960728
+    ]
+  },
+  "camera_to_body": {
+    "rotation_xyzw": [
+      0.5129143336193943,
+      -0.5261322417805004,
+      0.477953279294692,
+      -0.4813152951426414
+    ],
+    "translation_m": [
+      0.3261033243105258,
+      0.002341286177511296,
+      -0.014143289159899777
+    ],
+    "tilt_axis_body": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "tilt_pivot_body_m": [
+      0.27,
+      0.0,
+      0.0
+    ],
+    "tilt_sign": -1.0,
+    "tilt_zero_degrees": 1.6176747902961728
+  },
+  "timing": {
+    "video_to_telemetry_offset_s": 0.0
+  },
+  "fallback_calibration": {
+    "schema_version": 1,
+    "profile_name": "Elios 3 Built-in RGB Camera - General Default Starting Profile",
+    "validated": true,
+    "image_width": 3840,
+    "image_height": 2160,
+    "intrinsics": {
+      "fx": 1600.0,
+      "fy": 1600.0,
+      "cx": 1920.0,
+      "cy": 1080.0
+    },
+    "distortion": {
+      "model": "pinhole",
+      "coefficients": []
+    },
+    "camera_to_body": {
+      "rotation_xyzw": [
+        0.5,
+        -0.5,
+        0.5,
+        -0.5
+      ],
+      "translation_m": [
+        0.27,
+        0.0,
+        0.0
+      ],
+      "tilt_axis_body": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "tilt_pivot_body_m": [
+        0.27,
+        0.0,
+        0.0
+      ],
+      "tilt_sign": -1.0,
+      "tilt_zero_degrees": 0.0
+    }
+  },
+  "refinement": {
+    "method": "interactive_video_point_cloud_workbench",
+    "adjustments": {
+      "focal_scale_x": 1.0,
+      "focal_scale_y": 1.0,
+      "principal_x_px": 0.0,
+      "principal_y_px": 0.0,
+      "distortion_k1": 0.0,
+      "distortion_k2": 0.0,
+      "distortion_p1": 0.0,
+      "distortion_p2": 0.0,
+      "mount_roll_degrees": 0.0,
+      "mount_pitch_degrees": 0.0,
+      "mount_yaw_degrees": 0.0,
+      "translation_x_m": 0.0,
+      "translation_y_m": 0.0,
+      "translation_z_m": 0.0,
+      "tilt_zero_degrees": 0.0,
+      "timing_offset_s": 0.0
+    },
+    "reviewed_reference_frames": 3,
+    "starting_refinement": {
+      "method": "point_correspondence_fit",
+      "projection_model": "opencv",
+      "match_count": 26,
+      "rms_error_px": 41.93772131648096,
+      "median_error_px": 19.63258933086509,
+      "fit_translation": true,
+      "fit_tilt_zero": true
+    },
+    "alignment_score": 0.4666946232318878,
+    "point_match_count": 26
+  }
+}

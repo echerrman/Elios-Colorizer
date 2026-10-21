@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import copy
 import ctypes
+from functools import lru_cache
+import hashlib
 import json
 from itertools import islice
 import math
@@ -79,6 +81,8 @@ class ColorizationOptions:
     cuda_device_index: int = 0
     cuda_enabled: bool = True
     memory_budget_bytes: int | None = None
+    scratch_directory: str | None = None
+    state_storage: str = 'auto'
 
     def __post_init__(self) -> None:
         if self.chunk_size < 1 or self.frame_batch_size < 1 or self.depth_buffer_width < 8 or self.worker_threads < 1:
@@ -89,6 +93,8 @@ class ColorizationOptions:
             raise ValueError("Multi-frame fusion observation counts are invalid")
         if self.cuda_device_index < 0:
             raise ValueError("CUDA device index must be nonnegative")
+        if self.state_storage not in ('auto', 'ram', 'disk'):
+            raise ValueError("State storage must be auto, ram, or disk")
         if (not 0 <= self.occlusion_radius_pixels <= 4
                 or not 0 <= self.image_border_fraction < 0.25
                 or not 0 < self.minimum_depth_m < self.maximum_depth_m
@@ -142,6 +148,7 @@ class _PreparedFrame:
     illumination_frame: int = 0
     diversity_group: int = 0
     depth_edge_strength: np.ndarray | None = None
+    image_edge_strength: np.ndarray | None = None
 
 
 class _PoseDiversityGroups:
@@ -151,7 +158,7 @@ class _PoseDiversityGroups:
         self.translation_m = translation_m
         self.rotation_degrees = rotation_degrees
         self._bins: dict[tuple[int, int, int, int], list[tuple[np.ndarray, np.ndarray, int]]] = {}
-        self._next_group = 1
+        self._next_group_by_source: dict[int, int] = {}
 
     @staticmethod
     def _rotation_degrees(first: np.ndarray, second: np.ndarray) -> float:
@@ -171,8 +178,11 @@ class _PoseDiversityGroups:
                                 and self._rotation_degrees(frame.camera_to_world, anchor_rotation)
                                 < self.rotation_degrees):
                             return group
-        group = self._next_group
-        self._next_group += 1
+        local_group = self._next_group_by_source.get(source, 1)
+        if local_group >= (1 << 20) or source >= (1 << 12):
+            raise ColorizationError('Pose diversity group identifier capacity exceeded')
+        group = (source << 20) | local_group
+        self._next_group_by_source[source] = local_group + 1
         key = (source, int(cell[0]), int(cell[1]), int(cell[2]))
         self._bins.setdefault(key, []).append((center.copy(), frame.camera_to_world.copy(), group))
         return group
@@ -309,8 +319,28 @@ def _prepare(frame: FrameObservation, calibration: Calibration,
                           float(np.clip(math.sqrt(max(sharpness, 1) / 100), 0.1, 1.0)))
 
 
+def _prepare_image_edges(frame: _PreparedFrame) -> None:
+    """Compute the CPU fallback's exact edge expression once per frame, lazily."""
+    if frame.image_edge_strength is not None:
+        return
+    rgb32 = frame.observation.rgb.astype(np.float32)
+    luminance = rgb32 @ np.array([.2126, .7152, .0722], dtype=np.float32)
+    horizontal = np.abs(luminance[1:-1, 2:] - luminance[1:-1, :-2])
+    vertical = np.abs(luminance[2:, 1:-1] - luminance[:-2, 1:-1])
+    image_edges = np.zeros(luminance.shape, dtype=np.float32)
+    image_edges[1:-1, 1:-1] = np.clip((np.hypot(horizontal, vertical) - 12) / 96, 0, 1)
+    frame.image_edge_strength = image_edges
+
+
 def _project(xyz: np.ndarray, frame: _PreparedFrame, calibration: Calibration,
              options: ColorizationOptions, *, border: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    from .cpu_backend import project as native_cpu_project
+    native = native_cpu_project(
+        xyz, frame.center, frame.camera_to_world, calibration,
+        options.minimum_depth_m, options.maximum_depth_m,
+        options.image_border_fraction if border else 0.)
+    if native is not None:
+        return native
     # With row vectors, world-to-camera is multiplication by camera-to-world R.
     camera = (xyz - frame.center) @ frame.camera_to_world
     z = camera[:, 2]
@@ -359,27 +389,93 @@ def _use_xyz_cache(point_count: int, options: ColorizationOptions) -> bool:
     return available is not None and needed <= 4 * 1024**3 and needed <= max(0, available - 2 * 1024**3) * .35
 
 
+def _close_array(array: np.ndarray | None) -> None:
+    mapping = getattr(array, '_mmap', None)
+    if mapping is not None:
+        mapping.close()
+
+
 def _xyz_chunks(path: Path, chunk_size: int, active_offsets: set[int] | None = None,
-                xyz_cache: np.ndarray | None = None) -> Iterator[tuple[int, np.ndarray]]:
+                xyz_cache: np.ndarray | None = None,
+                chunk_ranges: list[tuple[int, int]] | None = None) -> Iterator[tuple[int, np.ndarray]]:
+    ranges = chunk_ranges
+    if ranges is None:
+        with laspy.open(path) as metadata_reader:
+            point_count = int(metadata_reader.header.point_count)
+        ranges = [(offset, min(chunk_size, point_count - offset))
+                  for offset in range(0, point_count, chunk_size)]
     if xyz_cache is not None:
-        for offset in range(0, len(xyz_cache), chunk_size):
+        for offset, length in ranges:
             if active_offsets is None or offset in active_offsets:
-                yield offset, xyz_cache[offset:offset + chunk_size]
+                yield offset, xyz_cache[offset:offset + length]
         return
     with laspy.open(path) as reader:
-        offset = 0
-        while offset < reader.header.point_count:
-            length = min(chunk_size, reader.header.point_count - offset)
+        for offset, length in ranges:
             if active_offsets is not None and offset not in active_offsets:
-                if offset + length < reader.header.point_count:
-                    reader.seek(offset + length)
-            else:
-                points = reader.read_points(length)
-                if len(points) != length:
-                    raise ColorizationError("Source LAS is truncated or changed while reading")
-                xyz = np.column_stack((points.x, points.y, points.z))
-                yield offset, xyz
-            offset += length
+                continue
+            reader.seek(offset)
+            points = reader.read_points(length)
+            if len(points) != length:
+                raise ColorizationError("Source LAS is truncated or changed while reading")
+            xyz = np.column_stack((points.x, points.y, points.z))
+            yield offset, xyz
+
+
+def _geometry_chunk_ranges(path: Path, point_count: int, chunk_size: int) -> tuple[list[tuple[int, int]], str]:
+    """Use persisted spatial-tile boundaries when present, splitting only oversized tiles."""
+    sidecar = path.with_suffix(path.suffix + '.tiles.json')
+    try:
+        data = json.loads(sidecar.read_text(encoding='utf-8'))
+        if data.get('point_count') != point_count:
+            raise ValueError('point count differs')
+        ranges = []
+        cursor = 0
+        for start, length in data['tile_ranges']:
+            start, length = int(start), int(length)
+            if start != cursor or length <= 0:
+                raise ValueError('tile ranges are not contiguous')
+            for local in range(0, length, chunk_size):
+                ranges.append((start + local, min(chunk_size, length - local)))
+            cursor += length
+        if cursor != point_count:
+            raise ValueError('tile ranges are incomplete')
+        return ranges, 'persisted_spatial_tiles'
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return ([(offset, min(chunk_size, point_count - offset))
+                 for offset in range(0, point_count, chunk_size)], 'fixed_chunks')
+
+
+@lru_cache(maxsize=32)
+def _normalized_image_bounds(width: int, height: int, fx: float, fy: float,
+                             cx: float, cy: float, model: str,
+                             coefficients: tuple[float, ...]) -> tuple[float, float, float, float]:
+    """Return conservative normalized ray bounds for the distorted image perimeter."""
+    if model == 'pinhole':
+        return (-cx / fx, (width - 1 - cx) / fx,
+                -cy / fy, (height - 1 - cy) / fy)
+    # Dense perimeter sampling is cheap, cached by calibration, and handles the
+    # strong wide-angle distortion of the refined Elios profile. Expanding the
+    # extrema protects against numerical interpolation between samples.
+    samples = 1024
+    xs = np.linspace(0., width - 1., samples)
+    ys = np.linspace(0., height - 1., samples)
+    pixels = np.concatenate((np.column_stack((xs, np.zeros_like(xs))),
+                             np.column_stack((xs, np.full_like(xs, height - 1.))),
+                             np.column_stack((np.zeros_like(ys), ys)),
+                             np.column_stack((np.full_like(ys, width - 1.), ys))))
+    matrix = np.array(((fx, 0., cx), (0., fy, cy), (0., 0., 1.)), dtype=np.float64)
+    distortion = np.asarray(coefficients, dtype=np.float64)
+    if model == 'fisheye':
+        rays = cv2.fisheye.undistortPoints(pixels.reshape(-1, 1, 2), matrix, distortion)
+    else:
+        rays = cv2.undistortPoints(pixels.reshape(-1, 1, 2), matrix, distortion)
+    rays = rays.reshape(-1, 2)
+    finite = rays[np.isfinite(rays).all(axis=1)]
+    if not len(finite):
+        return (-math.inf, math.inf, -math.inf, math.inf)
+    margin = max(1e-5, float(np.ptp(finite[:, 0]) + np.ptp(finite[:, 1])) / samples)
+    return (float(finite[:, 0].min() - margin), float(finite[:, 0].max() + margin),
+            float(finite[:, 1].min() - margin), float(finite[:, 1].max() + margin))
 
 
 def _chunk_may_be_visible(bounds: np.ndarray, frame: _PreparedFrame,
@@ -391,13 +487,16 @@ def _chunk_may_be_visible(bounds: np.ndarray, frame: _PreparedFrame,
     x, y, z = camera.T
     if z.max() < options.minimum_depth_m or z.min() > options.maximum_depth_m:
         return False
-    # Distorted lenses may see beyond a pinhole frustum, so only reject their depth.
-    if calibration.distortion_model == "pinhole":
-        horizontal = calibration.fx * x + calibration.cx * z
-        vertical = calibration.fy * y + calibration.cy * z
-        if (np.all(horizontal < 0) or np.all(horizontal > calibration.image_width * z)
-                or np.all(vertical < 0) or np.all(vertical > calibration.image_height * z)):
-            return False
+    left, right, top, bottom = _normalized_image_bounds(
+        calibration.image_width, calibration.image_height, calibration.fx, calibration.fy,
+        calibration.cx, calibration.cy, calibration.distortion_model,
+        tuple(calibration.distortion_coefficients))
+    # Each expression is linear over the AABB, so all eight corners outside one
+    # plane proves the complete chunk is outside. Bounds from distorted perimeter
+    # rays are intentionally rectangular and expanded, making this rejection safe.
+    if (np.all(x < left * z) or np.all(x > right * z)
+            or np.all(y < top * z) or np.all(y > bottom * z)):
+        return False
     return True
 
 
@@ -454,12 +553,15 @@ def _edge_confidence(frame: _PreparedFrame, uv: np.ndarray,
     image = frame.observation.rgb
     x = np.clip(np.rint(uv[:, 0]).astype(np.intp), 1, image.shape[1] - 2)
     y = np.clip(np.rint(uv[:, 1]).astype(np.intp), 1, image.shape[0] - 2)
-    weights = np.array([.2126, .7152, .0722], dtype=np.float32)
-    horizontal = np.abs((image[y, x + 1].astype(np.float32)
-                         - image[y, x - 1].astype(np.float32)) @ weights)
-    vertical = np.abs((image[y + 1, x].astype(np.float32)
-                       - image[y - 1, x].astype(np.float32)) @ weights)
-    image_edge = np.clip((np.hypot(horizontal, vertical) - 12) / 96, 0, 1)
+    if frame.image_edge_strength is not None:
+        image_edge = frame.image_edge_strength[y, x]
+    else:
+        weights = np.array([.2126, .7152, .0722], dtype=np.float32)
+        horizontal = np.abs((image[y, x + 1].astype(np.float32)
+                             - image[y, x - 1].astype(np.float32)) @ weights)
+        vertical = np.abs((image[y + 1, x].astype(np.float32)
+                           - image[y - 1, x].astype(np.float32)) @ weights)
+        image_edge = np.clip((np.hypot(horizontal, vertical) - 12) / 96, 0, 1)
     depth_edge = (frame.depth_edge_strength[depth_y, depth_x]
                   if frame.depth_edge_strength is not None else np.zeros(len(uv), dtype=np.float32))
     # A texture edge alone may be real paint, and a depth edge alone may be a
@@ -835,14 +937,13 @@ def colorize_las(
     """
     options = options or ColorizationOptions()
     candidate_path = Path(candidate_directory).resolve() if candidate_directory is not None else None
-    if candidate_path is not None and options.multi_frame_fusion:
-        raise ColorizationError("Per-flight candidate shards currently require multi-frame fusion to be Off")
     from .runtime import StageTimings, prefetch
     timings = StageTimings()
     processing_started = time.perf_counter()
     from .cuda_backend import (CudaBackendError, cuda_checkpoint,
                                cuda_projection_backend)
     acceleration = cuda_checkpoint().to_dict()
+    timings.add('acceleration_initialization', time.perf_counter() - processing_started)
     source, destination = Path(input_path).resolve(), Path(output_path).resolve()
     if source == destination:
         raise ColorizationError("Input and output must be different files")
@@ -852,10 +953,13 @@ def colorize_las(
         raise ColorizationError("A validated RGB camera calibration is required")
     cuda_backend, cuda_reason = (cuda_projection_backend(calibration) if options.cuda_enabled else
                                  (None,'CUDA disabled by custom hardware resource settings'))
+    from .cpu_backend import available as native_cpu_available
+    cpu_backend_name = ('native_cpu_projection' if native_cpu_available(calibration)
+                        else 'numpy_opencv_cpu')
     acceleration.update(
-        processing_backend=(('cuda_visibility_cpu_diverse_fusion' if options.multi_frame_fusion
-                             else 'cuda_visibility_cpu_color')
-                            if cuda_backend else 'cpu_reference'),
+        processing_backend=(('cuda_pose_diverse_fusion' if options.multi_frame_fusion
+                             else 'cuda_edge_aware_color')
+                            if cuda_backend else cpu_backend_name),
         cuda_acceleration_active=cuda_backend is not None,
         fallback_reason=cuda_reason,
         visibility_chunks=0,
@@ -868,15 +972,28 @@ def colorize_las(
         selected_cuda_device=options.cuda_device_index if cuda_backend is not None else None,
     )
     acceleration['summary'] = (
-        (f"CUDA device {options.cuda_device_index + 1} visibility with deterministic CPU "
+        (f"CUDA device {options.cuda_device_index + 1} deterministic "
          f"{'pose-diverse fusion' if options.multi_frame_fusion else 'edge-aware color selection'} "
          f"enabled on {acceleration.get('device_name')}")
-        if cuda_backend else f"CPU fallback: {cuda_reason}")
+        if cuda_backend else f"CPU fallback ({cpu_backend_name}): {cuda_reason}")
     _emit(progress, "acceleration", **acceleration)
     if destination.exists() and not options.overwrite:
         raise ColorizationError("Output already exists; choose another file name")
+    checkpoint_path = candidate_path / 'checkpoint.json' if candidate_path is not None else None
+    resume_checkpoint = None
+    signature = hashlib.sha256(json.dumps({
+        'source': str(source), 'source_size': source.stat().st_size,
+        'source_mtime_ns': source.stat().st_mtime_ns,
+        'calibration': calibration.to_dict(),
+        'options': asdict(options),
+    }, sort_keys=True, default=str).encode('utf-8')).hexdigest()
     if candidate_path is not None and candidate_path.exists():
-        raise ColorizationError("Candidate shard directory already exists")
+        try:
+            resume_checkpoint = json.loads(checkpoint_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            raise ColorizationError("Candidate shard directory already exists and is not resumable")
+        if resume_checkpoint.get('signature') != signature:
+            raise ColorizationError("Candidate shard checkpoint belongs to different inputs or settings")
     _check_cancel(cancelled)
     with laspy.open(source) as reader:
         original_header = copy.deepcopy(reader.header)
@@ -884,12 +1001,29 @@ def colorize_las(
     if count == 0:
         raise ColorizationError("Source LAS contains no points")
     header = _output_header(original_header, options.merged_output)
+    chunk_ranges, chunk_layout = _geometry_chunk_ranges(source, count, options.chunk_size)
+    acceleration['chunk_layout'] = chunk_layout
+    acceleration['geometry_tasks'] = len(chunk_ranges)
     destination.parent.mkdir(parents=True, exist_ok=True)
     use_xyz_cache = _use_xyz_cache(count, options)
     fusion_bytes = (count * options.fusion_max_observations * (3 + 4 + 4 + 2 + 4)
                     if options.multi_frame_fusion else 0)
-    required_bytes = count * ((16 if candidate_path is not None else header.point_format.size + 14)) + fusion_bytes + 64 * 1024**2
-    if shutil.disk_usage(destination.parent).free < required_bytes:
+    state_bytes = count * 14 + fusion_bytes
+    available_memory = _available_memory_bytes()
+    ram_budget = (min(available_memory, options.memory_budget_bytes)
+                  if available_memory is not None and options.memory_budget_bytes is not None
+                  else options.memory_budget_bytes or available_memory)
+    state_in_ram = (candidate_path is None and options.state_storage != 'disk'
+                    and ram_budget is not None
+                    and (options.state_storage == 'ram' or state_bytes <= max(0, ram_budget - 4 * 1024**3) * .30))
+    acceleration.update(state_storage='ram' if state_in_ram else 'memory_mapped_scratch',
+                        state_bytes=state_bytes)
+    scratch_root = Path(options.scratch_directory or os.environ.get(
+        'ELIOS_COLORIZER_SCRATCH', str(destination.parent))).resolve()
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    required_bytes = (count * (16 if candidate_path is not None else header.point_format.size)
+                      + (0 if state_in_ram else state_bytes) + 64 * 1024**2)
+    if shutil.disk_usage(scratch_root).free < required_bytes:
         raise ColorizationError(f"Insufficient output disk space; need about {required_bytes / 1024**3:.2f} GiB")
     received, used, rejected = 0, 0, 0
     illumination = dict(requested=options.illumination_balancing, applied=False,
@@ -910,27 +1044,27 @@ def colorize_las(
     sample_ids = (np.linspace(0, count - 1, min(count, 8192), dtype=np.int64)
                   if options.illumination_balancing else np.empty(0, dtype=np.int64))
     sample_xyz = np.empty((len(sample_ids), 3))
-    with tempfile.TemporaryDirectory(prefix=".elios-colorize-", dir=destination.parent) as scratch:
+    with tempfile.TemporaryDirectory(prefix=".elios-colorize-", dir=scratch_root) as scratch:
         work = candidate_path if candidate_path is not None else Path(scratch)
-        if candidate_path is not None:
+        if candidate_path is not None and resume_checkpoint is None:
             candidate_path.mkdir(parents=True, exist_ok=False)
-        colors = np.memmap(work / "rgb.u16", mode="w+", dtype=np.uint16, shape=(count, 3))
-        quality = np.memmap(work / "quality.f32", mode="w+", dtype=np.float32, shape=(count,))
-        distances = np.memmap(work / "distance.f32", mode="w+", dtype=np.float32, shape=(count,))
-        sources = np.memmap(work / "source.u16", mode="w+", dtype=np.uint16, shape=(count,))
+        resume_mode = resume_checkpoint is not None
+        completed_batches = int((resume_checkpoint or {}).get('completed_batches', 0))
+        def state_array(name, dtype, shape):
+            return (np.zeros(shape, dtype=dtype) if state_in_ram else
+                    np.memmap(work / name, mode='r+' if resume_mode else "w+", dtype=dtype, shape=shape))
+        colors = state_array("rgb.u16", np.uint16, (count, 3))
+        quality = state_array("quality.f32", np.float32, (count,))
+        distances = state_array("distance.f32", np.float32, (count,))
+        sources = state_array("source.u16", np.uint16, (count,))
         fusion_colors = fusion_weights = fusion_distances = fusion_sources = fusion_groups = None
         if options.multi_frame_fusion:
             shape = (count, options.fusion_max_observations)
-            fusion_colors = np.memmap(work / "fusion-rgb.u8", mode="w+", dtype=np.uint8,
-                                      shape=(*shape, 3))
-            fusion_weights = np.memmap(work / "fusion-weight.f32", mode="w+", dtype=np.float32,
-                                       shape=shape)
-            fusion_distances = np.memmap(work / "fusion-distance.f32", mode="w+", dtype=np.float32,
-                                         shape=shape)
-            fusion_sources = np.memmap(work / "fusion-source.u16", mode="w+", dtype=np.uint16,
-                                       shape=shape)
-            fusion_groups = np.memmap(work / "fusion-group.u32", mode="w+", dtype=np.uint32,
-                                      shape=shape)
+            fusion_colors = state_array("fusion-rgb.u8", np.uint8, (*shape, 3))
+            fusion_weights = state_array("fusion-weight.f32", np.float32, shape)
+            fusion_distances = state_array("fusion-distance.f32", np.float32, shape)
+            fusion_sources = state_array("fusion-source.u16", np.uint16, shape)
+            fusion_groups = state_array("fusion-group.u32", np.uint32, shape)
         # Freshly created mapped files are zero initialized by the operating system.
         active_cuda_batch = None
         diversity_groups = _PoseDiversityGroups()
@@ -938,15 +1072,17 @@ def colorize_las(
             # Chunk bounds are tiny (about 4 KB per 20M points) and let later passes
             # seek past distant/behind-camera chunks without decoding their XYZ.
             chunk_bounds: dict[int, np.ndarray] = {}
+            chunk_lengths: dict[int, int] = {}
             xyz_cache = np.empty((count, 3), dtype=np.float64) if use_xyz_cache else None
             indexing_started = time.perf_counter()
-            for offset, xyz in _xyz_chunks(source, options.chunk_size):
+            for offset, xyz in _xyz_chunks(source, options.chunk_size, chunk_ranges=chunk_ranges):
                 _check_cancel(cancelled)
                 if not np.isfinite(xyz).all():
                     raise ColorizationError("Source LAS contains nonfinite coordinates")
                 lo, hi = np.searchsorted(sample_ids, [offset, offset + len(xyz)])
                 sample_xyz[lo:hi] = xyz[sample_ids[lo:hi] - offset]
                 chunk_bounds[offset] = np.array([xyz.min(axis=0), xyz.max(axis=0)])
+                chunk_lengths[offset] = len(xyz)
                 if xyz_cache is not None:
                     xyz_cache[offset:offset + len(xyz)] = xyz
                 _emit(progress, "indexing", points_processed=offset + len(xyz), point_count=count,
@@ -964,10 +1100,13 @@ def colorize_las(
                 _check_cancel(cancelled)
                 batch: list[_PreparedFrame] = []
                 # islice bounds decoded-frame memory even when every frame is rejected.
+                stream_started = time.perf_counter()
                 observations = list(islice(stream, options.frame_batch_size))
+                timings.add('frame_stream_wait', time.perf_counter() - stream_started)
                 if not observations:
                     break
                 batch_index += 1
+                preparation_started = time.perf_counter()
                 for observation in observations:
                     received += 1
                     prepared = _prepare(observation, calibration, options)
@@ -976,12 +1115,38 @@ def colorize_las(
                     else:
                         prepared.diversity_group = diversity_groups.assign(prepared)
                         batch.append(prepared)
+                timings.add('frame_preparation', time.perf_counter() - preparation_started,
+                            operations=len(observations))
                 if not batch:
                     _emit(progress, "frames_rejected", frames_received=received, frames_rejected=rejected)
                     continue
                 used += len(batch)
-                active_offsets = {offset for offset, bounds in chunk_bounds.items()
-                                  if any(_chunk_may_be_visible(bounds, frame, calibration, options) for frame in batch)}
+                if batch_index <= completed_batches:
+                    _emit(progress, 'checkpoint_resume', batch=batch_index,
+                          completed_batches=completed_batches,
+                          frames_received=received, frames_used=used)
+                    continue
+                planning_started = time.perf_counter()
+                from .task_graph import build_projection_task_graph
+                task_graph = build_projection_task_graph(
+                    chunk_bounds, chunk_lengths, batch,
+                    lambda bounds, frame: _chunk_may_be_visible(
+                        bounds, frame, calibration, options))
+                visible_frames_by_offset = task_graph.frame_masks
+                timings.add('frustum_task_planning', time.perf_counter() - planning_started)
+                active_offsets = set(visible_frames_by_offset)
+                batch_work_total = sum(chunk_lengths[offset] * len(indices)
+                                       for offset, indices in visible_frames_by_offset.items())
+                visibility_work = 0
+                acceleration['chunk_frame_pairs_after_culling'] = (
+                    acceleration.get('chunk_frame_pairs_after_culling', 0)
+                    + sum(len(indices) for indices in visible_frames_by_offset.values()))
+                acceleration['chunk_frame_pairs_before_culling'] = (
+                    acceleration.get('chunk_frame_pairs_before_culling', 0)
+                    + len(chunk_bounds) * len(batch))
+                acceleration['work_units_rejected_by_culling'] = (
+                    acceleration.get('work_units_rejected_by_culling', 0)
+                    + task_graph.rejected_work_units)
                 visibility_started = time.perf_counter()
                 cuda_batch = None
                 if cuda_backend is not None:
@@ -989,24 +1154,27 @@ def colorize_las(
                         cuda_batch = cuda_backend.begin_batch(batch, calibration, options)
                         active_cuda_batch = cuda_batch
                         for offset, xyz in prefetch(
-                                _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache), 2):
+                                _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache, chunk_ranges), 2):
                             _check_cancel(cancelled)
-                            cuda_batch.visibility(xyz)
+                            frame_indices = visible_frames_by_offset[offset]
+                            cuda_batch.visibility(xyz, frame_indices)
                             acceleration['visibility_chunks'] += 1
-                            acceleration['points_projected_for_visibility'] += len(xyz) * len(batch)
+                            acceleration['points_projected_for_visibility'] += len(xyz) * len(frame_indices)
+                            visibility_work += len(xyz) * len(frame_indices)
                             _emit(progress, "visibility", batch=batch_index,
                                   points_processed=offset + len(xyz), point_count=count,
+                                  work_completed=visibility_work, work_total=batch_work_total,
                                   frames_received=received, frames_used=used)
                         # Copy the raw CUDA depth map back before applying the
                         # shared edge analysis and occlusion expansion on CPU.
-                        cuda_batch.finish_visibility(0)
+                        cuda_batch.finish_visibility(options.occlusion_radius_pixels)
                     except CudaBackendError as exc:
                         if cuda_batch is not None:
                             cuda_batch.close()
                         cuda_batch = active_cuda_batch = None
                         cuda_backend = None
                         cuda_reason = str(exc)
-                        acceleration.update(processing_backend='cpu_reference',
+                        acceleration.update(processing_backend=cpu_backend_name,
                                             cuda_acceleration_active=False,
                                             fallback_reason=cuda_reason,
                                             summary=f'CPU fallback: {cuda_reason}')
@@ -1015,15 +1183,18 @@ def colorize_las(
                             frame.depth.fill(np.inf)
                 if cuda_batch is None:
                     for offset, xyz in prefetch(
-                            _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache), 2):
+                            _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache, chunk_ranges), 2):
                         _check_cancel(cancelled)
-                        if executor is None or len(batch) == 1:
-                            for frame in batch:
+                        active_frames = [batch[index] for index in visible_frames_by_offset[offset]]
+                        if executor is None or len(active_frames) == 1:
+                            for frame in active_frames:
                                 _update_visibility(xyz, frame, calibration, options)
                         else:
-                            list(executor.map(lambda frame: _update_visibility(xyz, frame, calibration, options), batch))
+                            list(executor.map(lambda frame: _update_visibility(xyz, frame, calibration, options), active_frames))
+                        visibility_work += len(xyz) * len(active_frames)
                         _emit(progress, "visibility", batch=batch_index, points_processed=offset + len(xyz),
-                              point_count=count, frames_received=received, frames_used=used)
+                              point_count=count, work_completed=visibility_work,
+                              work_total=batch_work_total, frames_received=received, frames_used=used)
                 for frame in batch:
                     _finalize_visibility(frame, options)
                 timings.add('cuda_visibility' if cuda_batch is not None else 'cpu_visibility',
@@ -1053,50 +1224,109 @@ def colorize_las(
                             cuda_batch = active_cuda_batch = None
                             cuda_backend = None
                             cuda_reason = str(exc)
-                            acceleration.update(processing_backend='cpu_reference',
+                            acceleration.update(processing_backend=cpu_backend_name,
                                                 cuda_acceleration_active=False,
                                                 fallback_reason=cuda_reason,
                                                 summary=f'CPU fallback: {cuda_reason}')
                             _emit(progress, "acceleration", **acceleration)
-                chunks = prefetch(_xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache), 2)
                 color_started = time.perf_counter()
-                if options.multi_frame_fusion:
-                    assign = lambda item: _assign_chunk_fusion(
-                        item[0], item[1], batch, colors, quality, distances, sources,
-                        fusion_colors, fusion_weights, fusion_distances, fusion_sources,
-                        fusion_groups, calibration, options)
+                completed_chunks = None
+                cuda_counts = []
+                color_work = 0
+                if cuda_batch is not None:
+                    try:
+                        for offset, xyz in prefetch(
+                                _xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache, chunk_ranges), 2):
+                            indices = visible_frames_by_offset[offset]
+                            target = slice(offset, offset + len(xyz))
+                            if options.multi_frame_fusion:
+                                corrected_count, rejected_count = cuda_batch.assign_fusion(
+                                    xyz, colors[target], quality[target], distances[target], sources[target],
+                                    fusion_colors[target], fusion_weights[target], fusion_distances[target],
+                                    fusion_sources[target], fusion_groups[target], indices)
+                            else:
+                                corrected_count, rejected_count = cuda_batch.assign(
+                                    xyz, colors[target], quality[target], distances[target], sources[target], indices)
+                            cuda_counts.append((offset, len(xyz), corrected_count, rejected_count))
+                            acceleration['color_chunks'] += 1
+                            acceleration['points_processed_for_color'] += len(xyz) * len(indices)
+                            color_work += len(xyz) * len(indices)
+                            _check_cancel(cancelled)
+                            _emit(progress, "colorizing", batch=batch_index,
+                                  points_processed=offset + len(xyz), point_count=count,
+                                  work_completed=color_work, work_total=batch_work_total,
+                                  frames_received=received, frames_used=used)
+                    except CudaBackendError as exc:
+                        cuda_batch.close()
+                        cuda_batch = active_cuda_batch = None
+                        cuda_backend = None
+                        cuda_reason = str(exc)
+                        cuda_counts.clear()
+                        acceleration.update(processing_backend=cpu_backend_name,
+                                            cuda_acceleration_active=False,
+                                            fallback_reason=cuda_reason,
+                                            summary=f'CPU fallback: {cuda_reason}')
+                        _emit(progress, "acceleration", **acceleration)
+                if cuda_batch is None:
+                    edge_started = time.perf_counter()
+                    for frame in batch:
+                        _prepare_image_edges(frame)
+                    timings.add('cpu_edge_map_preparation', time.perf_counter() - edge_started,
+                                operations=len(batch))
+                    chunks = prefetch(_xyz_chunks(source, options.chunk_size, active_offsets, xyz_cache,
+                                                  chunk_ranges), 2)
+                    if options.multi_frame_fusion:
+                        def assign(item):
+                            offset, xyz = item
+                            active = [batch[index] for index in visible_frames_by_offset[offset]]
+                            return _assign_chunk_fusion(
+                                offset, xyz, active, colors, quality, distances, sources,
+                                fusion_colors, fusion_weights, fusion_distances, fusion_sources,
+                                fusion_groups, calibration, options)
+                    else:
+                        def assign(item):
+                            offset, xyz = item
+                            active = [batch[index] for index in visible_frames_by_offset[offset]]
+                            return _assign_chunk_colors(offset, xyz, active, colors, quality, distances,
+                                                        sources, calibration, options)
                     completed_chunks = (map(assign, chunks) if executor is None else
                                         _bounded_parallel_map(executor, assign, chunks, options.worker_threads))
-                    for offset, length, corrected_count, rejected_count in completed_chunks:
-                        illumination['corrected_observations'] += corrected_count
-                        illumination['rejected_exposure_observations'] += rejected_count
-                        illumination['excluded_from_correction_observations'] += rejected_count
-                        _check_cancel(cancelled)
-                        _emit(progress, "colorizing", batch=batch_index, points_processed=offset + length,
-                              point_count=count, frames_received=received, frames_used=used)
+                    result_counts = completed_chunks
                 else:
-                    if executor is None:
-                        completed_chunks = (_assign_chunk_colors(offset, xyz, batch, colors, quality, distances,
-                                                                 sources, calibration, options) for offset, xyz in chunks)
-                    else:
-                        completed_chunks = _bounded_parallel_map(
-                            executor,
-                            lambda item: _assign_chunk_colors(item[0], item[1], batch, colors, quality, distances,
-                                                              sources, calibration, options),
-                            chunks, options.worker_threads)
-                    for offset, length, corrected_count, rejected_count in completed_chunks:
-                        illumination['corrected_observations'] += corrected_count
-                        illumination['rejected_exposure_observations'] += rejected_count
-                        illumination['excluded_from_correction_observations'] += rejected_count
-                        _check_cancel(cancelled)
-                        _emit(progress, "colorizing", batch=batch_index, points_processed=offset + length,
-                              point_count=count, frames_received=received, frames_used=used)
-                timings.add('cpu_fusion_candidates' if options.multi_frame_fusion
-                            else 'cpu_edge_aware_color_assignment',
+                    result_counts = iter(cuda_counts)
+                color_work = 0
+                for completed_offset, completed_length, corrected_count, rejected_count in result_counts:
+                    illumination['corrected_observations'] += corrected_count
+                    illumination['rejected_exposure_observations'] += rejected_count
+                    illumination['excluded_from_correction_observations'] += rejected_count
+                    color_work += completed_length * len(visible_frames_by_offset[completed_offset])
+                    if cuda_batch is None:
+                        _emit(progress, "colorizing", batch=batch_index,
+                              points_processed=completed_offset + completed_length, point_count=count,
+                              work_completed=color_work, work_total=batch_work_total,
+                              frames_received=received, frames_used=used)
+                timings.add(('cuda_fusion_candidates' if options.multi_frame_fusion
+                             else 'cuda_edge_aware_color_assignment') if cuda_batch is not None else
+                            ('cpu_fusion_candidates' if options.multi_frame_fusion
+                             else 'cpu_edge_aware_color_assignment'),
                             time.perf_counter() - color_started)
                 if cuda_batch is not None:
                     cuda_batch.close()
                     cuda_batch = active_cuda_batch = None
+                if checkpoint_path is not None:
+                    checkpoint_started = time.perf_counter()
+                    for array in (colors, quality, distances, sources, fusion_colors,
+                                  fusion_weights, fusion_distances, fusion_sources, fusion_groups):
+                        if array is not None and hasattr(array, 'flush'):
+                            array.flush()
+                    checkpoint_temp = checkpoint_path.with_suffix('.tmp')
+                    checkpoint_temp.write_text(json.dumps({
+                        'format': 'elios-color-checkpoint-v1', 'signature': signature,
+                        'completed_batches': batch_index, 'frames_received': received,
+                        'frames_used': used, 'frames_rejected': rejected,
+                    }), encoding='utf-8')
+                    os.replace(checkpoint_temp, checkpoint_path)
+                    timings.add('checkpoint_io', time.perf_counter() - checkpoint_started)
                 # Drop the full-resolution RGB arrays before decoding the next batch.
                 del batch, observations, prepared, observation
             if used == 0:
@@ -1104,17 +1334,24 @@ def colorize_las(
             _check_cancel(cancelled)
             if candidate_path is not None:
                 for array in (colors, quality, distances, sources):
-                    array.flush()
+                    if hasattr(array, 'flush'):
+                        array.flush()
                 colored = sum(int(np.count_nonzero(quality[offset:offset + options.chunk_size] > 0))
                               for offset in range(0, count, options.chunk_size))
                 timings.add('total', time.perf_counter() - processing_started)
                 metadata = {
-                    'format': 'elios-color-candidates-v1', 'point_count': count,
+                    'format': ('elios-color-candidates-v2' if options.multi_frame_fusion
+                               else 'elios-color-candidates-v1'),
+                    'point_count': count,
                     'frames_received': received, 'frames_used': used, 'frames_rejected': rejected,
                     'colored_point_count': colored, 'source_flight_values_preserved': True,
+                    'multi_frame_fusion': options.multi_frame_fusion,
+                    'fusion_max_observations': options.fusion_max_observations,
+                    'fusion_min_observations': options.fusion_min_observations,
                     'acceleration': acceleration, 'performance': timings.to_dict(),
                 }
                 (candidate_path / 'candidate.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+                checkpoint_path.unlink(missing_ok=True)
                 result = ColorizationResult(candidate_path, count, colored, received, used, rejected,
                                              experimental_calibration=not calibration.validated,
                                              xyz_cache_used=use_xyz_cache,
@@ -1187,13 +1424,12 @@ def colorize_las(
             # Windows cannot remove an open memory-mapped file.
             if active_cuda_batch is not None:
                 active_cuda_batch.close()
-            colors._mmap.close()
-            quality._mmap.close()
-            distances._mmap.close()
-            sources._mmap.close()
+            _close_array(colors)
+            _close_array(quality)
+            _close_array(distances)
+            _close_array(sources)
             for array in (fusion_colors, fusion_weights, fusion_distances, fusion_sources, fusion_groups):
-                if array is not None:
-                    array._mmap.close()
+                _close_array(array)
 
 
 def reduce_candidate_shards(input_path: str | Path, output_path: str | Path,
@@ -1221,12 +1457,32 @@ def reduce_candidate_shards(input_path: str | Path, output_path: str | Path,
                       ('distance.f32', np.float32, (count,)),
                       ('source.u16', np.uint16, (count,)))
     try:
+        fusion_enabled = None
+        fusion_slots = fusion_minimum = None
         for shard in shards:
             info = json.loads((shard / 'candidate.json').read_text(encoding='utf-8'))
-            if info.get('format') != 'elios-color-candidates-v1' or info.get('point_count') != count:
+            if (info.get('format') not in ('elios-color-candidates-v1', 'elios-color-candidates-v2')
+                    or info.get('point_count') != count):
                 raise ColorizationError(f'Candidate shard does not match merged geometry: {shard}')
+            shard_fusion = info.get('format') == 'elios-color-candidates-v2'
+            if fusion_enabled is None:
+                fusion_enabled = shard_fusion
+                fusion_slots = int(info.get('fusion_max_observations', 5))
+                fusion_minimum = int(info.get('fusion_min_observations', 3))
+            if shard_fusion != fusion_enabled or (shard_fusion and
+                    (int(info.get('fusion_max_observations', 0)) != fusion_slots
+                     or int(info.get('fusion_min_observations', 0)) != fusion_minimum)):
+                raise ColorizationError('Candidate shards use incompatible fusion settings')
+            files = list(expected_files)
+            if shard_fusion:
+                shape = (count, fusion_slots)
+                files.extend((('fusion-rgb.u8', np.uint8, (*shape, 3)),
+                              ('fusion-weight.f32', np.float32, shape),
+                              ('fusion-distance.f32', np.float32, shape),
+                              ('fusion-source.u16', np.uint16, shape),
+                              ('fusion-group.u32', np.uint32, shape)))
             arrays = tuple(np.memmap(shard / name, mode='r', dtype=dtype, shape=shape)
-                           for name, dtype, shape in expected_files)
+                           for name, dtype, shape in files)
             opened.append(arrays)
             metadata.append(info)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1235,23 +1491,93 @@ def reduce_candidate_shards(input_path: str | Path, output_path: str | Path,
         with tempfile.TemporaryDirectory(prefix='.elios-reduce-', dir=destination.parent) as scratch:
             temporary = Path(scratch) / 'result.las'
             colored = 0
+            fused_report = {'requested': False, 'applied': False}
+            merged = None
+            if fusion_enabled:
+                shape = (count, fusion_slots)
+                merged = (
+                    np.memmap(Path(scratch) / 'rgb.u16', mode='w+', dtype=np.uint16, shape=(count, 3)),
+                    np.memmap(Path(scratch) / 'quality.f32', mode='w+', dtype=np.float32, shape=(count,)),
+                    np.memmap(Path(scratch) / 'distance.f32', mode='w+', dtype=np.float32, shape=(count,)),
+                    np.memmap(Path(scratch) / 'source.u16', mode='w+', dtype=np.uint16, shape=(count,)),
+                    np.memmap(Path(scratch) / 'fusion-rgb.u8', mode='w+', dtype=np.uint8, shape=(*shape, 3)),
+                    np.memmap(Path(scratch) / 'fusion-weight.f32', mode='w+', dtype=np.float32, shape=shape),
+                    np.memmap(Path(scratch) / 'fusion-distance.f32', mode='w+', dtype=np.float32, shape=shape),
+                    np.memmap(Path(scratch) / 'fusion-source.u16', mode='w+', dtype=np.uint16, shape=shape),
+                    np.memmap(Path(scratch) / 'fusion-group.u32', mode='w+', dtype=np.uint32, shape=shape),
+                )
+                out_colors, out_quality, out_distances, out_sources, out_fc, out_fw, out_fd, out_fs, out_fg = merged
+                for offset in range(0, count, chunk_size):
+                    _check_cancel(cancelled)
+                    end = min(count, offset + chunk_size)
+                    rows = np.arange(end - offset)
+                    for arrays in opened:
+                        colors, quality, distances, sources, fc, fw, fd, fs, fg = arrays
+                        candidate_quality = np.asarray(quality[offset:end])
+                        better = candidate_quality > out_quality[offset:end]
+                        if better.any():
+                            chosen = np.flatnonzero(better) + offset
+                            out_quality[chosen] = candidate_quality[better]
+                            out_colors[chosen] = colors[offset:end][better]
+                            out_distances[chosen] = distances[offset:end][better]
+                            out_sources[chosen] = sources[offset:end][better]
+                        for candidate_slot in range(fusion_slots):
+                            candidate_weights = np.asarray(fw[offset:end, candidate_slot])
+                            valid = candidate_weights > 0
+                            if not valid.any():
+                                continue
+                            weights = out_fw[offset:end]
+                            groups = out_fg[offset:end]
+                            candidate_groups = np.asarray(fg[offset:end, candidate_slot])
+                            same = (groups == candidate_groups[:, None]) & (weights > 0)
+                            has_same = np.any(same, axis=1)
+                            same_slots = np.argmax(same, axis=1)
+                            empty = weights <= 0
+                            has_empty = np.any(empty, axis=1)
+                            empty_slots = np.argmax(empty, axis=1)
+                            weakest = np.argmin(weights, axis=1)
+                            slots = np.where(has_same, same_slots, np.where(has_empty, empty_slots, weakest))
+                            retained = weights[rows, slots]
+                            take = valid & (candidate_weights > retained)
+                            if take.any():
+                                local = np.flatnonzero(take)
+                                absolute = local + offset
+                                selected_slots = slots[take]
+                                out_fc[absolute, selected_slots] = fc[offset:end, candidate_slot][take]
+                                out_fw[absolute, selected_slots] = candidate_weights[take]
+                                out_fd[absolute, selected_slots] = fd[offset:end, candidate_slot][take]
+                                out_fs[absolute, selected_slots] = fs[offset:end, candidate_slot][take]
+                                out_fg[absolute, selected_slots] = candidate_groups[take]
+                    _emit(progress, 'reducing_candidates', points_processed=end,
+                          point_count=count, colored_point_count=int(np.count_nonzero(out_quality[:end] > 0)))
+                fusion_options = ColorizationOptions(
+                    chunk_size=chunk_size, multi_frame_fusion=True,
+                    fusion_max_observations=fusion_slots,
+                    fusion_min_observations=fusion_minimum)
+                fused_report = _finalize_fusion(
+                    out_colors, out_quality, out_distances, out_sources,
+                    out_fc, out_fw, out_fd, out_fs, out_fg, fusion_options)
             with laspy.open(source) as reader, laspy.open(temporary, mode='w', header=header) as writer:
                 offset = 0
                 for original_points in reader.chunk_iterator(chunk_size):
                     _check_cancel(cancelled)
                     length = len(original_points)
-                    best_colors = np.zeros((length, 3), dtype=np.uint16)
-                    best_quality = np.zeros(length, dtype=np.float32)
-                    best_sources = np.zeros(length, dtype=np.uint16)
+                    best_colors = (np.asarray(merged[0][offset:offset + length]) if merged is not None
+                                   else np.zeros((length, 3), dtype=np.uint16))
+                    best_quality = (np.asarray(merged[1][offset:offset + length]) if merged is not None
+                                    else np.zeros(length, dtype=np.float32))
+                    best_sources = (np.asarray(merged[3][offset:offset + length]) if merged is not None
+                                    else np.zeros(length, dtype=np.uint16))
                     # Strict greater-than and source order reproduce the existing
                     # chronological winner policy, including deterministic ties.
-                    for colors, quality, _distances, sources in opened:
-                        candidate_quality = np.asarray(quality[offset:offset + length])
-                        better = candidate_quality > best_quality
-                        if better.any():
-                            best_quality[better] = candidate_quality[better]
-                            best_colors[better] = colors[offset:offset + length][better]
-                            best_sources[better] = sources[offset:offset + length][better]
+                    if merged is None:
+                        for colors, quality, _distances, sources in opened:
+                            candidate_quality = np.asarray(quality[offset:offset + length])
+                            better = candidate_quality > best_quality
+                            if better.any():
+                                best_quality[better] = candidate_quality[better]
+                                best_colors[better] = colors[offset:offset + length][better]
+                                best_sources[better] = sources[offset:offset + length][better]
                     points = laspy.PackedPointRecord.from_point_record(original_points, header.point_format)
                     points.red, points.green, points.blue = best_colors.T
                     observed = best_quality > 0
@@ -1266,19 +1592,24 @@ def reduce_candidate_shards(input_path: str | Path, output_path: str | Path,
                     writer.write_evlrs(original_header.evlrs)
             _check_cancel(cancelled)
             os.rename(temporary, destination)
+            if merged is not None:
+                for array in merged:
+                    array._mmap.close()
         timings.add('candidate_reduction', time.perf_counter() - started)
         acceleration = {
             'processing_backend': 'parallel_flight_map_reduce',
             'cuda_acceleration_active': any(bool(item.get('acceleration', {}).get('cuda_acceleration_active'))
                                             for item in metadata),
             'candidate_shards': len(shards),
-            'summary': f'Reduced {len(shards)} independent flight candidate shards',
+            'summary': (f'Reduced {len(shards)} independent flight '
+                        f"{'fusion reservoirs' if fusion_enabled else 'candidate shards'}"),
         }
         return ColorizationResult(
             destination, count, colored,
             sum(int(item['frames_received']) for item in metadata),
             sum(int(item['frames_used']) for item in metadata),
             sum(int(item['frames_rejected']) for item in metadata),
+            multi_frame_fusion=fused_report,
             acceleration=acceleration, performance=timings.to_dict())
     finally:
         for arrays in opened:

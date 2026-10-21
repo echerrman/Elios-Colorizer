@@ -133,7 +133,9 @@ def test_cuda_projection_matches_cpu_reference(tmp_path, monkeypatch,
                                rtol=2e-6, atol=2e-6)
     assert gpu.acceleration['cuda_acceleration_active']
     assert gpu.acceleration['processing_backend'] == (
-        'cuda_visibility_cpu_diverse_fusion' if fusion else 'cuda_visibility_cpu_color')
+        'cuda_pose_diverse_fusion' if fusion else 'cuda_edge_aware_color')
     assert gpu.acceleration['visibility_chunks'] > 0
-    assert gpu.acceleration['color_chunks'] == 0
+    assert gpu.acceleration['color_chunks'] > 0
+    assert (gpu.acceleration['chunk_frame_pairs_after_culling']
+            <= gpu.acceleration['chunk_frame_pairs_before_culling'])
     assert gpu.multi_frame_fusion['requested'] == fusion

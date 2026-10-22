@@ -16,6 +16,13 @@ $compilerEnvironment | ForEach-Object {
     }
 }
 New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
-& cl.exe /nologo /O2 /EHsc /LD /MT $source /Fo:"$outputDirectory\" /Fe:$output
+$object = Join-Path $outputDirectory 'elios_cpu_projection.obj'
+$compilerArguments = @(
+    '/nologo', '/O2', '/EHsc', '/LD', '/MT',
+    $source,
+    "/Fo$object",
+    "/Fe$output"
+)
+& cl.exe @compilerArguments
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $output)) { throw 'Native CPU backend build failed.' }
 Write-Host "Native CPU backend: $output"

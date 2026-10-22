@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from elios_colorizer.inspector_discovery import (
-    InspectorDiscoveryError, discover_asset, flight_feature_available, resolve_workspace_root)
+    InspectorDiscoveryError, InspectorFlight, discover_asset, flight_feature_available,
+    match_export_folders, resolve_workspace_root)
 
 
 def write_json(path: Path, value) -> None:
@@ -77,3 +78,34 @@ def test_missing_workspace_collections_returns_useful_warnings(tmp_path):
     assert result.inspections == ()
     assert any("Inspection folder not found" in warning for warning in result.warnings)
     assert any("Flight folder not found" in warning for warning in result.warnings)
+
+
+def test_matches_default_inspector_export_folder_suffixes(tmp_path):
+    exports = tmp_path / "Exports"
+    (exports / "Tank Survey - Flight 1").mkdir(parents=True)
+    (exports / "Tank Survey - Flight 6").mkdir()
+    (exports / "unrelated").mkdir()
+    flights = [
+        InspectorFlight("one", "inspection", "Flight 1", tmp_path / "native-one"),
+        InspectorFlight("six", "inspection", "Flight 6", tmp_path / "native-six"),
+    ]
+
+    matches, problems = match_export_folders(flights, exports)
+
+    assert problems == []
+    assert matches["one"].name == "Tank Survey - Flight 1"
+    assert matches["six"].name == "Tank Survey - Flight 6"
+
+
+def test_export_matching_returns_partial_results_for_manual_fallback(tmp_path):
+    exports = tmp_path / "Exports"
+    (exports / "Inspection - Flight 1").mkdir(parents=True)
+    flights = [
+        InspectorFlight("one", "inspection", "Flight 1", tmp_path / "native-one"),
+        InspectorFlight("two", "inspection", "Flight 2", tmp_path / "native-two"),
+    ]
+
+    matches, problems = match_export_folders(flights, exports)
+
+    assert set(matches) == {"one"}
+    assert any("Flight 2" in problem for problem in problems)

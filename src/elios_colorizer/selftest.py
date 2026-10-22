@@ -134,7 +134,7 @@ def run(directory):
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     from PySide6.QtWidgets import QApplication
     from PySide6.QtGui import QFontDatabase, QFont
-    from .ui import MainWindow
+    from .gui import ApplicationWindow
     app = QApplication.instance() or QApplication([])
     # The offscreen Qt platform has no native Windows font discovery.
     for name in ('segoeui.ttf', 'segoeuib.ttf', 'seguisb.ttf'):
@@ -142,7 +142,7 @@ def run(directory):
         if font.exists():
             QFontDatabase.addApplicationFont(str(font))
     app.setFont(QFont('Segoe UI', 10))
-    window = MainWindow(restore_settings=False)
+    window = ApplicationWindow(restore_settings=False)
     window.resize(1100, 1000)
     window.checklist.set_rows(inspected['checklist'])
     window.dependencies.set_rows(inspected['dependencies'])

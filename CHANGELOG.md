@@ -5,6 +5,51 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-10-22
+
+### Changed
+
+- Rebuilt the desktop application around a modular tool shell so colorization,
+  calibration, and future tools such as Color Analysis can evolve without
+  coupling their pages or state.
+- Reorganized colorization into dedicated Inputs, Validation, Processing, Run,
+  and Results pages. Validation now blocks progression on errors, advanced
+  controls live directly in Processing, and execution progress lives in Run.
+- Added lightweight, deletable recent-run summaries that retain output paths,
+  coverage, elapsed time, and settings without retaining processing data.
+- Introduced a shared Elios design system with coordinated light and dark
+  themes, modern fields and buttons, status badges, toggle controls, dialog
+  styling, focus states, sliders, menus, progress surfaces, and responsive
+  layouts.
+- Added typed completed-output artifacts for safe handoff from colorization to
+  future analysis tools.
+- Added automatic Inspector-export folder matching, inferred single/separate/
+  merged workflows, and clearer optional merged-cloud guidance.
+- Consolidated all processing controls into one embedded workspace and made
+  scroll-wheel navigation safe around editable controls.
+- Separated shared camera-profile validation from per-flight readiness and
+  recategorized expected exported-trajectory behavior as a consolidated
+  information note rather than repeated warnings.
+- Refined Inspector export assignment into a compact automatic-match list with
+  per-flight status and manual controls only for unmatched flights.
+- Moved the shared Camera Profile into its own non-collapsible Inputs card,
+  grouped identical multi-flight validation errors, and restored sun/moon
+  cues around the theme switch.
+- Reweighted run progress so preparation occupies at most the first five
+  percent, compacted the percentage badge, and made the Run status distinguish
+  a valid active colorization from genuinely blocked setup.
+- Split merged-output finalization into clearly reported candidate comparison,
+  accuracy-fusion, and LAS-writing stages so a completed comparison is never
+  mistaken for a finished or stalled run.
+
+### Compatibility
+
+- Preserved the existing inspection, calibration, resource planning,
+  colorization, fusion, illumination balancing, checkpoint, reporting,
+  progress, cancellation, and output behavior behind the new interface.
+- Kept existing settings and advanced-processing presets compatible across the
+  2.x to 3.0 upgrade.
+
 ## [2.2.0] - 2026-10-20
 
 ### Performance

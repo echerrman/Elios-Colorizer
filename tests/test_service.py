@@ -202,6 +202,13 @@ def test_complete_two_flight_merged_workflow(tmp_path, monkeypatch, balancing):
     assert set(merged.SourceFlight) >= {0, 1}
     assert any(stage == 'Upper Ring: Reading telemetry' for stage, _, _ in updates)
     assert any(stage == 'Lower Ring: Reading telemetry' for stage, _, _ in updates)
+    if report['summary']['processing_strategy'] == 'parallel_flight_map_reduce':
+        final_stages = [stage for stage, _, _ in updates]
+        assert 'Comparing flight candidates' in final_stages
+        assert 'Finalizing accuracy fusion' in final_stages
+        assert 'Writing output LAS' in final_stages
+        assert final_stages.index('Comparing flight candidates') < final_stages.index('Finalizing accuracy fusion')
+        assert final_stages.index('Finalizing accuracy fusion') < final_stages.index('Writing output LAS')
 
 
 def test_duplicate_names_are_rejected_and_source_notes_are_collapsed(monkeypatch):
@@ -222,6 +229,45 @@ def test_duplicate_names_are_rejected_and_source_notes_are_collapsed(monkeypatch
     assert len(warnings) == 1
     assert warnings[0]['detail'] == '4 source notes across 2 flights.'
     assert warnings[0]['details'][0].startswith('Upper:')
+
+
+def test_routine_export_trajectory_notes_are_consolidated_as_information(monkeypatch):
+    def fake_inspect(folder, *_args, **_kwargs):
+        return {'ready': False, 'flight_ready': True, 'checklist': [
+            {'label': 'Information', 'status': 'info',
+             'detail': 'Using the Inspector export trajectory.',
+             'details': ['Coordinate-matched export trajectory.', 'Quality=1 is usable.']},
+        ], 'dependencies': [], 'summary': folder, 'point_count': 1, 'estimated_views': 1}
+
+    monkeypatch.setattr('elios_colorizer.service.inspect_source', fake_inspect)
+    report = inspect_sources([{'folder': 'one', 'name': 'Upper'},
+                              {'folder': 'two', 'name': 'Lower'}])
+
+    notes = [row for row in report['checklist'] if row['label'] == 'Trajectory source']
+    assert len(notes) == 1
+    assert notes[0]['status'] == 'info'
+    assert len(notes[0]['details']) == 2
+    assert not [row for row in report['checklist'] if row['status'] == 'warning']
+
+
+def test_repeated_flight_validation_errors_are_grouped(monkeypatch):
+    def fake_inspect(folder, *_args, **_kwargs):
+        detail = 'Export the matching trajectory.' if folder != 'three' else 'Trajectory is unreadable.'
+        return {'ready': False, 'checklist': [
+            {'label': 'LAS-frame trajectory', 'status': 'missing', 'detail': detail},
+        ], 'dependencies': [], 'summary': folder, 'point_count': 1, 'estimated_views': 1}
+
+    monkeypatch.setattr('elios_colorizer.service.inspect_source', fake_inspect)
+    report = inspect_sources([
+        {'folder': 'one', 'name': 'Flight 1'},
+        {'folder': 'two', 'name': 'Flight 2'},
+        {'folder': 'three', 'name': 'Flight 3'},
+    ])
+    trajectory = next(row for row in report['checklist'] if row['label'] == 'LAS-frame trajectory')
+    assert trajectory['detail'] == (
+        'Flights 1, 2: Export the matching trajectory.; '
+        'Flight 3: Trajectory is unreadable.'
+    )
 
 
 def test_merged_best_view_uses_parallel_flight_map_reduce(tmp_path, monkeypatch):
@@ -249,6 +295,10 @@ def test_merged_best_view_uses_parallel_flight_map_reduce(tmp_path, monkeypatch)
     assert report['summary']['processing_strategy'] == 'parallel_flight_map_reduce'
     assert any(stage.endswith(': Checking visibility') for stage, _, _ in updates)
     assert any(stage.endswith(': Assigning RGB') for stage, _, _ in updates)
+    first_colorization = next(index for index,(stage,_,_) in enumerate(updates)
+                              if stage.endswith((': Checking visibility', ': Assigning RGB')))
+    assert updates[:first_colorization]
+    assert max(fraction for _,fraction,_ in updates[:first_colorization]) <= .05
 
 @pytest.mark.parametrize('balancing', [False, True])
 def test_separate_outputs_use_flight_numbers_and_names(tmp_path, monkeypatch, balancing):

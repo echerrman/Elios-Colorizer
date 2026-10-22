@@ -195,11 +195,24 @@ def inspect_source(folder: str, las_override: str | None = None,
         estimated_views = max(1, round(duration_s))
     for warning in source.warnings:
         rows.append(dict(label='Source note', status='warning', detail=warning))
+    if source.information:
+        rows.append(dict(label='Information', status='info',
+                         detail='Using the Inspector export trajectory that matches the selected point cloud.',
+                         details=list(source.information)))
+    def flight_data_failure(row):
+        if row['status'] != 'missing' or row['label'] == 'RGB camera calibration':
+            return False
+        # A decoded video's disagreement with the shared profile is a shared
+        # calibration compatibility error, not a failure of that flight's data.
+        if row['label'] == 'Video decoding' and 'calibration expects' in row.get('detail', ''):
+            return False
+        return True
+    flight_ready = not any(flight_data_failure(row) for row in rows)
     return dict(ready=all(row['status'] != 'missing' for row in rows), checklist=rows,
                 dependencies=dependencies, summary=f'{point_count:,} source points. '
                 'Coordinates and original attributes are retained; points without a usable view remain uncolored.',
                 point_count=point_count, estimated_views=estimated_views,
-                video_duration_s=duration_s)
+                video_duration_s=duration_s, flight_ready=flight_ready)
 
 
 def inspect_sources(flights: Iterable[dict[str, str | None]],
@@ -220,6 +233,23 @@ def inspect_sources(flights: Iterable[dict[str, str | None]],
     flight_names = _flight_names(selections)
     reports = [inspect_source(str(item.get('folder') or ''), item.get('las_override'),
                               calibration_override) for item in selections]
+    def grouped_flight_details(items):
+        grouped: dict[str, list[str]] = {}
+        for index,row in items:
+            detail=row['detail'] if row else 'not found'
+            grouped.setdefault(detail,[]).append(flight_names[index-1])
+        summaries=[]
+        for detail,names in grouped.items():
+            if len(names)==1:
+                prefix=names[0]
+            else:
+                compact=[]
+                for name in names:
+                    match=re.fullmatch(r'Flight\s+(\d+)',name,re.IGNORECASE)
+                    compact.append(match.group(1) if match else name)
+                prefix='Flights '+', '.join(compact)
+            summaries.append(f'{prefix}: {detail}')
+        return '; '.join(summaries)
     labels = ('Flight metadata', 'RGB video', 'LAS-frame trajectory',
               'Camera tilt and video timing', 'Existing point cloud', 'RGB camera calibration',
               'Video decoding')
@@ -232,21 +262,23 @@ def inspect_sources(flights: Iterable[dict[str, str | None]],
         warnings = [(index + 1, row) for index, row in enumerate(entries)
                     if row is not None and row.get('status') == 'warning']
         if failures:
-            detail = '; '.join(f"Flight {index}: {row['detail'] if row else 'not found'}"
-                               for index, row in failures)
+            detail = grouped_flight_details(failures)
             status = 'missing'
         elif warnings:
-            detail = '; '.join(f"Flight {index}: {row['detail']}" for index, row in warnings)
+            detail = grouped_flight_details(warnings)
             status = 'warning'
         else:
             detail = f'{len(reports)} of {len(reports)} flights ready'
             status = 'ok'
         checklist.append(dict(label=label, status=status, detail=detail))
     source_notes = []
+    information = []
     for flight_index, report in enumerate(reports, 1):
         for row in report['checklist']:
             if row['label'] == 'Source note':
                 source_notes.append(f"{flight_names[flight_index - 1]}: {row['detail']}")
+            elif row['label'] == 'Information':
+                information.extend(row.get('details') or [row.get('detail', '')])
             elif row['label'] in ('Flight identification', 'Flight folder', 'Local tools'):
                 checklist.append(dict(label=f"{flight_names[flight_index - 1]}: {row['label']}",
                                       status=row['status'], detail=row['detail']))
@@ -254,6 +286,13 @@ def inspect_sources(flights: Iterable[dict[str, str | None]],
         checklist.append(dict(label='Warnings', status='warning',
                               detail=f'{len(source_notes)} source notes across {len(reports)} flights.',
                               details=source_notes))
+    if information:
+        unique_information = list(dict.fromkeys(item for item in information if item))
+        checklist.append(dict(
+            label='Trajectory source', status='info',
+            detail=f'Using coordinate-matched Inspector export trajectories for {len(reports)} flight(s).',
+            details=unique_information,
+        ))
     ready = all(report['ready'] for report in reports)
     if ready:
         from .flight import discover_source
@@ -366,13 +405,13 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
             raise ColorizationCancelled('Colorization cancelled.')
 
     ensure_running()
-    emit('Reading telemetry', .003, 'Extracting pose, reported camera pitch, and video frame timing…', force=True)
+    emit('Reading telemetry', .005, 'Extracting pose, reported camera pitch, and video frame timing…', force=True)
     telemetry = load_telemetry(source, cache_directory(), cancelled=cancelled,
-                              progress=lambda message, fraction: emit('Reading telemetry', .007, message))
+                              progress=lambda message, fraction: emit('Reading telemetry', .01, message))
     ensure_running()
     if not len(telemetry.frame_times_s):
         raise ValueError('No recorded video frame timing was found.')
-    emit('Checking video', .01, 'Comparing encoded RGB frames with recorded FrameSync counters…', force=True)
+    emit('Checking video', .015, 'Comparing encoded RGB frames with recorded FrameSync counters…', force=True)
     video_coverage = inspect_video_coverage(source, telemetry, cancelled)
     ensure_running()
     origin = float(telemetry.frame_times_s[0])
@@ -455,15 +494,15 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
                        if multi_frame_fusion else 'staging bounded chunks for CUDA projection') if cuda_active else
                       (f"caching coordinates in memory for {info['worker_threads']} CPU workers"
                        if info['xyz_cache_used'] else 'using the bounded-memory CPU streaming path'))
-            emit('Preparing point cloud', .01 + .02 * fraction,
+            emit('Preparing point cloud', .03 + .02 * fraction,
                  f"Reading {info['points_processed']:,} of {info['point_count']:,} points; {method}")
         elif stage == 'fusion':
             fraction = info['points_processed'] / max(info['point_count'], 1)
-            emit('Fusing RGB observations', .945 + .005 * fraction,
+            emit('Fusing RGB observations', .95 + .005 * fraction,
                  'Rejecting color outliers and selecting robust multi-frame colors')
         elif stage == 'writing':
             fraction = info['points_processed'] / max(info['point_count'], 1)
-            emit('Saving LAS', .95 + .049 * fraction,
+            emit('Saving LAS', .955 + .044 * fraction,
                  f"Writing {info['points_processed']:,} of {info['point_count']:,} points")
         elif stage in ('visibility', 'colorizing'):
             local = (info.get('work_completed', info['points_processed'])
@@ -476,7 +515,7 @@ def run_colorization(folder: str, output: str, las_override: str | None = None,
             estimated_selected = max(info['frames_received'], round(expected_frames * retention))
             fraction = min(1., (completed + options.frame_batch_size * within_batch)
                            / max(estimated_selected, 1))
-            emit('Checking visibility' if stage == 'visibility' else 'Assigning RGB', .03 + .92 * fraction,
+            emit('Checking visibility' if stage == 'visibility' else 'Assigning RGB', .05 + .90 * fraction,
                  _projection_progress_detail(info['frames_used'], estimated_selected,
                                              candidates, expected_frames,
                                              info['points_processed'], info['point_count']))
@@ -649,13 +688,13 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
         geometry = Path(merged_source or '').resolve()
         matrices = [selection_transform(item, index) for index, item in enumerate(selections, 1)]
         if progress:
-            progress('Validating alignment', .01, 'Checking every flight against the supplied merged geometry…')
+            progress('Validating alignment', .005, 'Checking every flight against the supplied merged geometry…')
         alignment = validate_transforms(source_las, geometry, matrices)
-        preparation_share = .05
+        preparation_share = .01
 
         indexed_geometry = scratch / 'spatially_indexed_geometry.las'
         index_base = preparation_share
-        index_share = .08
+        index_share = .03
         def index_progress(stage, fraction, message):
             if progress:progress(stage, index_base + index_share * fraction, message)
         geometry, spatial_index = spatially_index_geometry(
@@ -759,6 +798,10 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                                                    options.frame_batch_size,
                                                    lookahead_batches=2,
                                                    stats=grouping_stats)
+        # Alignment, spatial indexing, telemetry, video checks, and hardware
+        # planning collectively occupy only the first 5%. The remaining
+        # progress represents projection/color selection and final writing.
+        preparation_share = .05
         color_share = .95 - preparation_share
 
         engine_high_water = preparation_share
@@ -780,14 +823,13 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
             elif stage == 'illumination':
                 engine_emit('Illumination Balancing', preparation_share, info['reason'])
             elif stage == 'indexing':
-                local = info['points_processed'] / max(info['point_count'], 1)
-                engine_emit('Preparing final geometry', preparation_share + color_share * .02 * local,
+                engine_emit('Preparing final geometry', preparation_share,
                          f"Reading {info['points_processed']:,} / {info['point_count']:,} merged points · "
                          f"{options.frame_batch_size}-view batches · "
                          f"{('CUDA fusion' if multi_frame_fusion else 'CUDA projection') if cuda_active else f'{options.worker_threads} CPU workers'}")
             elif stage == 'fusion':
                 local = info['points_processed'] / max(info['point_count'], 1)
-                engine_emit('Fusing RGB observations', .945 + .005 * local,
+                engine_emit('Fusing RGB observations', .95 + .005 * local,
                             'Rejecting color outliers and selecting robust multi-frame colors')
             elif stage in ('visibility', 'colorizing'):
                 local = (info.get('work_completed', info['points_processed'])
@@ -801,13 +843,13 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                 view_fraction = min(1., (completed + options.frame_batch_size * within)
                                     / max(estimated_selected, 1))
                 engine_emit('Checking visibility' if stage == 'visibility' else 'Assigning RGB',
-                         preparation_share + color_share * (.02 + .93 * view_fraction),
+                         preparation_share + color_share * view_fraction,
                          _projection_progress_detail(info['frames_used'], estimated_selected,
                                                      candidates, planned,
                                                      info['points_processed'], info['point_count']))
             elif stage == 'writing':
                 local = info['points_processed'] / max(info['point_count'], 1)
-                engine_emit('Saving merged LAS', .95 + .049 * local,
+                engine_emit('Saving merged LAS', .955 + .044 * local,
                          f"Writing {info['points_processed']:,} / {info['point_count']:,} points")
 
         parallel_strategy = 'global_observation_stream'
@@ -848,14 +890,14 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                     nonlocal progress_high_water
                     stage = info['stage']
                     if stage == 'indexing':
-                        local = .02 * info['points_processed'] / max(info['point_count'], 1)
+                        local = 0.
                     elif stage in ('visibility', 'colorizing'):
                         point_fraction = (info.get('work_completed', info['points_processed'])
                                           / max(info.get('work_total', info['point_count']), 1))
                         within = (.5 if stage == 'colorizing' else 0.) + .5 * point_fraction
                         completed_views = max(0, info['frames_received'] - options.frame_batch_size)
-                        local = .02 + .97 * min(1., (completed_views + options.frame_batch_size * within)
-                                                / max(expected_views[index], 1))
+                        local = min(1., (completed_views + options.frame_batch_size * within)
+                                    / max(expected_views[index], 1))
                     elif stage == 'candidate_complete':
                         local = 1.
                     else:
@@ -911,10 +953,21 @@ def _run_merged_workflow(selections: list[dict[str, str | None]], destination: P
                     raise
 
             def reduction_progress(info):
-                if progress and info['stage'] == 'reducing_candidates':
-                    local = info['points_processed'] / max(info['point_count'], 1)
-                    progress('Selecting final colors', .90 + .099 * local,
-                             f"Comparing all flights for {info['points_processed']:,} / {info['point_count']:,} points")
+                if not progress:
+                    return
+                local = info['points_processed'] / max(info['point_count'], 1)
+                if info['stage'] == 'comparing_candidates':
+                    progress('Comparing flight candidates', .90 + .04 * local,
+                             f"Compared candidate colors for {info['points_processed']:,} / {info['point_count']:,} points")
+                elif info['stage'] == 'finalizing_fusion':
+                    progress('Finalizing accuracy fusion', .94 + .03 * local,
+                             f"Fused robust observations for {info['points_processed']:,} / {info['point_count']:,} points")
+                elif info['stage'] == 'writing_output':
+                    progress('Writing output LAS', .97 + .029 * local,
+                             f"Wrote selected colors for {info['points_processed']:,} / {info['point_count']:,} points")
+                elif info['stage'] == 'selecting_and_writing_output':
+                    progress('Selecting colors and writing output LAS', .90 + .099 * local,
+                             f"Selected and wrote colors for {info['points_processed']:,} / {info['point_count']:,} points")
 
             result = reduce_candidate_shards(
                 geometry, destination, [item.output_path for item in map_results],

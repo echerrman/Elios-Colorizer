@@ -174,13 +174,14 @@ def test_action_buttons_and_color_balance_placeholder(ui):
     assert second.remove_button.objectName() == "removeFlightButton"
     assert second.remove_button.text() == "Remove"
     assert second.duplicate_button.text() == "Duplicate"
-    assert second.up_button.width() == second.down_button.width() == 38
+    assert second.up_button.width() == second.down_button.width() == 32
+    assert second.duplicate_button.width() == 120
     assert window.asset_import_button.text() == "Import Inspector Asset…"
     assert not hasattr(window, "bulk_add_button")
     assert "↻" in window.refresh_button.text()
     assert window.color_balance_check.isEnabled()
     assert window.color_balance_check.text() == "Illumination Balancing"
-    assert window.color_balance_check.objectName() == window.distance_check.objectName() == "distanceToggle"
+    assert window.color_balance_check.objectName() == "distanceToggle"
     assert not window.color_balance_check.isChecked()
     window.color_balance_check.setChecked(True)
     assert window._selection().illumination_balancing
@@ -195,12 +196,12 @@ def test_responsive_layout_switches_to_two_columns(ui, app):
     window.resize(1000, 850)
     QApplication.processEvents()
     assert not window._wide_layout
-    assert window.workflow_layout.getItemPosition(window.workflow_layout.indexOf(window.processing_card))[:2] == (2, 0)
+    assert window.workflow_layout.getItemPosition(window.workflow_layout.indexOf(window.processing_card))[:2] == (3, 0)
     # Offscreen Qt test screens can clamp top-level window sizes, so exercise
     # the same breakpoint method with the intended viewport width directly.
     window._apply_responsive_layout(1500)
     assert window._wide_layout
-    assert window.workflow_layout.getItemPosition(window.workflow_layout.indexOf(window.processing_card)) == (0, 1, 2, 1)
+    assert window.workflow_layout.getItemPosition(window.workflow_layout.indexOf(window.processing_card)) == (0, 1, 3, 1)
 
 
 def test_startup_reveals_only_fully_initialized_window(ui, app):
@@ -237,6 +238,9 @@ def test_flight_controls_remain_aligned_across_window_sizes(ui, app):
     window._add_flight(trigger=False); window._add_flight(trigger=False)
     window.flight_rows[1].set_readiness({"ready": True, "point_count": 12, "video_duration_s": 8})
     window.flight_rows[2].set_readiness({"ready": False, "point_count": 12, "video_duration_s": 8})
+    window.flight_rows[0].set_readiness({"ready": False, "flight_ready": True,
+                                         "point_count": 12, "video_duration_s": 8})
+    assert "#2e9d61" in window.flight_rows[0].readiness_badge.styleSheet()
     assert "#2e9d61" in window.flight_rows[1].readiness_badge.styleSheet()
     assert "#b45f36" in window.flight_rows[2].readiness_badge.styleSheet()
     for width in (820, 1100, 1600):
@@ -300,6 +304,8 @@ def test_flight_cards_support_bulk_add_collapse_duplicate_and_reorder(ui, tmp_pa
     assert collapsed_height < first.sizeHint().height()
     window.flights_toggle.setChecked(False)
     assert window.flights_body.isHidden()
+    assert window.camera_card.parent() is not window.flights_body
+    assert not window.camera_card.isHidden()
     window.flights_toggle.setChecked(True)
     window._duplicate_flight(first)
     duplicate = window.flight_rows[-1]
@@ -338,6 +344,30 @@ def test_inspector_asset_dialog_formats_inspector_epoch_and_microseconds():
     assert InspectorAssetDialog._duration_text(617_000_000)=="10:17"
     assert InspectorAssetDialog._duration_text(1_066_000_000)=="17:46"
     assert InspectorAssetDialog._duration_text(91)=="1:31"
+
+
+def test_inspector_export_rows_collapse_matches_and_keep_manual_fallback(app, tmp_path):
+    first=InspectorFlight("flight-one","inspection-id","Flight 1",tmp_path/"flight-one")
+    second=InspectorFlight("flight-two","inspection-id","Flight 2",tmp_path/"flight-two")
+    inspection=InspectorInspection("inspection-id","asset-id","Inspection",tmp_path/"inspection",(first,second))
+    asset=InspectorAsset("asset-id","Tank",tmp_path/"asset",tmp_path,(inspection,),())
+    exports=tmp_path/"exports";exports.mkdir();matched=exports/"Tank Export Flight 1";matched.mkdir()
+    manual=tmp_path/"manual-flight-two";manual.mkdir()
+    dialog=InspectorAssetDialog(asset)
+    try:
+        dialog.select_all_button.click();dialog.import_button.click();QApplication.processEvents()
+        assert dialog.export_rows_widget.parent() is dialog.pages.widget(1)
+        dialog.export_root_edit.setText(str(exports));dialog._auto_match_exports();QApplication.processEvents()
+        _panel,status,path_label,edit,button=dialog._export_rows[first.id]
+        assert status.text()=="✓" and status.property("matchState")=="complete"
+        assert not path_label.isHidden() and edit.isHidden() and button.isHidden()
+        _panel,status,path_label,edit,button=dialog._export_rows[second.id]
+        assert status.text()=="✕" and status.property("matchState")=="missing"
+        assert path_label.isHidden() and not edit.isHidden() and not button.isHidden()
+        edit.setText(str(manual));QApplication.processEvents()
+        assert status.text()=="✓" and edit.isHidden() and button.isHidden()
+        assert dialog.import_selections()==[(first,"Inspection",str(matched)),(second,"Inspection",str(manual))]
+    finally:dialog.close();dialog.deleteLater()
 
 
 def test_discovered_flights_use_existing_rows_and_disambiguate_names(ui, tmp_path):
@@ -510,6 +540,8 @@ def test_estimated_time_left_updates_during_processing(ui):
     window = ui(FakeBackend())
     window._run_started_at = time.monotonic() - 100
     window._on_progress("Validating alignment", .2, "Checking flights")
+    assert window.progress_bar.value() == 50
+    assert window.progress_badge.text() == "5%"
     assert "Waiting for colorization" in window.eta_label.text()
     now = time.monotonic()
     window._eta_samples = [(now - 12, .40), (now - 6, .45)]
@@ -729,10 +761,9 @@ def test_multi_flight_modes_and_optional_distance(ui, tmp_path):
     assert window.flight_rows[0].name_edit.text() == "Flight 1"
     assert second.name_edit.text() == "Flight 2"
     assert second.name_edit.maxLength() == 48
-    assert window.mode_combo.isVisible()
-    assert window.mode_combo.currentData() == "merge"
-    assert window.mode_combo.currentText() == "One merged cloud"
-    window.mode_combo.setCurrentIndex(window.mode_combo.findData("separate"))
+    assert not window.mode_combo.isVisible()
+    assert window.mode_combo.currentData() == "separate"
+    assert window.alignment_panel.isVisible()
     window.source_edit.setText("flight-one")
     window.las_edit.setText("one.las")
     second.folder_edit.setText("flight-two")
@@ -750,7 +781,9 @@ def test_multi_flight_modes_and_optional_distance(ui, tmp_path):
     flights, saved, calibration, mode, distance = backend.last_run
     assert [item["folder"] for item in flights] == ["flight-one", "flight-two"]
     assert (saved, calibration, mode, distance) == (str(output), "shared.json", "separate", 6.5)
-    window.mode_combo.setCurrentIndex(window.mode_combo.findData("merge"))
+    window.merged_edit.setText(str(tmp_path / "merged.las"))
+    QApplication.processEvents()
+    assert window.mode_combo.currentData() == "merge"
     assert "already merged cloud" in window.mode_help.text()
     assert window.alignment_panel.isVisible()
     assert window.flight_rows[0].transform_edit.isVisible()

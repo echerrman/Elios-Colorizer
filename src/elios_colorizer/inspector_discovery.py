@@ -5,6 +5,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import re
 from typing import Any, Iterable
 
 
@@ -46,6 +47,35 @@ class InspectorAsset:
     @property
     def flight_count(self) -> int:
         return sum(len(item.flights) for item in self.inspections)
+
+
+def match_export_folders(flights: Iterable[InspectorFlight], parent: str | Path):
+    """Match Inspector's default ``... Flight N`` export folder names."""
+    root = Path(parent).expanduser().resolve()
+    selected = list(flights)
+    if not root.is_dir():
+        return {}, ["The selected export parent folder does not exist."]
+    try:
+        candidates = [item.resolve() for item in root.iterdir() if item.is_dir()]
+    except OSError as exc:
+        return {}, [f"The export parent folder cannot be read: {exc}"]
+    matches: dict[str, Path] = {}
+    problems: list[str] = []
+    for flight in selected:
+        number_match = re.search(r"\bflight[\s_-]*(\d+)\b", flight.name, re.IGNORECASE)
+        if not number_match:
+            problems.append(f'{flight.name}: no "Flight N" number was available for automatic matching.')
+            continue
+        number = int(number_match.group(1))
+        suffix = re.compile(rf"(?:^|[^a-z0-9])flight[\s_-]*0*{number}\s*$", re.IGNORECASE)
+        found = [folder for folder in candidates if suffix.search(folder.name)]
+        if len(found) == 1:
+            matches[flight.id] = found[0]
+        elif not found:
+            problems.append(f"{flight.name}: no folder ending in Flight {number} was found.")
+        else:
+            problems.append(f"{flight.name}: multiple folders ending in Flight {number} were found.")
+    return matches, problems
 
 
 def _metadata_file(folder: Path, filename: str) -> Path | None:

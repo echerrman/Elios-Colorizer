@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml?query=branch%3Amain"><img alt="Tests" src="https://github.com/echerrman/Elios-Colorizer/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v2.2.0"><img alt="Release v2.2.0" src="https://img.shields.io/badge/release-v2.2.0-2f6f89"></a>
+  <a href="https://github.com/echerrman/Elios-Colorizer/releases/tag/v3.0.0"><img alt="Release v3.0.0" src="https://img.shields.io/badge/release-v3.0.0-2f6f89"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2f6f89"></a>
   <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2f6f89">
   <img alt="Local processing" src="https://img.shields.io/badge/processing-local-187548">
@@ -27,8 +27,9 @@ native flight telemetry, and recorded 4K video. It preserves unobserved geometry
 marks every point with an explicit colorization status, and performs all work on
 the local computer. Flight data is not uploaded to a cloud service.
 
-> **Version 2.1:** align video and cloud geometry manually or fit a bounded
-> camera projection from matched 2D video pixels and 3D cloud points.
+> **Version 3.0:** a modular, step-oriented desktop workspace now separates
+> Inputs, Validation, Processing, Run, and Results while preserving the
+> established local colorization pipeline and calibration workbench.
 
 ## Install
 

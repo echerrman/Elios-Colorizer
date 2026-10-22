@@ -57,6 +57,7 @@ class FlightSource:
     las_path: Path | None = None
     calibration_path: Path | None = None
     warnings: list[str] = field(default_factory=list)
+    information: list[str] = field(default_factory=list)
 
     @property
     def missing_inputs(self) -> list[str]:
@@ -231,10 +232,11 @@ def discover_source(folder, las_override=None, calibration_override=None) -> Fli
                                ("rgb_camera_profile.json", "colorizer_calibration.json")], "RGB camera profiles")
     if not starnet and mcap:
         warnings.append("MCAP servo fallback has receipt timestamps and an inferred opposite sign; StarNet is preferred.")
+    information = []
     if trajectory:
-        warnings.append("Exported trajectory poses are used because they share the selected LAS coordinate system; native MCAP remains available only as a fallback.")
-        warnings.append("Export trajectory quality=1 is treated as usable; the export does not define its confidence semantics.")
-    return FlightSource(scope, meta_path, metadata, tuple(videos), mcap, starnet, trajectory, las, profile, warnings)
+        information.append("Inspector export trajectories are used because they share the selected point-cloud coordinate system; native MCAP remains available only as a fallback.")
+        information.append("Inspector export trajectory quality=1 is treated as usable because the export does not define separate confidence semantics.")
+    return FlightSource(scope, meta_path, metadata, tuple(videos), mcap, starnet, trajectory, las, profile, warnings, information)
 
 
 @dataclass

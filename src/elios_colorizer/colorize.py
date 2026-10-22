@@ -763,7 +763,8 @@ def _finalize_fusion(colors: np.ndarray, quality: np.ndarray, distances: np.ndar
                      sources: np.ndarray, fusion_colors: np.ndarray,
                      fusion_weights: np.ndarray, fusion_distances: np.ndarray,
                      fusion_sources: np.ndarray, fusion_groups: np.ndarray,
-                     options: ColorizationOptions) -> dict[str, Any]:
+                     options: ColorizationOptions,
+                     progress: ProgressCallback | None = None) -> dict[str, Any]:
     """Choose a robust observed-color medoid after rejecting luminance outliers."""
     report = dict(requested=True, applied=False, maximum_observations=options.fusion_max_observations,
                   minimum_observations=options.fusion_min_observations,
@@ -788,6 +789,8 @@ def _finalize_fusion(colors: np.ndarray, quality: np.ndarray, distances: np.ndar
         eligible = np.flatnonzero(counts >= options.fusion_min_observations)
         report['points_using_best_observation_fallback'] += int(np.count_nonzero(counts > 0))
         if not len(eligible):
+            _emit(progress, 'finalizing_fusion', points_processed=end,
+                  point_count=len(colors), points_fused=report['points_fused'])
             continue
         candidate_weights = weights[eligible].astype(np.float32, copy=True)
         candidate_colors = np.asarray(fusion_colors[offset:end][eligible])
@@ -829,6 +832,8 @@ def _finalize_fusion(colors: np.ndarray, quality: np.ndarray, distances: np.ndar
         consensus = np.count_nonzero(inlier, axis=1) >= 2
         report['rejected_outlier_observations'] += int(np.count_nonzero(active & ~inlier))
         if not consensus.any():
+            _emit(progress, 'finalizing_fusion', points_processed=end,
+                  point_count=len(colors), points_fused=report['points_fused'])
             continue
         eligible = eligible[consensus]
         candidate_weights = candidate_weights[consensus]
@@ -853,6 +858,8 @@ def _finalize_fusion(colors: np.ndarray, quality: np.ndarray, distances: np.ndar
         sources[chosen] = fusion_sources[chosen, chosen_slots]
         report['points_fused'] += len(chosen)
         report['points_using_best_observation_fallback'] -= len(chosen)
+        _emit(progress, 'finalizing_fusion', points_processed=end,
+              point_count=len(colors), points_fused=report['points_fused'])
     report['applied'] = report['points_fused'] > 0
     return report
 
@@ -1548,7 +1555,7 @@ def reduce_candidate_shards(input_path: str | Path, output_path: str | Path,
                                 out_fd[absolute, selected_slots] = fd[offset:end, candidate_slot][take]
                                 out_fs[absolute, selected_slots] = fs[offset:end, candidate_slot][take]
                                 out_fg[absolute, selected_slots] = candidate_groups[take]
-                    _emit(progress, 'reducing_candidates', points_processed=end,
+                    _emit(progress, 'comparing_candidates', points_processed=end,
                           point_count=count, colored_point_count=int(np.count_nonzero(out_quality[:end] > 0)))
                 fusion_options = ColorizationOptions(
                     chunk_size=chunk_size, multi_frame_fusion=True,
@@ -1556,7 +1563,8 @@ def reduce_candidate_shards(input_path: str | Path, output_path: str | Path,
                     fusion_min_observations=fusion_minimum)
                 fused_report = _finalize_fusion(
                     out_colors, out_quality, out_distances, out_sources,
-                    out_fc, out_fw, out_fd, out_fs, out_fg, fusion_options)
+                    out_fc, out_fw, out_fd, out_fs, out_fg, fusion_options,
+                    progress=progress)
             with laspy.open(source) as reader, laspy.open(temporary, mode='w', header=header) as writer:
                 offset = 0
                 for original_points in reader.chunk_iterator(chunk_size):
@@ -1586,7 +1594,9 @@ def reduce_candidate_shards(input_path: str | Path, output_path: str | Path,
                     writer.write_points(points)
                     colored += int(np.count_nonzero(observed))
                     offset += length
-                    _emit(progress, 'reducing_candidates', points_processed=offset,
+                    _emit(progress, ('writing_output' if merged is not None
+                                     else 'selecting_and_writing_output'),
+                          points_processed=offset,
                           point_count=count, colored_point_count=colored)
                 if original_header.evlrs:
                     writer.write_evlrs(original_header.evlrs)

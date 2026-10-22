@@ -19,7 +19,7 @@ selftest-output/
 .release-pytest/
 
 # Local research retained outside the public repository.
-tools/
+/tools/
 docs/FLIGHT_DATA_FINDINGS.md
 docs/PERFORMANCE.md
 camera_profiles/01_baseline_1600_square_pinhole.json

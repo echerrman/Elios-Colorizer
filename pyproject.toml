@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "pyinstaller>=6,<7", "pillow>=11,<13"]
+dev = ["pytest>=8,<10", "pyinstaller>=6,<7", "pillow>=11,<14"]
 
 [project.gui-scripts]
 elios-colorizer = "elios_colorizer.ui:main"
